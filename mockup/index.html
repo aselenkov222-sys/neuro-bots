@@ -7,7 +7,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23c2410c'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600;700&family=Unbounded:wght@400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
   <script>
     (function () {
@@ -19,7 +19,7 @@
           document.documentElement.dataset.theme = theme;
         }
       } catch (error) {}
-      if (!location.hash) location.replace("#bot");
+      if (!location.hash) location.replace("#chat");
     })();
   </script>
 </head>
@@ -28,13 +28,13 @@
     <header class="proto">
       <p class="proto-brand">
         <strong>Макет</strong>
-        <span>Экраны для просмотра. В данных уже есть бот «Почта».</span>
+        <span>Главный экран — чаты. Остальные экраны пока в прежнем виде.</span>
       </p>
       <nav class="proto-nav" aria-label="Экраны макета">
-        <a href="#tariff" data-screen>Тариф</a>
+        <a href="#chat" data-screen>Чаты</a>
         <a href="#bots" data-screen>Боты</a>
         <a href="#bot" data-screen>Карточка</a>
-        <a href="#chat" data-screen>Чат</a>
+        <a href="#tariff" data-screen>Тариф</a>
         <a href="#password" data-screen>Пароль</a>
       </nav>
       <div class="theme-switch" role="group" aria-label="Тема">

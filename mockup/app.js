@@ -86,6 +86,53 @@ const state = {
           messages: []
         }
       ]
+    },
+    {
+      id: "cal",
+      name: "Календарь",
+      description: "Собирает встречи на день.",
+      color: "#1f7a4c",
+      icon: "calendar",
+      main: false,
+      nodeId: "start",
+      scenario: "Открыть календарь.\nСобрать встречи на сегодня.\nНаписать итог в основной чат.",
+      draft: "Открыть календарь.\nСобрать встречи на сегодня.\nНаписать итог в основной чат.",
+      routine: { days: [1, 2, 3, 4, 5], time: "08:30", paused: false },
+      chats: [
+        {
+          id: "main",
+          title: "Основной",
+          kind: "main",
+          messages: [
+            { id: "c1", from: "user", text: "Что сегодня по встречам?" },
+            { id: "c2", from: "bot", text: "Три встречи. Первая в 11:00, последняя в 16:30." }
+          ]
+        }
+      ]
+    },
+    {
+      id: "stock",
+      name: "Склад",
+      description: "Сверяет остатки раз в неделю.",
+      color: "#5c6570",
+      icon: "box",
+      main: false,
+      nodeId: "start",
+      scenario: "Открыть склад.\nСверить остатки.\nНаписать итог в основной чат.",
+      draft: "Открыть склад.\nСверить остатки.\nНаписать итог в основной чат.",
+      routine: { days: [1], time: "18:00", paused: true },
+      chats: [
+        {
+          id: "main",
+          title: "Основной",
+          kind: "main",
+          messages: [
+            { id: "s1", from: "user", text: "Сверь остатки за неделю." },
+            { id: "s2", from: "file", name: "остатки.xlsx" },
+            { id: "s3", from: "bot", text: "Сверил остатки. Расхождений нет." }
+          ]
+        }
+      ]
     }
   ]
 };
@@ -140,7 +187,7 @@ function earlierClash(bot) {
 }
 
 function screen() {
-  const hash = location.hash || "#bot";
+  const hash = location.hash || "#chat";
   if (hash === "#tariff" || hash === "#bots" || hash === "#bot" || hash === "#chat" || hash === "#password") {
     return hash.slice(1);
   }
@@ -466,18 +513,33 @@ function chatPreview(chat) {
   return last.text;
 }
 
+function rosterPreview(bot) {
+  const waiting = bot.chats.some((item) => item.messages.some((message) => message.from === "gate" && !message.answer));
+  const main = bot.chats.find((item) => item.kind === "main") || bot.chats[0];
+  return { waiting, text: chatPreview(main) };
+}
+
 function chatScreen() {
   const bot = activeBot();
-  const chat = activeChat(bot);
-  state.activeChatId = chat.id;
-  const items = bot.chats.map((item) => {
-    const waiting = item.messages.some((message) => message.from === "gate" && !message.answer);
+  let chat = bot.chats.find((item) => item.id === state.activeChatId);
+  if (!chat) {
+    chat = bot.chats.find((item) => item.kind === "main") || bot.chats[0];
+    state.activeChatId = chat.id;
+  }
+  const roster = state.bots.map((item) => {
+    const preview = rosterPreview(item);
+    const on = item.id === bot.id;
     return `
-      <button type="button" class="chat-item ${item.id === chat.id ? "is-on" : ""}" data-action="open-chat" data-id="${item.id}" aria-pressed="${item.id === chat.id ? "true" : "false"}">
-        <b>${esc(item.title)}</b>
-        <span>${waiting ? "Ждёт «Да». " : ""}${esc(chatPreview(item))}</span>
+      <button type="button" class="roster-item ${on ? "is-on" : ""}" data-action="open-thread" data-id="${item.id}" aria-pressed="${on ? "true" : "false"}">
+        <span class="avatar sm" style="--av:${item.color}">${icon(item.icon)}</span>
+        <span class="roster-copy">
+          <span class="roster-name">${esc(item.name)}${item.main ? '<i class="chief">Главный</i>' : ""}</span>
+          <span class="roster-preview">${preview.waiting ? '<em class="wait">Ждёт «Да».</em> ' : ""}${esc(preview.text)}</span>
+        </span>
       </button>`;
   }).join("");
+  const tabs = bot.chats.map((item) => `
+    <button type="button" class="chat-tab ${item.id === chat.id ? "is-on" : ""}" role="tab" data-action="open-chat" data-id="${item.id}" aria-selected="${item.id === chat.id ? "true" : "false"}">${esc(item.title)}</button>`).join("");
   const thread = chat.messages.length
     ? chat.messages.map((message) => messageHtml(message, bot)).join("")
     : '<p class="empty">Чат пустой. История из основного сюда не копируется.</p>';
@@ -490,20 +552,22 @@ function chatScreen() {
     : '<p class="empty">Файлов пока нет.</p>';
 
   return `
-    ${topbar(esc(bot.name), "Чат", '<a class="btn-quiet" href="#bot">Карточка</a>')}
-    <div class="chat">
-      <aside class="zone list">
-        <h2>Чаты</h2>
-        ${items}
-        <button type="button" class="btn-green" data-action="add-chat">Ещё чат</button>
+    ${topbar("Чаты", "")}
+    <div class="inbox">
+      <aside class="zone roster">
+        <nav class="roster-list" aria-label="Боты">${roster}</nav>
       </aside>
-      <section class="zone thread">
+      <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
         <div class="thread-head">
-          <div>
-            <h2>${esc(chat.title)}</h2>
-            <p class="meta">${chat.kind === "main" ? "Этот чат нельзя удалить" : "Дополнительный чат"}</p>
+          <div class="thread-titles">
+            <h2 class="thread-title">${esc(bot.name)}</h2>
+            <div class="chat-tabs" role="tablist" aria-label="Чаты этого бота">${tabs}</div>
+            <p class="meta">${chat.kind === "main" ? "Основной чат. Его нельзя удалить." : "Дополнительный чат. История основного сюда не копируется."}</p>
           </div>
-          ${remove}
+          <div class="thread-tools">
+            <button type="button" class="btn-quiet" data-action="add-chat">Новый чат</button>
+            ${remove}
+          </div>
         </div>
         <div class="messages">${thread}</div>
         <form class="composer" data-form="send">
@@ -513,18 +577,21 @@ function chatScreen() {
         </form>
       </section>
       <aside class="zone side">
-        <div class="side-block">
+        <div class="side-id">
           <span class="avatar" style="--av:${bot.color}">${icon(bot.icon)}</span>
-          <strong>${esc(bot.name)}</strong>
-          <p class="meta">${esc(bot.description || "Без описания")}</p>
-          ${bot.main ? '<span class="pill green">Главный</span>' : ""}
-          <span class="pill">${esc(routineLabel(bot))}</span>
+          <div class="side-name">
+            <strong>${esc(bot.name)}</strong>
+            ${bot.main ? '<i class="chief">Главный</i>' : ""}
+          </div>
         </div>
+        <p class="meta">${esc(bot.description || "Без описания")}</p>
+        <p class="meta">${esc(routineLabel(bot))}</p>
         <div class="library">
           <h2>Библиотека</h2>
           ${library}
         </div>
         <p class="hint">«Да» и «Нет» нажимает только пользователь. Главный бот сам их не нажимает.</p>
+        <a class="btn-quiet" href="#bot">Карточка</a>
       </aside>
     </div>`;
 }
@@ -596,6 +663,7 @@ function render() {
     chat: chatScreen,
     password: passwordScreen
   }[name];
+  app.classList.toggle("home", name === "chat");
   app.innerHTML = view();
   document.querySelectorAll("[data-screen]").forEach((link) => {
     link.setAttribute("aria-current", link.getAttribute("href") === `#${name}` ? "page" : "false");
@@ -788,6 +856,16 @@ app.addEventListener("click", (event) => {
     });
     state.activeChatId = chat.id;
     go("#chat");
+    return;
+  }
+  if (action === "open-thread") {
+    state.activeId = target.dataset.id;
+    const next = activeBot();
+    if (!next.chats.some((item) => item.id === state.activeChatId)) {
+      const main = next.chats.find((item) => item.kind === "main") || next.chats[0];
+      state.activeChatId = main.id;
+    }
+    render();
     return;
   }
   if (action === "open-chat") {
