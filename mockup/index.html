@@ -4,15 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Боты — кликабельный макет</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23b84e0e'/%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23c2410c'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
   <script>
     (function () {
       try {
-        var theme = localStorage.getItem("nb-theme");
+        var stored = localStorage.getItem("nb-theme");
+        var query = new URLSearchParams(location.search).get("theme");
+        var theme = stored === "dark" || stored === "light" ? stored : query;
         if (theme === "dark" || theme === "light") {
           document.documentElement.dataset.theme = theme;
         }
@@ -24,10 +26,10 @@
 <body>
   <div class="stage">
     <header class="proto">
-      <div class="proto-brand">
+      <p class="proto-brand">
         <strong>Макет</strong>
         <span>Экраны для просмотра. В данных уже есть бот «Почта».</span>
-      </div>
+      </p>
       <nav class="proto-nav" aria-label="Экраны макета">
         <a href="#tariff" data-screen>Тариф</a>
         <a href="#bots" data-screen>Боты</a>
@@ -40,7 +42,7 @@
         <button type="button" data-theme-set="dark">Тёмная</button>
       </div>
     </header>
-    <main id="app" class="window" aria-live="polite"></main>
+    <main id="app" class="window"></main>
   </div>
   <script src="app.js"></script>
 </body>
