@@ -13,6 +13,7 @@
 
 - [стек](docs/plan.md#stack)
 - [первый checkpoint](docs/plan.md#checkpoint-1)
+- [исполнение первого checkpoint](docs/plan.md#checkpoint-1-build)
 - [десктоп](docs/plan.md#desktop)
 - [следующие вехи](docs/plan.md#later)
 
