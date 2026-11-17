@@ -35,6 +35,7 @@ const state = {
   savedFlash: false,
   draft: "",
   notice: "",
+  holdTariff: false,
   bots: [],
   card: null,
   messages: []
@@ -82,7 +83,7 @@ function desiredScreen() {
   const requested = screen();
   if (requested === "login" || requested === "register") return requested;
   if (!state.me) return "register";
-  if (!state.me.email_confirmed) return "tariff";
+  if (state.holdTariff || !state.me.email_confirmed) return "tariff";
   if ((requested === "bot" || requested === "chat") && state.activeId) return requested;
   return "bots";
 }
@@ -552,6 +553,7 @@ async function signOut() {
   const result = await api("/api/logout", { method: "POST" });
   note(result);
   state.me = null;
+  state.holdTariff = false;
   state.activeId = null;
   state.creating = null;
   state.savedFlash = false;
@@ -575,6 +577,7 @@ async function boot() {
       : "register";
     const me = await api("/api/me");
     state.me = me.status === 401 || !me.ok ? null : me.data;
+    state.holdTariff = next === "tariff";
     history.replaceState(null, "", `/#${next}`);
     await showCurrent();
     return;

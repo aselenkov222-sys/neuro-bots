@@ -277,6 +277,16 @@ def test_browser_shows_message_and_logout(database: None) -> None:
             page.wait_for_selector("#composer")
             assert page.locator("button", has_text="Выход").count() == 1
 
+            page.goto(link)
+            page.wait_for_selector("[role='status']")
+            assert page.locator("h1").inner_text() == "Тариф"
+            assert page.locator("[role='status']").inner_text() == "Ссылка больше не действует"
+            assert page.locator("text=Создать бота").count() == 0
+            page.wait_for_timeout(500)
+            assert page.locator("h1").inner_text() == "Тариф"
+            assert page.locator("[role='status']").inner_text() == "Ссылка больше не действует"
+            assert page.locator("text=Создать бота").count() == 0
+
             page.click("button:has-text('Выход')")
             page.wait_for_selector("text=Войти")
             assert page.locator("h1").inner_text() == "Вход"
@@ -287,6 +297,7 @@ def test_browser_shows_message_and_logout(database: None) -> None:
 
             page.goto(link)
             page.wait_for_selector("[role='status']")
+            assert page.locator("h1").inner_text() == "Вход"
             assert page.locator("[role='status']").inner_text() == "Ссылка больше не действует"
             browser.close()
     finally:
