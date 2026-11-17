@@ -18,3 +18,13 @@ sessions = Table(
     Column("account_id", Uuid(), ForeignKey("accounts.id"), nullable=False),
     Column("last_request_at", DateTime(timezone=True), nullable=False),
 )
+
+confirmation_links = Table(
+    "confirmation_links",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("account_id", Uuid(), ForeignKey("accounts.id"), nullable=False),
+    Column("token_hash", Text(), nullable=False, unique=True),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True), nullable=True),
+)

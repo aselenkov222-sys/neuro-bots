@@ -66,6 +66,48 @@ def test_sqlalchemy_and_psycopg_meet_the_stack() -> None:
     assert Version(version("psycopg")) >= Version("3")
 
 
+def _revision_chain() -> list[tuple[str, str | None]]:
+    scripts = list(VERSIONS_DIR.glob("*.py"))
+    assert scripts
+    links: dict[str, str | None] = {}
+    for script in scripts:
+        module = ast.parse(script.read_text())
+        revision: str | None = None
+        down_revision: str | None = None
+        saw_down = False
+        for node in module.body:
+            if not (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and isinstance(node.value, ast.Constant)
+            ):
+                continue
+            value = node.value.value
+            if node.target.id == "revision" and isinstance(value, str):
+                revision = value
+            elif node.target.id == "down_revision" and (
+                value is None or isinstance(value, str)
+            ):
+                saw_down = True
+                down_revision = value
+        if revision is None or not saw_down:
+            raise AssertionError(f"{script.name} revision id is missing")
+        links[revision] = down_revision
+    roots = [revision for revision, down in links.items() if down is None]
+    assert roots == ["3c87a0f84d5e"]
+    ordered = [roots[0]]
+    while True:
+        children = [
+            revision for revision, down in links.items() if down == ordered[-1]
+        ]
+        if not children:
+            break
+        assert len(children) == 1
+        ordered.append(children[0])
+    assert set(ordered) == set(links)
+    return [(revision, links[revision]) for revision in ordered]
+
+
 def test_alembic_uses_the_same_database_and_metadata() -> None:
     ini_url = ""
     for line in (PROJECT_ROOT / "alembic.ini").read_text().splitlines():
@@ -92,10 +134,17 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert "server.models" in imported_modules
     import server.models
 
-    assert set(metadata.tables) == {"accounts", "sessions"}
+    assert set(metadata.tables) == {
+        "accounts",
+        "sessions",
+        "confirmation_links",
+    }
     assert server.models.accounts.metadata is metadata
     assert server.models.sessions.metadata is metadata
-    assert len(list(VERSIONS_DIR.glob("*.py"))) == 1
+    assert server.models.confirmation_links.metadata is metadata
+    chain = _revision_chain()
+    assert chain[0] == ("3c87a0f84d5e", None)
+    assert chain[-1][1] == "3c87a0f84d5e"
 
 
 def test_select_one_and_alembic_upgrade_head() -> None:
@@ -122,7 +171,9 @@ def test_select_one_and_alembic_upgrade_head() -> None:
             timeout=60,
         )
         assert upgrade.returncode == 0, upgrade.stderr + upgrade.stdout
-        assert len(list(VERSIONS_DIR.glob("*.py"))) == 1
+        chain = _revision_chain()
+        assert chain[0] == ("3c87a0f84d5e", None)
+        assert chain[-1][1] == "3c87a0f84d5e"
         assert "Running upgrade" in upgrade.stderr + upgrade.stdout
 
         engine = create_db_engine()
@@ -135,6 +186,11 @@ def test_select_one_and_alembic_upgrade_head() -> None:
                 ).scalars().all()
         finally:
             engine.dispose()
-        assert set(tables) == {"accounts", "sessions", "alembic_version"}
+        assert set(tables) == {
+            "accounts",
+            "sessions",
+            "confirmation_links",
+            "alembic_version",
+        }
     finally:
         _compose("down", "--remove-orphans", timeout=60)
