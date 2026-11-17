@@ -301,12 +301,11 @@ def test_confirmed_session_is_not_email_unconfirmed(database: None) -> None:
     assert "set-cookie" not in posted.headers
     assert after_post == after_list
     not_found = {"code": "not_found", "message": "Бот не найден."}
-    hidden = {"detail": "Not Found"}
     expected = {
         ("GET", "/api/bots/not-a-uuid"): (404, not_found),
         ("PATCH", "/api/bots/not-a-uuid"): (404, not_found),
-        ("GET", "/api/bots/not-a-uuid/messages"): (404, hidden),
-        ("POST", "/api/bots/not-a-uuid/messages"): (404, hidden),
+        ("GET", "/api/bots/not-a-uuid/messages"): (404, not_found),
+        ("POST", "/api/bots/not-a-uuid/messages"): (404, not_found),
     }
     assert set(rest) == set(expected)
     for route, response in rest.items():

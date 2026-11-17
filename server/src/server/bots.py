@@ -2,7 +2,7 @@ import json
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from fastapi import APIRouter, Request
@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
+import server.aggregator as aggregator
 from server.accounts import format_utc, touch_session, utc_now
 from server.auth import (
     begin,
@@ -18,7 +19,15 @@ from server.auth import (
     origin_rejected,
     unauthenticated,
 )
-from server.models import bots, chats
+from server.config import development_tariff
+from server.models import (
+    bots,
+    chats,
+    messages,
+    quota_charges,
+    quota_counters,
+    subscription_periods,
+)
 
 router = APIRouter()
 
@@ -46,6 +55,11 @@ INVALID_COLOR = "Такого цвета в наборе нет."
 INVALID_ICON = "Такого значка в наборе нет."
 INVALID_OBJECT = "Нужен JSON-объект."
 NOT_FOUND = "Бот не найден."
+MESSAGE_LIMIT = 8000
+INVALID_MESSAGE = "Сообщение — от 1 до 8 000 символов."
+EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
+EMPTY_MODEL_CODE = "empty_model_response"
+QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 
 
 class Opened(NamedTuple):
@@ -232,25 +246,116 @@ def open_confirmed(
         yield Opened(connection, session, account, now)
 
 
-def refuse_bots(request: Request, *, mutating: bool) -> JSONResponse:
-    if mutating:
-        rejected = origin_rejected(request)
-        if rejected is not None:
-            return rejected
-    now = utc_now()
-    with begin() as connection:
-        current = current_account(connection, request, now)
-        if current is None:
-            outcome = "anonymous"
-        elif current[1]["email_confirmed_at"] is None:
-            outcome = "unconfirmed"
-        else:
-            outcome = "confirmed"
-    if outcome == "anonymous":
-        return unauthenticated()
-    if outcome == "unconfirmed":
-        return email_unconfirmed()
-    return JSONResponse({"detail": "Not Found"}, status_code=404)
+class QuotaCounterMissing(RuntimeError):
+    pass
+
+
+def _load_chat(connection: Connection, bot_id: uuid.UUID) -> RowMapping:
+    return (
+        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        .mappings()
+        .one()
+    )
+
+
+def _lock_quota_counter(
+    connection: Connection, account_id: uuid.UUID
+) -> RowMapping:
+    period = (
+        connection.execute(
+            select(subscription_periods.c.id).where(
+                subscription_periods.c.account_id == account_id,
+                subscription_periods.c.active.is_(True),
+            )
+        )
+        .scalars()
+        .one_or_none()
+    )
+    if period is None:
+        raise QuotaCounterMissing
+    counter = (
+        connection.execute(
+            select(quota_counters)
+            .where(quota_counters.c.period_id == period)
+            .with_for_update()
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if counter is None:
+        raise QuotaCounterMissing
+    return counter
+
+
+def _insert_message(
+    connection: Connection,
+    chat_id: uuid.UUID,
+    role: str,
+    text: str,
+    code: str | None,
+    updated_at: datetime,
+) -> None:
+    connection.execute(
+        messages.insert().values(
+            id=uuid.uuid4(),
+            chat_id=chat_id,
+            role=role,
+            text=text,
+            code=code,
+            updated_at=updated_at,
+        )
+    )
+
+
+def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, object]:
+    rows = (
+        connection.execute(
+            select(messages)
+            .where(messages.c.chat_id == chat_id)
+            .order_by(messages.c.updated_at.asc(), messages.c.id.asc())
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        "messages": [
+            {
+                "id": str(row["id"]),
+                "role": row["role"],
+                "text": row["text"],
+                "code": row["code"],
+                "updated_at": format_utc(row["updated_at"]),
+            }
+            for row in rows
+        ]
+    }
+
+
+def _adapter_messages(connection: Connection, chat_id: uuid.UUID) -> list[dict[str, str]]:
+    rows = (
+        connection.execute(
+            select(messages.c.role, messages.c.text)
+            .where(
+                messages.c.chat_id == chat_id,
+                messages.c.role.in_(("user", "assistant")),
+            )
+            .order_by(messages.c.updated_at.asc(), messages.c.id.asc())
+        )
+        .mappings()
+        .all()
+    )
+    return [{"role": row["role"], "text": row["text"]} for row in rows]
+
+
+async def read_message_text(request: Request) -> str | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(400, "invalid_message", INVALID_MESSAGE)
+    text = body.get("text") if isinstance(body, dict) else None
+    if not isinstance(text, str) or not 1 <= len(text) <= MESSAGE_LIMIT:
+        return error_response(400, "invalid_message", INVALID_MESSAGE)
+    return text
 
 
 @router.get("/api/bots")
@@ -359,9 +464,95 @@ async def update_bot(request: Request, bot_id: str) -> JSONResponse:
 
 @router.get("/api/bots/{bot_id}/messages")
 def list_messages(request: Request, bot_id: str) -> JSONResponse:
-    return refuse_bots(request, mutating=False)
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        chat = _load_chat(opened.connection, parsed_id)
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat["id"]))
 
 
 @router.post("/api/bots/{bot_id}/messages")
-def create_message(request: Request, bot_id: str) -> JSONResponse:
-    return refuse_bots(request, mutating=True)
+async def create_message(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        text = await read_message_text(request)
+        if isinstance(text, JSONResponse):
+            return text
+        counter = _lock_quota_counter(opened.connection, opened.account["id"])
+        chat = _load_chat(opened.connection, parsed_id)
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "user",
+            text,
+            None,
+            opened.now,
+        )
+        follow_at = opened.now + timedelta(microseconds=1)
+        if counter["used"] >= development_tariff.model_requests:
+            _insert_message(
+                opened.connection,
+                chat["id"],
+                "error",
+                QUOTA_EXHAUSTED_TEXT,
+                None,
+                follow_at,
+            )
+        else:
+            reply = aggregator.complete(
+                description=bot["description"],
+                scenario=bot["scenario"],
+                messages=_adapter_messages(opened.connection, chat["id"]),
+                desktop_available=False,
+            )
+            if reply == "":
+                _insert_message(
+                    opened.connection,
+                    chat["id"],
+                    "error",
+                    EMPTY_MODEL_TEXT,
+                    EMPTY_MODEL_CODE,
+                    follow_at,
+                )
+            else:
+                _insert_message(
+                    opened.connection,
+                    chat["id"],
+                    "assistant",
+                    reply,
+                    None,
+                    follow_at,
+                )
+                opened.connection.execute(
+                    quota_charges.insert().values(
+                        id=uuid.uuid4(),
+                        period_id=counter["period_id"],
+                        created_at=opened.now,
+                    )
+                )
+                opened.connection.execute(
+                    quota_counters.update()
+                    .where(quota_counters.c.id == counter["id"])
+                    .values(used=counter["used"] + 1)
+                )
+        opened.connection.execute(
+            chats.update()
+            .where(chats.c.id == chat["id"])
+            .values(updated_at=follow_at)
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat["id"]))
