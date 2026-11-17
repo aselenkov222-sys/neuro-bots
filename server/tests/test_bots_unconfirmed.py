@@ -120,7 +120,17 @@ def _state() -> tuple[tuple[str, ...], dict[str, list[tuple[object, ...]]]]:
                 )
             )
             stored: dict[str, list[tuple[object, ...]]] = {}
-            for table in ("accounts", "sessions", "confirmation_links"):
+            for table in (
+                "accounts",
+                "sessions",
+                "confirmation_links",
+                "bots",
+                "chats",
+                "messages",
+                "subscription_periods",
+                "quota_counters",
+                "quota_charges",
+            ):
                 result = connection.execute(text(f"SELECT * FROM {table}"))
                 stored[table] = [tuple(row) for row in result]
     finally:
@@ -230,6 +240,30 @@ def test_missing_session_is_unauthenticated(database: None) -> None:
     assert _state() == after_expiry
 
 
+def _assert_only_last_request_moved(
+    before: tuple[tuple[str, ...], dict[str, list[tuple[object, ...]]]],
+    after: tuple[tuple[str, ...], dict[str, list[tuple[object, ...]]]],
+    cookie: str,
+) -> None:
+    assert before[0] == after[0]
+    for table, rows in before[1].items():
+        if table != "sessions":
+            assert after[1][table] == rows
+    session_id = uuid.UUID(cookie)
+    before_sessions = {row[0]: row for row in before[1]["sessions"]}
+    after_sessions = {row[0]: row for row in after[1]["sessions"]}
+    assert set(before_sessions) == set(after_sessions)
+    moved = False
+    for sid, row in before_sessions.items():
+        if sid == session_id:
+            assert after_sessions[sid][1] == row[1]
+            assert after_sessions[sid][2] > row[2]
+            moved = True
+        else:
+            assert after_sessions[sid] == row
+    assert moved
+
+
 def test_confirmed_session_is_not_email_unconfirmed(database: None) -> None:
     email = "confirmed-bots@example.com"
     cookie = _open_session(email)
@@ -237,16 +271,49 @@ def test_confirmed_session_is_not_email_unconfirmed(database: None) -> None:
     before = _state()
     with TestClient(app) as client:
         client.cookies.set("session", cookie)
-        responses = [
-            _call(
+        listed = _call(client, "GET", "/api/bots", origin=None)
+        after_list = _state()
+        posted = _call(client, "POST", "/api/bots", origin=ORIGIN)
+        after_post = _state()
+        rest = {
+            (method, path): _call(
                 client,
                 method,
                 path,
                 origin=ORIGIN if method in MUTATING else None,
             )
             for method, path in ROUTES
-        ]
-    assert [response.status_code for response in responses] == [404] * len(ROUTES)
-    assert all("email_unconfirmed" not in response.text for response in responses)
-    assert all(response.json() != EMAIL_UNCONFIRMED for response in responses)
-    assert _state() == before
+            if path != "/api/bots"
+        }
+    assert listed.status_code == 200
+    assert listed.json() == {"bots": []}
+    assert listed.json() != EMAIL_UNCONFIRMED
+    assert "email_unconfirmed" not in listed.text
+    assert "set-cookie" not in listed.headers
+    _assert_only_last_request_moved(before, after_list, cookie)
+    assert posted.status_code == 400
+    assert posted.json() == {
+        "code": "invalid_request",
+        "message": "Нужен JSON-объект.",
+    }
+    assert posted.json() != EMAIL_UNCONFIRMED
+    assert "email_unconfirmed" not in posted.text
+    assert "set-cookie" not in posted.headers
+    assert after_post == after_list
+    not_found = {"code": "not_found", "message": "Бот не найден."}
+    hidden = {"detail": "Not Found"}
+    expected = {
+        ("GET", "/api/bots/not-a-uuid"): (404, not_found),
+        ("PATCH", "/api/bots/not-a-uuid"): (404, not_found),
+        ("GET", "/api/bots/not-a-uuid/messages"): (404, hidden),
+        ("POST", "/api/bots/not-a-uuid/messages"): (404, hidden),
+    }
+    assert set(rest) == set(expected)
+    for route, response in rest.items():
+        status, body = expected[route]
+        assert response.status_code == status
+        assert response.json() == body
+        assert response.json() != EMAIL_UNCONFIRMED
+        assert "email_unconfirmed" not in response.text
+        assert "set-cookie" not in response.headers
+    assert _state() == after_post
