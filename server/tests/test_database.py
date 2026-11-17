@@ -56,9 +56,13 @@ def test_sqlalchemy_and_psycopg_meet_the_stack() -> None:
     assert _requirement("alembic").name == "alembic"
     assert Version("2.0.52") in sqlalchemy_req.specifier
     assert Version("2.0.51") not in sqlalchemy_req.specifier
+    assert Version("2.1.0") not in sqlalchemy_req.specifier
+    assert Version("2.1.9") not in sqlalchemy_req.specifier
     assert Version("3.0.0") in psycopg_req.specifier
     assert Version("2.9.11") not in psycopg_req.specifier
-    assert Version(version("sqlalchemy")) >= Version("2.0.52")
+    installed_sqlalchemy = Version(version("sqlalchemy"))
+    assert installed_sqlalchemy >= Version("2.0.52")
+    assert installed_sqlalchemy < Version("2.1")
     assert Version(version("psycopg")) >= Version("3")
 
 
