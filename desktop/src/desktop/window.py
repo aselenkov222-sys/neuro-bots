@@ -3,6 +3,8 @@ import os
 import sys
 import threading
 
+from desktop.identity import bridge_script, computer_id, default_state_dir
+
 PYWEBVIEW = "pywebview"
 PYSIDE6 = "pyside6"
 _QUIT_COMMAND = "Выйти"
@@ -66,16 +68,16 @@ def _open_pywebview(origin: str, on_ready) -> None:
     )
     _hide_pywebview_on_close(window)
     _install_cocoa_quit_tray()
-    if on_ready is not None:
-        sent = {"done": False}
+    sent = {"done": False}
 
-        def loaded() -> None:
-            if sent["done"]:
-                return
-            sent["done"] = True
-            on_ready(window)
+    def loaded() -> None:
+        _inject_desktop_bridge(window.evaluate_js)
+        if on_ready is None or sent["done"]:
+            return
+        sent["done"] = True
+        on_ready(window)
 
-        window.events.loaded += loaded
+    window.events.loaded += loaded
     webview.start(
         localization={"cocoa.menu.quit": _QUIT_COMMAND, "global.quit": _QUIT_COMMAND},
     )
@@ -147,19 +149,21 @@ def _open_pyside6(origin: str, on_ready) -> None:
     view = _cabinet_view(webengine.QWebEngineView)()
     command_quit_action = _pyside_quit_command(widgets, gui, view)
     tray_quit_action = _install_pyside_quit_tray(widgets, gui, application)
-    if on_ready is not None:
-        sent = {"done": False}
+    sent = {"done": False}
 
-        def loaded(_ok: bool) -> None:
-            if sent["done"]:
-                return
-            current = view.url().toString().rstrip("/")
-            if current != origin.rstrip("/"):
-                return
-            sent["done"] = True
-            on_ready(view)
+    def loaded(_ok: bool) -> None:
+        _inject_desktop_bridge(lambda script: view.page().runJavaScript(script))
+        if on_ready is None or sent["done"]:
+            return
+        current = view.url().toString().rstrip("/")
+        if current != origin.rstrip("/"):
+            return
+        sent["done"] = True
+        on_ready(view)
 
-        view.loadFinished.connect(loaded)
+    load_finished = getattr(view, "loadFinished", None)
+    if load_finished is not None:
+        load_finished.connect(loaded)
     view.load(qt_core.QUrl(origin))
     view.show()
     application.exec()
@@ -225,6 +229,13 @@ def _quit_command() -> None:
 
 def _quit_from_tray() -> None:
     _stop_process()
+
+
+def _inject_desktop_bridge(run_script) -> None:
+    try:
+        run_script(bridge_script(computer_id(default_state_dir())))
+    except Exception:
+        return
 
 
 def _stop_process() -> None:

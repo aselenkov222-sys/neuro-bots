@@ -9,9 +9,11 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Index,
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     text,
 )
@@ -54,9 +56,11 @@ BOT_COLUMNS = (
 )
 CHAT_COLUMNS = ("id", "bot_id", "updated_at")
 MESSAGE_COLUMNS = ("id", "chat_id", "role", "text", "code", "updated_at")
+DESKTOP_COLUMNS = ("id", "account_id", "computer_id", "working", "created_at")
 ACCOUNT_REVISION = "3c87a0f84d5e"
 CONFIRMATION_REVISION = "ff582d8bc7fb"
 EMAIL_CONFIRMED_REVISION = "048ee727aa3e"
+SUBSCRIPTION_REVISION = "c54ff0c6fb42"
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
@@ -128,9 +132,11 @@ def _revision_chain() -> list[str]:
     assert set(chain) == set(links)
     assert links[CONFIRMATION_REVISION] == ACCOUNT_REVISION
     assert links[EMAIL_CONFIRMED_REVISION] == CONFIRMATION_REVISION
-    assert links[chain[-1]] == EMAIL_CONFIRMED_REVISION
+    assert links[SUBSCRIPTION_REVISION] == EMAIL_CONFIRMED_REVISION
+    assert links[chain[-1]] == SUBSCRIPTION_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
+    assert chain[-1] != SUBSCRIPTION_REVISION
     return chain
 
 
@@ -168,6 +174,37 @@ def _columns(connection: Connection, table_name: str) -> dict[str, dict[str, obj
         .all()
     )
     return {str(row["column_name"]): dict(row) for row in rows}
+
+
+def _indexes(connection: Connection, table_name: str) -> list[dict[str, object]]:
+    rows = (
+        connection.execute(
+            text(
+                """
+                SELECT
+                    i.relname AS index_name,
+                    ix.indisunique AS is_unique,
+                    pg_get_expr(ix.indpred, ix.indrelid) AS predicate,
+                    (
+                        SELECT array_agg(a.attname ORDER BY k.ordinality)
+                        FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality)
+                        JOIN pg_catalog.pg_attribute AS a
+                          ON a.attrelid = t.oid AND a.attnum = k.attnum
+                    ) AS columns
+                FROM pg_catalog.pg_index AS ix
+                JOIN pg_catalog.pg_class AS i ON i.oid = ix.indexrelid
+                JOIN pg_catalog.pg_class AS t ON t.oid = ix.indrelid
+                JOIN pg_catalog.pg_namespace AS n ON n.oid = t.relnamespace
+                WHERE n.nspname = 'public'
+                  AND t.relname = :table_name
+                """
+            ),
+            {"table_name": table_name},
+        )
+        .mappings()
+        .all()
+    )
+    return [dict(row) for row in rows]
 
 
 def _constraints(connection: Connection, table_name: str) -> set[tuple[str, str]]:
@@ -346,6 +383,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     bots = metadata.tables["bots"]
     chats = metadata.tables["chats"]
     messages = metadata.tables["messages"]
+    desktops = metadata.tables["desktops"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -356,6 +394,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "bots",
         "chats",
         "messages",
+        "desktops",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -366,6 +405,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert bots is server.models.bots
     assert chats is server.models.chats
     assert messages is server.models.messages
+    assert desktops is server.models.desktops
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -375,6 +415,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(bots.columns.keys()) == BOT_COLUMNS
     assert tuple(chats.columns.keys()) == CHAT_COLUMNS
     assert tuple(messages.columns.keys()) == MESSAGE_COLUMNS
+    assert tuple(desktops.columns.keys()) == DESKTOP_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -550,12 +591,46 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         quota_charges,
         bots,
         chats,
+        desktops,
     ):
         assert [
             constraint
             for constraint in table.constraints
             if isinstance(constraint, CheckConstraint)
         ] == []
+
+    assert [column.name for column in desktops.primary_key] == ["id"]
+    _assert_model_column(desktops.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        desktops.c.account_id,
+        Uuid,
+        nullable=False,
+        foreign_table="accounts",
+    )
+    _assert_model_column(desktops.c.computer_id, Uuid, nullable=False)
+    _assert_model_column(desktops.c.working, Boolean, nullable=False)
+    _assert_model_column(
+        desktops.c.created_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    unique_constraints = [
+        constraint
+        for constraint in desktops.constraints
+        if isinstance(constraint, UniqueConstraint)
+    ]
+    assert len(unique_constraints) == 1
+    assert [column.name for column in unique_constraints[0].columns] == [
+        "account_id",
+        "computer_id",
+    ]
+    assert [index.name for index in desktops.indexes] == ["desktops_one_working"]
+    partial_index = next(iter(desktops.indexes))
+    assert isinstance(partial_index, Index)
+    assert partial_index.unique is True
+    assert [column.name for column in partial_index.columns] == ["account_id"]
+    assert str(partial_index.dialect_options["postgresql"]["where"]) == "working"
 
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
@@ -596,6 +671,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "bots",
                     "chats",
                     "messages",
+                    "desktops",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -881,6 +957,46 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     ),
                     ("c", MESSAGE_ROLE_CHECK),
                 }
+
+                desktop_columns = _columns(connection, "desktops")
+                assert tuple(desktop_columns) == DESKTOP_COLUMNS
+                _assert_catalog_column(
+                    desktop_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    desktop_columns, "account_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    desktop_columns, "computer_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    desktop_columns, "working", "bool", "boolean", not_null=True
+                )
+                _assert_catalog_column(
+                    desktop_columns,
+                    "created_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "desktops") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    ("u", "UNIQUE (account_id, computer_id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+                    ),
+                }
+                partial_indexes = [
+                    row
+                    for row in _indexes(connection, "desktops")
+                    if row["index_name"] == "desktops_one_working"
+                ]
+                assert len(partial_indexes) == 1
+                partial_row = partial_indexes[0]
+                assert partial_row["is_unique"] is True
+                assert partial_row["predicate"] == "working"
+                assert list(partial_row["columns"]) == ["account_id"]
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -895,6 +1011,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "bots",
                     "chats",
                     "messages",
+                    "desktops",
                 ):
                     assert (
                         connection.execute(
