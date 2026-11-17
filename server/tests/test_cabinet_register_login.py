@@ -40,7 +40,7 @@ def test_register_and_login_screens_use_tariff_fields() -> None:
             '<link href="https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600;700&family=Unbounded:wght@400&display=swap" rel="stylesheet">',
             '<link rel="stylesheet" href="styles.css">',
         ]
-        assert 'location.replace("#chat")' in html
+        assert 'location.replace("#chat")' not in html
 
         styles = client.get("/styles.css")
         assert styles.status_code == 200
@@ -49,7 +49,9 @@ def test_register_and_login_screens_use_tariff_fields() -> None:
         script_response = client.get("/app.js")
         assert script_response.status_code == 200
         script = script_response.text
-        assert 'location.hash || "#chat"' in script
+        assert 'location.hash || "#chat"' not in script
+        assert 'api("/api/me")' in script
+        assert 'if (!state.me) return "register"' in script
         assert 'hash === "#register"' in script
         assert 'hash === "#login"' in script
         assert "register: registerScreen" in script

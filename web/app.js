@@ -29,24 +29,14 @@ const ICONS = {
 const app = document.querySelector("#app");
 
 const state = {
+  me: null,
   creating: null,
-  activeId: "cal",
+  activeId: null,
   savedFlash: false,
-  bots: [
-    {
-      id: "cal",
-      name: "Календарь",
-      description: "Собирает встречи на день.",
-      color: "#1f7a4c",
-      icon: "calendar",
-      scenario: "Открыть календарь.\nСобрать встречи на сегодня.\nНаписать итог в основной чат.",
-      draft: "Открыть календарь.\nСобрать встречи на сегодня.\nНаписать итог в основной чат.",
-      messages: [
-        { id: "c1", from: "user", text: "Что сегодня по встречам?" },
-        { id: "c2", from: "bot", text: "Три встречи. Первая в 11:00, последняя в 16:30." }
-      ]
-    }
-  ]
+  draft: "",
+  bots: [],
+  card: null,
+  messages: []
 };
 
 function esc(value) {
@@ -61,20 +51,39 @@ function icon(name) {
   return `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ICONS.spark}</svg>`;
 }
 
-function uid(prefix) {
-  return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function activeBot() {
-  return state.bots.find((bot) => bot.id === state.activeId) || state.bots[0];
+async function api(path, options) {
+  const settings = options || {};
+  const headers = new Headers(settings.headers || {});
+  const init = {
+    method: settings.method || "GET",
+    credentials: "same-origin",
+    headers
+  };
+  if (settings.body !== undefined) {
+    headers.set("Content-Type", "application/json");
+    init.body = JSON.stringify(settings.body);
+  }
+  const response = await fetch(path, init);
+  const type = response.headers.get("content-type") || "";
+  const data = type.includes("application/json") ? await response.json() : null;
+  return { ok: response.ok, status: response.status, data };
 }
 
 function screen() {
-  const hash = location.hash || "#chat";
+  const hash = location.hash;
   if (hash === "#tariff" || hash === "#bots" || hash === "#bot" || hash === "#chat" || hash === "#register" || hash === "#login") {
     return hash.slice(1);
   }
-  return "bot";
+  return "";
+}
+
+function desiredScreen() {
+  const requested = screen();
+  if (requested === "login" || requested === "register") return requested;
+  if (!state.me) return "register";
+  if (!state.me.email_confirmed) return "tariff";
+  if ((requested === "bot" || requested === "chat") && state.activeId) return requested;
+  return "bots";
 }
 
 function topbar(title, lede, extra) {
@@ -101,10 +110,20 @@ function picker(scope, color, chosenIcon) {
     </fieldset>`;
 }
 
+function formatLocal(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString();
+}
+
 function tariffScreen() {
+  const resend = state.me && state.me.email_confirmed === false
+    ? '<div class="actions" style="margin-top:12px"><button type="button" class="btn-orange" data-action="resend">Прислать новую</button></div>'
+    : "";
   return `
     ${topbar("Тариф", "")}
-    <article class="tariff sheet"></article>`;
+    <article class="tariff sheet"></article>
+    ${resend}`;
 }
 
 function registerScreen() {
@@ -189,8 +208,9 @@ function botsScreen() {
 }
 
 function botScreen() {
-  const bot = activeBot();
-  const dirty = bot.draft !== bot.scenario;
+  const bot = state.card;
+  if (!bot) return `${topbar("Карточка бота", "")}`;
+  const dirty = state.draft !== bot.scenario;
   return `
     ${topbar(esc(bot.name), "Карточка бота", '<a class="btn-green" href="#chat">В чат</a>')}
     <section class="identity raised">
@@ -208,7 +228,7 @@ function botScreen() {
         <h2>Текст сценария</h2>
         <span id="dirty" class="dirty" ${dirty ? "" : "hidden"}>Есть несохранённая правка</span>
       </div>
-      <textarea id="scenario" aria-label="Текст сценария">${esc(bot.draft)}</textarea>
+      <textarea id="scenario" aria-label="Текст сценария">${esc(state.draft)}</textarea>
       <p class="hint" style="margin:10px 0">Сохранение заменяет прежний сценарий целиком. Написанные сообщения остаются как были.</p>
       ${state.savedFlash ? '<p class="flash" role="status">Сценарий сохранён. Прежний текст заменён целиком.</p>' : ""}
       <button type="button" class="btn-orange" data-action="save-scenario">Сохранить сценарий</button>
@@ -216,15 +236,20 @@ function botScreen() {
 }
 
 function messageHtml(message, bot) {
-  if (message.from === "bot") {
-    return `<article class="bubble bot"><span class="avatar sm" style="--av:${bot.color}">${icon(bot.icon)}</span><div><p>${esc(message.text)}</p></div></article>`;
+  const when = esc(formatLocal(message.updated_at));
+  const text = esc(message.text || "");
+  if (message.role === "user") {
+    return `<article class="bubble user"><p>${text}</p><p class="meta">${when}</p></article>`;
   }
-  return `<article class="bubble user"><p>${esc(message.text)}</p></article>`;
+  const avatar = message.role === "assistant" && bot
+    ? `<span class="avatar sm" style="--av:${bot.color}">${icon(bot.icon)}</span>`
+    : "";
+  return `<article class="bubble bot">${avatar}<div><p>${text}</p><p class="meta">${when}</p></div></article>`;
 }
 
 function chatScreen() {
-  const bot = activeBot();
-  const thread = bot.messages.map((message) => messageHtml(message, bot)).join("");
+  const bot = state.card || { name: "", color: "#c85a12", icon: "spark" };
+  const thread = state.messages.map((message) => messageHtml(message, bot)).join("");
   return `
     ${topbar("Чаты", "")}
     <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
@@ -246,7 +271,7 @@ function render() {
   const caret = scenario && document.activeElement === scenario
     ? [scenario.selectionStart, scenario.selectionEnd, scenario.scrollTop]
     : null;
-  const name = screen();
+  const name = desiredScreen();
   const view = {
     tariff: tariffScreen,
     bots: botsScreen,
@@ -274,6 +299,102 @@ function render() {
   next.scrollTop = caret[2];
 }
 
+async function loadBots() {
+  const result = await api("/api/bots");
+  if (result.ok && result.data) state.bots = result.data.bots;
+}
+
+async function loadCard() {
+  if (!state.activeId) return;
+  const result = await api(`/api/bots/${state.activeId}`);
+  if (!result.ok || !result.data) return;
+  state.card = result.data;
+  state.draft = result.data.scenario;
+}
+
+async function loadMessages() {
+  if (!state.activeId) return;
+  if (!state.card || state.card.id !== state.activeId) await loadCard();
+  const result = await api(`/api/bots/${state.activeId}/messages`);
+  if (result.ok && result.data) state.messages = result.data.messages;
+}
+
+async function showCurrent() {
+  const desired = desiredScreen();
+  if (location.hash !== `#${desired}`) {
+    location.hash = `#${desired}`;
+    return;
+  }
+  if (desired === "bots") await loadBots();
+  if (desired === "bot") await loadCard();
+  if (desired === "chat") await loadMessages();
+  render();
+}
+
+async function patchBot(changes) {
+  if (!state.activeId) return;
+  const result = await api(`/api/bots/${state.activeId}`, { method: "PATCH", body: changes });
+  if (!result.ok || !result.data) return;
+  state.card = result.data;
+  if (Object.prototype.hasOwnProperty.call(changes, "scenario")) state.draft = result.data.scenario;
+  const index = state.bots.findIndex((item) => item.id === result.data.id);
+  if (index >= 0) state.bots[index] = result.data;
+  render();
+}
+
+async function submitRegister() {
+  const email = document.getElementById("register-email").value;
+  const password = document.getElementById("register-password").value;
+  const result = await api("/api/register", { method: "POST", body: { email, password } });
+  if (!result.ok) return;
+  state.me = result.data;
+  location.hash = "#tariff";
+}
+
+async function submitLogin() {
+  const email = document.getElementById("login-email").value;
+  const password = document.getElementById("login-password").value;
+  const result = await api("/api/login", { method: "POST", body: { email, password } });
+  if (!result.ok) return;
+  state.me = result.data;
+  state.activeId = null;
+  location.hash = result.data.email_confirmed ? "#bots" : "#tariff";
+}
+
+async function submitCreate() {
+  const draft = state.creating;
+  if (!draft || !draft.name.trim()) return;
+  const result = await api("/api/bots", {
+    method: "POST",
+    body: {
+      name: draft.name.trim(),
+      description: draft.description,
+      scenario: draft.scenario,
+      color: draft.color,
+      icon: draft.icon
+    }
+  });
+  if (!result.ok || !result.data) return;
+  state.bots.push(result.data);
+  state.creating = null;
+  render();
+}
+
+async function submitMessage() {
+  const input = document.getElementById("composer");
+  const text = input.value.trim();
+  if (!text || !state.activeId) return;
+  const result = await api(`/api/bots/${state.activeId}/messages`, {
+    method: "POST",
+    body: { text }
+  });
+  if (!result.ok || !result.data) return;
+  state.messages = result.data.messages;
+  render();
+  const next = document.getElementById("composer");
+  if (next) next.focus();
+}
+
 function restoreFocus(target) {
   if (!target || !target.dataset || !target.dataset.action) return;
   const action = target.dataset.action;
@@ -286,23 +407,16 @@ function restoreFocus(target) {
   if (match) match.focus();
 }
 
-function go(hash) {
-  if (location.hash === hash) render();
-  else location.hash = hash;
-}
-
 app.addEventListener("input", (event) => {
-  const bot = activeBot();
   const target = event.target;
   if (target.id === "scenario") {
-    bot.draft = target.value;
+    state.draft = target.value;
     state.savedFlash = false;
     const dirty = document.getElementById("dirty");
-    if (dirty) dirty.hidden = bot.draft === bot.scenario;
+    if (dirty && state.card) dirty.hidden = state.draft === state.card.scenario;
     const flash = app.querySelector(".flash");
     if (flash && flash.textContent.startsWith("Сценарий сохранён")) flash.remove();
   }
-  if (target.id === "bot-desc") bot.description = target.value;
   if (target.id === "create-name" && state.creating) {
     state.creating.name = target.value;
     const save = document.getElementById("save-bot");
@@ -313,31 +427,36 @@ app.addEventListener("input", (event) => {
 });
 
 app.addEventListener("change", (event) => {
-  const bot = activeBot();
   const target = event.target;
-  if (target.id === "bot-name") {
+  if (target.id === "bot-name" && state.card) {
     const next = target.value.trim();
-    if (!next) target.value = bot.name;
-    else bot.name = next;
-    const title = app.querySelector("h1");
-    if (title && screen() === "bot") title.textContent = bot.name;
+    if (!next) target.value = state.card.name;
+    else if (next !== state.card.name) patchBot({ name: next });
+  }
+  if (target.id === "bot-desc" && state.card && target.value !== state.card.description) {
+    patchBot({ description: target.value });
   }
 });
 
 app.addEventListener("submit", (event) => {
   event.preventDefault();
   const form = event.target.dataset.form;
-  if (form === "create") saveBot();
-  if (form === "send") sendMessage();
+  if (form === "register") submitRegister();
+  if (form === "login") submitLogin();
+  if (form === "create") submitCreate();
+  if (form === "send") submitMessage();
 });
 
 app.addEventListener("click", (event) => {
   const target = event.target.closest("[data-action]");
   if (!target || target.disabled) return;
   const action = target.dataset.action;
-  const bot = activeBot();
+  if (action === "resend") {
+    api("/api/confirmation", { method: "POST" });
+    return;
+  }
   if (action === "open-create") {
-    state.creating = { name: "", description: "", scenario: "", color: COLORS[0].value, icon: "spark" };
+    state.creating = { name: "", description: "", scenario: "", color: "#c85a12", icon: "spark" };
     render();
     const field = document.getElementById("create-name");
     if (field) field.focus();
@@ -348,61 +467,49 @@ app.addEventListener("click", (event) => {
     render();
   }
   if (action === "pick-color" || action === "pick-icon") {
-    const holder = target.dataset.scope === "create" ? state.creating : bot;
-    if (!holder) return;
-    if (action === "pick-color") holder.color = target.dataset.color;
-    else holder.icon = target.dataset.icon;
-    render();
+    const scope = target.dataset.scope;
+    if (scope === "create" && state.creating) {
+      if (action === "pick-color") state.creating.color = target.dataset.color;
+      else state.creating.icon = target.dataset.icon;
+      render();
+    }
+    if (scope === "card" && state.card) {
+      if (action === "pick-color") patchBot({ color: target.dataset.color });
+      else patchBot({ icon: target.dataset.icon });
+    }
   }
   if (action === "open-bot") {
     state.activeId = target.dataset.id;
     state.savedFlash = false;
-    go("#bot");
+    state.card = null;
+    location.hash = "#bot";
     return;
   }
   if (action === "save-scenario") {
-    bot.scenario = bot.draft;
     state.savedFlash = true;
-    render();
+    patchBot({ scenario: state.draft });
   }
   restoreFocus(target);
 });
 
-function saveBot() {
-  const draft = state.creating;
-  if (!draft || !draft.name.trim()) return;
-  const bot = {
-    id: uid("bot"),
-    name: draft.name.trim(),
-    description: draft.description.trim(),
-    color: draft.color,
-    icon: draft.icon,
-    scenario: draft.scenario.trim(),
-    draft: draft.scenario.trim(),
-    messages: []
-  };
-  state.bots.push(bot);
-  state.activeId = bot.id;
-  state.creating = null;
-  state.savedFlash = false;
-  go("#bot");
+async function boot() {
+  if (location.pathname === "/api/confirm-email") {
+    const result = await api(`${location.pathname}${location.search}`, {
+      headers: { Accept: "application/json" }
+    });
+    const destination = result.data && result.data.destination;
+    const next = destination === "bots" || destination === "login" || destination === "tariff"
+      ? destination
+      : "register";
+    location.replace(`/#${next}`);
+    return;
+  }
+  const me = await api("/api/me");
+  state.me = me.status === 401 || !me.ok ? null : me.data;
+  await showCurrent();
 }
 
-function sendMessage() {
-  const input = document.getElementById("composer");
-  const text = input.value.trim();
-  if (!text) return;
-  const bot = activeBot();
-  bot.messages.push({ id: uid("user"), from: "user", text });
-  bot.messages.push({
-    id: uid("bot"),
-    from: "bot",
-    text: "Сообщение осталось в этом чате. В макете модель не вызывается."
-  });
-  render();
-  const next = document.getElementById("composer");
-  if (next) next.focus();
-}
-
-window.addEventListener("hashchange", render);
-render();
+window.addEventListener("hashchange", () => {
+  showCurrent();
+});
+boot();
