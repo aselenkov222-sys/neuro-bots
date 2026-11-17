@@ -23,6 +23,7 @@ from server.accounts import (
     touch_session,
     utc_now,
 )
+from server.confirmation import issue_confirmation_link, log_confirmation_link
 from server.db import create_db_engine
 from server.passwords import PasswordNotAccepted, password_accepted, verify_password
 
@@ -112,17 +113,20 @@ async def register(request: Request) -> JSONResponse:
         return error_response(400, "invalid_password", "Пароль не по правилам.")
     if len(normalize_email(email)) > EMAIL_MAX_LENGTH:
         return error_response(400, "invalid_email", "Почта длиннее 254 символов.")
+    stored_email = normalize_email(email)
     try:
         with begin() as connection:
             account_id = create_account(connection, email, password)
             session_id = create_session(connection, account_id)
+            token = issue_confirmation_link(connection, account_id)
     except PasswordNotAccepted:
         return error_response(400, "invalid_password", "Пароль не по правилам.")
     except EmailTooLong:
         return error_response(400, "invalid_email", "Почта длиннее 254 символов.")
     except IntegrityError:
         return error_response(400, "email_taken", "Эта почта уже зарегистрирована")
-    return opened_session(account_id, normalize_email(email), "", session_id)
+    log_confirmation_link(str(request.base_url), token, stored_email)
+    return opened_session(account_id, stored_email, "", session_id)
 
 
 @router.post("/api/login")
