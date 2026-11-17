@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
+from server.auth import router
 from server.db import database_responds
 
 app = FastAPI()
@@ -23,4 +24,5 @@ def health() -> Response:
     return JSONResponse({"status": "ok"})
 
 
+app.include_router(router)
 app.mount("/", StaticFiles(directory=_WEB_DIR), name="web")
