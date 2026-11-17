@@ -187,7 +187,7 @@ function earlierClash(bot) {
 
 function screen() {
   const hash = location.hash || "#chat";
-  if (hash === "#tariff" || hash === "#bots" || hash === "#bot" || hash === "#chat") {
+  if (hash === "#tariff" || hash === "#bots" || hash === "#bot" || hash === "#chat" || hash === "#register" || hash === "#login") {
     return hash.slice(1);
   }
   return "bot";
@@ -248,6 +248,44 @@ function tariffScreen() {
       <button type="button" class="btn-orange" data-action="pay" ${state.tariffId ? "" : "disabled"}>Оплатить</button>
       <p class="hint">После оплаты открывается список ботов. Сумму задаёт владелец продукта, в макете её нет.</p>
     </div>`;
+}
+
+function registerScreen() {
+  return `
+    ${topbar("Регистрация", "")}
+    <form class="panel sheet" data-form="register">
+      <div class="fields">
+        <label class="field" for="register-email">Почта
+          <input id="register-email" name="email" type="email" autocomplete="email">
+        </label>
+        <label class="field" for="register-password">Пароль
+          <input id="register-password" name="password" type="password" autocomplete="new-password">
+        </label>
+      </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn-orange" type="submit">Зарегистрироваться</button>
+        <a class="btn-quiet" href="#login">Вход</a>
+      </div>
+    </form>`;
+}
+
+function loginScreen() {
+  return `
+    ${topbar("Вход", "")}
+    <form class="panel sheet" data-form="login">
+      <div class="fields">
+        <label class="field" for="login-email">Почта
+          <input id="login-email" name="email" type="email" autocomplete="email">
+        </label>
+        <label class="field" for="login-password">Пароль
+          <input id="login-password" name="password" type="password" autocomplete="current-password">
+        </label>
+      </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn-orange" type="submit">Войти</button>
+        <a class="btn-quiet" href="#register">Регистрация</a>
+      </div>
+    </form>`;
 }
 
 function botCard(bot) {
@@ -625,7 +663,9 @@ function render() {
     tariff: tariffScreen,
     bots: botsScreen,
     bot: botScreen,
-    chat: chatScreen
+    chat: chatScreen,
+    register: registerScreen,
+    login: loginScreen
   }[name];
   app.classList.toggle("home", name === "chat");
   app.innerHTML = view();

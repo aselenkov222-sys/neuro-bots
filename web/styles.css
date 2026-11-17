@@ -479,7 +479,7 @@ label.field, .field {
   color: var(--muted);
 }
 
-input[type="text"], input[type="password"], input[type="time"], textarea {
+input[type="text"], input[type="email"], input[type="password"], input[type="time"], textarea {
   width: 100%;
   border-radius: 12px;
   border: 1px solid var(--stroke);
