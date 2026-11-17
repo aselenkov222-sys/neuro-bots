@@ -76,9 +76,12 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
 
     module = ast.parse((PROJECT_ROOT / "alembic" / "env.py").read_text())
     imported: set[str] = set()
+    imported_modules: set[str] = set()
     assigned: dict[str, str] = {}
     for node in module.body:
-        if isinstance(node, ast.ImportFrom) and node.module == "server.db":
+        if isinstance(node, ast.Import):
+            imported_modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module == "server.db":
             imported.update(alias.name for alias in node.names)
         elif isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
@@ -86,8 +89,13 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
                 assigned[target.id] = node.value.id
     assert {"DATABASE_URL", "metadata"} <= imported
     assert assigned["target_metadata"] == "metadata"
-    assert metadata.tables == {}
-    assert list(VERSIONS_DIR.glob("*.py")) == []
+    assert "server.models" in imported_modules
+    import server.models
+
+    assert set(metadata.tables) == {"accounts", "sessions"}
+    assert server.models.accounts.metadata is metadata
+    assert server.models.sessions.metadata is metadata
+    assert len(list(VERSIONS_DIR.glob("*.py"))) == 1
 
 
 def test_select_one_and_alembic_upgrade_head() -> None:
@@ -114,9 +122,8 @@ def test_select_one_and_alembic_upgrade_head() -> None:
             timeout=60,
         )
         assert upgrade.returncode == 0, upgrade.stderr + upgrade.stdout
-        assert "Running upgrade" not in upgrade.stderr
-        assert "Running upgrade" not in upgrade.stdout
-        assert list(VERSIONS_DIR.glob("*.py")) == []
+        assert len(list(VERSIONS_DIR.glob("*.py"))) == 1
+        assert "Running upgrade" in upgrade.stderr + upgrade.stdout
 
         engine = create_db_engine()
         try:
@@ -128,6 +135,6 @@ def test_select_one_and_alembic_upgrade_head() -> None:
                 ).scalars().all()
         finally:
             engine.dispose()
-        assert set(tables) <= {"alembic_version"}
+        assert set(tables) == {"accounts", "sessions", "alembic_version"}
     finally:
         _compose("down", "--remove-orphans", timeout=60)
