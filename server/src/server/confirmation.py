@@ -3,12 +3,13 @@ import logging
 import secrets
 import sys
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
+from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
 from server.accounts import utc_now
-from server.models import confirmation_links
+from server.models import accounts, confirmation_links
 
 logger = logging.getLogger("server.confirmation")
 CONFIRMATION_LIFETIME = timedelta(hours=24)
@@ -54,3 +55,41 @@ def issue_confirmation_link(connection: Connection, account_id: uuid.UUID) -> st
 
 def log_confirmation_link(base_url: str, token: str, email: str) -> None:
     logger.info("%s %s", confirmation_url(base_url, token), email)
+
+
+def apply_confirmation(
+    connection: Connection, token: str, now: datetime
+) -> uuid.UUID | None:
+    if token == "":
+        return None
+    link = (
+        connection.execute(
+            select(confirmation_links).where(
+                confirmation_links.c.token_hash == hash_token(token)
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if link is None or link["revoked_at"] is not None or now > link["expires_at"]:
+        return None
+    updated = connection.execute(
+        confirmation_links.update()
+        .where(
+            confirmation_links.c.id == link["id"],
+            confirmation_links.c.revoked_at.is_(None),
+            confirmation_links.c.expires_at >= now,
+        )
+        .values(revoked_at=now)
+    )
+    if updated.rowcount != 1:
+        return None
+    connection.execute(
+        accounts.update()
+        .where(
+            accounts.c.id == link["account_id"],
+            accounts.c.email_confirmed_at.is_(None),
+        )
+        .values(email_confirmed_at=now)
+    )
+    return link["account_id"]

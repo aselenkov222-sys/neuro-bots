@@ -12,7 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 VERSIONS_DIR = PROJECT_ROOT / "alembic" / "versions"
 
-ACCOUNT_COLUMNS = ("id", "email", "password_hash", "name")
+ACCOUNT_COLUMNS = ("id", "email", "password_hash", "name", "email_confirmed_at")
 SESSION_COLUMNS = ("id", "account_id", "last_request_at")
 CONFIRMATION_LINK_COLUMNS = (
     "id",
@@ -22,6 +22,7 @@ CONFIRMATION_LINK_COLUMNS = (
     "revoked_at",
 )
 ACCOUNT_REVISION = "3c87a0f84d5e"
+CONFIRMATION_REVISION = "ff582d8bc7fb"
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -87,7 +88,9 @@ def _revision_chain() -> list[str]:
         assert len(children) == 1
         chain.append(children[0])
     assert set(chain) == set(links)
-    assert links[chain[-1]] == ACCOUNT_REVISION
+    assert links[CONFIRMATION_REVISION] == ACCOUNT_REVISION
+    assert links[chain[-1]] == CONFIRMATION_REVISION
+    assert chain[-1] != CONFIRMATION_REVISION
     return chain
 
 
@@ -182,6 +185,11 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert accounts.c.name.type.length == 80
     assert accounts.c.name.nullable is False
     assert accounts.c.name.server_default.arg.text == "''"
+    assert isinstance(accounts.c.email_confirmed_at.type, DateTime)
+    assert accounts.c.email_confirmed_at.type.timezone is True
+    assert accounts.c.email_confirmed_at.nullable is True
+    assert accounts.c.email_confirmed_at.default is None
+    assert accounts.c.email_confirmed_at.server_default is None
 
     assert isinstance(sessions.c.id.type, Uuid)
     assert sessions.c.id.nullable is False
@@ -285,6 +293,13 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                 assert account_columns["name"]["format_type"] == "character varying(80)"
                 assert account_columns["name"]["not_null"] is True
                 assert account_columns["name"]["column_default"] == "''::character varying"
+                assert account_columns["email_confirmed_at"]["type_name"] == "timestamptz"
+                assert (
+                    account_columns["email_confirmed_at"]["format_type"]
+                    == "timestamp with time zone"
+                )
+                assert account_columns["email_confirmed_at"]["not_null"] is False
+                assert account_columns["email_confirmed_at"]["column_default"] is None
                 assert _constraints(connection, "accounts") == {
                     ("p", "PRIMARY KEY (id)"),
                     ("u", "UNIQUE (email)"),

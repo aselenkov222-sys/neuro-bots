@@ -144,7 +144,9 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert server.models.confirmation_links.metadata is metadata
     chain = _revision_chain()
     assert chain[0] == ("3c87a0f84d5e", None)
-    assert chain[-1][1] == "3c87a0f84d5e"
+    assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
+    assert chain[-1][1] == "ff582d8bc7fb"
+    assert chain[-1][0] != "ff582d8bc7fb"
 
 
 def test_select_one_and_alembic_upgrade_head() -> None:
@@ -173,7 +175,9 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert upgrade.returncode == 0, upgrade.stderr + upgrade.stdout
         chain = _revision_chain()
         assert chain[0] == ("3c87a0f84d5e", None)
-        assert chain[-1][1] == "3c87a0f84d5e"
+        assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
+        assert chain[-1][1] == "ff582d8bc7fb"
+        assert chain[-1][0] != "ff582d8bc7fb"
         assert "Running upgrade" in upgrade.stderr + upgrade.stdout
 
         engine = create_db_engine()

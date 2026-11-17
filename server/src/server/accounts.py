@@ -1,3 +1,4 @@
+import calendar
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -39,6 +40,25 @@ def create_account(connection: Connection, email: str, password: str) -> uuid.UU
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def format_utc(moment: datetime) -> str:
+    if moment.tzinfo is None:
+        normalized = moment.replace(tzinfo=timezone.utc)
+    else:
+        normalized = moment.astimezone(timezone.utc)
+    return normalized.isoformat()
+
+
+def calendar_month_end(start: datetime) -> datetime:
+    if start.month == 12:
+        year = start.year + 1
+        month = 1
+    else:
+        year = start.year
+        month = start.month + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return start.replace(year=year, month=month, day=day)
 
 
 def session_is_current(last_request_at: datetime, now: datetime) -> bool:

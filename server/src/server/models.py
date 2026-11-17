@@ -9,6 +9,7 @@ accounts = Table(
     Column("email", String(254), nullable=False, unique=True),
     Column("password_hash", Text(), nullable=False),
     Column("name", String(80), nullable=False, server_default=text("''")),
+    Column("email_confirmed_at", DateTime(timezone=True), nullable=True),
 )
 
 sessions = Table(
