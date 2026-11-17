@@ -1,10 +1,22 @@
 import ast
 import subprocess
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import DateTime, String, Text, Uuid, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    text,
+)
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 
 from server.db import create_db_engine, metadata
 
@@ -21,8 +33,34 @@ CONFIRMATION_LINK_COLUMNS = (
     "expires_at",
     "revoked_at",
 )
+SUBSCRIPTION_PERIOD_COLUMNS = (
+    "id",
+    "account_id",
+    "started_at",
+    "ends_at",
+    "active",
+)
+QUOTA_COUNTER_COLUMNS = ("id", "period_id", "used")
+QUOTA_CHARGE_COLUMNS = ("id", "period_id", "created_at")
+BOT_COLUMNS = (
+    "id",
+    "account_id",
+    "name",
+    "color",
+    "icon",
+    "description",
+    "scenario",
+    "updated_at",
+)
+CHAT_COLUMNS = ("id", "bot_id", "updated_at")
+MESSAGE_COLUMNS = ("id", "chat_id", "role", "text", "code", "updated_at")
 ACCOUNT_REVISION = "3c87a0f84d5e"
 CONFIRMATION_REVISION = "ff582d8bc7fb"
+EMAIL_CONFIRMED_REVISION = "048ee727aa3e"
+MESSAGE_ROLE_CHECK = (
+    "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
+    "'assistant'::character varying, 'error'::character varying])::text[])))"
+)
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -89,8 +127,10 @@ def _revision_chain() -> list[str]:
         chain.append(children[0])
     assert set(chain) == set(links)
     assert links[CONFIRMATION_REVISION] == ACCOUNT_REVISION
-    assert links[chain[-1]] == CONFIRMATION_REVISION
+    assert links[EMAIL_CONFIRMED_REVISION] == CONFIRMATION_REVISION
+    assert links[chain[-1]] == EMAIL_CONFIRMED_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
+    assert chain[-1] != EMAIL_CONFIRMED_REVISION
     return chain
 
 
@@ -154,23 +194,187 @@ def _constraints(connection: Connection, table_name: str) -> set[tuple[str, str]
     }
 
 
+def _assert_model_column(
+    column: object,
+    type_: type[object],
+    *,
+    nullable: bool,
+    length: int | None = None,
+    timezone: bool | None = None,
+    unique: bool = False,
+    foreign_table: str | None = None,
+) -> None:
+    assert isinstance(column.type, type_)
+    assert column.nullable is nullable
+    assert column.default is None
+    assert column.server_default is None
+    if length is not None:
+        assert column.type.length == length
+    if timezone is not None:
+        assert column.type.timezone is timezone
+    assert column.unique is (True if unique else None)
+    foreign_keys = list(column.foreign_keys)
+    if foreign_table is None:
+        assert foreign_keys == []
+    else:
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0].column.table.name == foreign_table
+        assert foreign_keys[0].column.name == "id"
+        assert foreign_keys[0].ondelete is None
+
+
+def _assert_catalog_column(
+    columns: dict[str, dict[str, object]],
+    name: str,
+    type_name: str,
+    format_type: str,
+    *,
+    not_null: bool,
+) -> None:
+    assert columns[name]["type_name"] == type_name
+    assert columns[name]["format_type"] == format_type
+    assert columns[name]["not_null"] is not_null
+    assert columns[name]["column_default"] is None
+
+
+def _insert_accepted_message_roles(connection: Connection) -> None:
+    account_id = uuid.uuid4()
+    bot_id = uuid.uuid4()
+    chat_id = uuid.uuid4()
+    moment = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+    connection.execute(
+        text(
+            """
+            INSERT INTO accounts (id, email, password_hash, name)
+            VALUES (:id, :email, :password_hash, :name)
+            """
+        ),
+        {
+            "id": account_id,
+            "email": "message-role@example.com",
+            "password_hash": "not-a-password",
+            "name": "",
+        },
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO bots (
+                id, account_id, name, color, icon,
+                description, scenario, updated_at
+            )
+            VALUES (
+                :id, :account_id, :name, :color, :icon,
+                :description, :scenario, :updated_at
+            )
+            """
+        ),
+        {
+            "id": bot_id,
+            "account_id": account_id,
+            "name": "Bot",
+            "color": "#c85a12",
+            "icon": "spark",
+            "description": "",
+            "scenario": "",
+            "updated_at": moment,
+        },
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO chats (id, bot_id, updated_at)
+            VALUES (:id, :bot_id, :updated_at)
+            """
+        ),
+        {"id": chat_id, "bot_id": bot_id, "updated_at": moment},
+    )
+    for role in ("user", "assistant", "error"):
+        connection.execute(
+            text(
+                """
+                INSERT INTO messages (id, chat_id, role, text, code, updated_at)
+                VALUES (:id, :chat_id, :role, :text, :code, :updated_at)
+                """
+            ),
+            {
+                "id": uuid.uuid4(),
+                "chat_id": chat_id,
+                "role": role,
+                "text": role,
+                "code": None,
+                "updated_at": moment,
+            },
+        )
+    stored = (
+        connection.execute(text("SELECT role FROM messages ORDER BY role"))
+        .scalars()
+        .all()
+    )
+    assert tuple(stored) == ("assistant", "error", "user")
+    try:
+        connection.execute(
+            text(
+                """
+                INSERT INTO messages (id, chat_id, role, text, code, updated_at)
+                VALUES (:id, :chat_id, :role, :text, :code, :updated_at)
+                """
+            ),
+            {
+                "id": uuid.uuid4(),
+                "chat_id": chat_id,
+                "role": "system",
+                "text": "no",
+                "code": None,
+                "updated_at": moment,
+            },
+        )
+    except IntegrityError:
+        return
+    raise AssertionError("message role system was stored")
+
+
 def test_upgrade_head_creates_accounts_and_sessions() -> None:
     import server.models
 
     accounts = metadata.tables["accounts"]
     sessions = metadata.tables["sessions"]
     confirmation_links = metadata.tables["confirmation_links"]
+    subscription_periods = metadata.tables["subscription_periods"]
+    quota_counters = metadata.tables["quota_counters"]
+    quota_charges = metadata.tables["quota_charges"]
+    bots = metadata.tables["bots"]
+    chats = metadata.tables["chats"]
+    messages = metadata.tables["messages"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
         "confirmation_links",
+        "subscription_periods",
+        "quota_counters",
+        "quota_charges",
+        "bots",
+        "chats",
+        "messages",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
     assert confirmation_links is server.models.confirmation_links
+    assert subscription_periods is server.models.subscription_periods
+    assert quota_counters is server.models.quota_counters
+    assert quota_charges is server.models.quota_charges
+    assert bots is server.models.bots
+    assert chats is server.models.chats
+    assert messages is server.models.messages
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
+    assert tuple(subscription_periods.columns.keys()) == SUBSCRIPTION_PERIOD_COLUMNS
+    assert tuple(quota_counters.columns.keys()) == QUOTA_COUNTER_COLUMNS
+    assert tuple(quota_charges.columns.keys()) == QUOTA_CHARGE_COLUMNS
+    assert tuple(bots.columns.keys()) == BOT_COLUMNS
+    assert tuple(chats.columns.keys()) == CHAT_COLUMNS
+    assert tuple(messages.columns.keys()) == MESSAGE_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -235,6 +439,124 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert confirmation_links.c.revoked_at.default is None
     assert confirmation_links.c.revoked_at.server_default is None
 
+    assert [column.name for column in subscription_periods.primary_key] == ["id"]
+    _assert_model_column(subscription_periods.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        subscription_periods.c.account_id,
+        Uuid,
+        nullable=False,
+        foreign_table="accounts",
+    )
+    _assert_model_column(
+        subscription_periods.c.started_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    _assert_model_column(
+        subscription_periods.c.ends_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    _assert_model_column(subscription_periods.c.active, Boolean, nullable=False)
+
+    assert [column.name for column in quota_counters.primary_key] == ["id"]
+    _assert_model_column(quota_counters.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        quota_counters.c.period_id,
+        Uuid,
+        nullable=False,
+        unique=True,
+        foreign_table="subscription_periods",
+    )
+    _assert_model_column(quota_counters.c.used, Integer, nullable=False)
+
+    assert [column.name for column in quota_charges.primary_key] == ["id"]
+    _assert_model_column(quota_charges.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        quota_charges.c.period_id,
+        Uuid,
+        nullable=False,
+        foreign_table="subscription_periods",
+    )
+    _assert_model_column(
+        quota_charges.c.created_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+
+    assert [column.name for column in bots.primary_key] == ["id"]
+    _assert_model_column(bots.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        bots.c.account_id,
+        Uuid,
+        nullable=False,
+        foreign_table="accounts",
+    )
+    _assert_model_column(bots.c.name, String, nullable=False, length=80)
+    _assert_model_column(bots.c.color, String, nullable=False, length=7)
+    _assert_model_column(bots.c.icon, String, nullable=False, length=32)
+    _assert_model_column(bots.c.description, String, nullable=False, length=280)
+    _assert_model_column(bots.c.scenario, String, nullable=False, length=16000)
+    _assert_model_column(
+        bots.c.updated_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+
+    assert [column.name for column in chats.primary_key] == ["id"]
+    _assert_model_column(chats.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        chats.c.bot_id,
+        Uuid,
+        nullable=False,
+        foreign_table="bots",
+    )
+    _assert_model_column(
+        chats.c.updated_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+
+    assert [column.name for column in messages.primary_key] == ["id"]
+    _assert_model_column(messages.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        messages.c.chat_id,
+        Uuid,
+        nullable=False,
+        foreign_table="chats",
+    )
+    _assert_model_column(messages.c.role, String, nullable=False, length=16)
+    _assert_model_column(messages.c.text, Text, nullable=False)
+    _assert_model_column(messages.c.code, Text, nullable=True)
+    _assert_model_column(
+        messages.c.updated_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in messages.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == [("messages_role_check", "role IN ('user', 'assistant', 'error')")]
+    for table in (
+        subscription_periods,
+        quota_counters,
+        quota_charges,
+        bots,
+        chats,
+    ):
+        assert [
+            constraint
+            for constraint in table.constraints
+            if isinstance(constraint, CheckConstraint)
+        ] == []
+
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
     assert down.returncode == 0, down.stderr
@@ -268,6 +590,12 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "accounts",
                     "sessions",
                     "confirmation_links",
+                    "subscription_periods",
+                    "quota_counters",
+                    "quota_charges",
+                    "bots",
+                    "chats",
+                    "messages",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -365,6 +693,215 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                         "FOREIGN KEY (account_id) REFERENCES accounts(id)",
                     ),
                 }
+
+                period_columns = _columns(connection, "subscription_periods")
+                assert tuple(period_columns) == SUBSCRIPTION_PERIOD_COLUMNS
+                _assert_catalog_column(period_columns, "id", "uuid", "uuid", not_null=True)
+                _assert_catalog_column(
+                    period_columns, "account_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    period_columns,
+                    "started_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    period_columns,
+                    "ends_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    period_columns, "active", "bool", "boolean", not_null=True
+                )
+                assert _constraints(connection, "subscription_periods") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+                    ),
+                }
+
+                counter_columns = _columns(connection, "quota_counters")
+                assert tuple(counter_columns) == QUOTA_COUNTER_COLUMNS
+                _assert_catalog_column(
+                    counter_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    counter_columns, "period_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    counter_columns, "used", "int4", "integer", not_null=True
+                )
+                assert _constraints(connection, "quota_counters") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    ("u", "UNIQUE (period_id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (period_id) REFERENCES subscription_periods(id)",
+                    ),
+                }
+
+                charge_columns = _columns(connection, "quota_charges")
+                assert tuple(charge_columns) == QUOTA_CHARGE_COLUMNS
+                _assert_catalog_column(
+                    charge_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    charge_columns, "period_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    charge_columns,
+                    "created_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "quota_charges") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (period_id) REFERENCES subscription_periods(id)",
+                    ),
+                }
+
+                bot_columns = _columns(connection, "bots")
+                assert tuple(bot_columns) == BOT_COLUMNS
+                _assert_catalog_column(bot_columns, "id", "uuid", "uuid", not_null=True)
+                _assert_catalog_column(
+                    bot_columns, "account_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    bot_columns,
+                    "name",
+                    "varchar",
+                    "character varying(80)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    bot_columns,
+                    "color",
+                    "varchar",
+                    "character varying(7)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    bot_columns,
+                    "icon",
+                    "varchar",
+                    "character varying(32)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    bot_columns,
+                    "description",
+                    "varchar",
+                    "character varying(280)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    bot_columns,
+                    "scenario",
+                    "varchar",
+                    "character varying(16000)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    bot_columns,
+                    "updated_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "bots") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+                    ),
+                }
+
+                chat_columns = _columns(connection, "chats")
+                assert tuple(chat_columns) == CHAT_COLUMNS
+                _assert_catalog_column(chat_columns, "id", "uuid", "uuid", not_null=True)
+                _assert_catalog_column(
+                    chat_columns, "bot_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    chat_columns,
+                    "updated_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "chats") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (bot_id) REFERENCES bots(id)",
+                    ),
+                }
+
+                message_columns = _columns(connection, "messages")
+                assert tuple(message_columns) == MESSAGE_COLUMNS
+                _assert_catalog_column(
+                    message_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    message_columns, "chat_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    message_columns,
+                    "role",
+                    "varchar",
+                    "character varying(16)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    message_columns, "text", "text", "text", not_null=True
+                )
+                _assert_catalog_column(
+                    message_columns, "code", "text", "text", not_null=False
+                )
+                _assert_catalog_column(
+                    message_columns,
+                    "updated_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "messages") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (chat_id) REFERENCES chats(id)",
+                    ),
+                    ("c", MESSAGE_ROLE_CHECK),
+                }
+                try:
+                    _insert_accepted_message_roles(connection)
+                finally:
+                    connection.rollback()
+                for table_name in (
+                    "accounts",
+                    "sessions",
+                    "confirmation_links",
+                    "subscription_periods",
+                    "quota_counters",
+                    "quota_charges",
+                    "bots",
+                    "chats",
+                    "messages",
+                ):
+                    assert (
+                        connection.execute(
+                            text(f"SELECT count(*) FROM {table_name}")
+                        ).scalar_one()
+                        == 0
+                    )
         finally:
             engine.dispose()
     finally:
