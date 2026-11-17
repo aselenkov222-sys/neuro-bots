@@ -1,10 +1,12 @@
 import json
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError
 
 from server.accounts import (
@@ -12,8 +14,14 @@ from server.accounts import (
     EmailTooLong,
     create_account,
     create_session,
+    delete_session,
     find_account_by_email,
+    find_account_by_id,
+    find_session,
     normalize_email,
+    session_is_current,
+    touch_session,
+    utc_now,
 )
 from server.db import create_db_engine
 from server.passwords import PasswordNotAccepted, password_accepted, verify_password
@@ -50,24 +58,26 @@ async def read_credentials(request: Request) -> tuple[str, str] | JSONResponse:
     return email, password
 
 
+def account_document(account_id: object, email: str, name: str) -> dict[str, object]:
+    return {
+        "account": {
+            "id": str(account_id),
+            "email": email,
+            "name": name,
+        },
+        "email_confirmed": False,
+        "period": None,
+        "quota": None,
+    }
+
+
 def opened_session(
     account_id: object,
     email: str,
     name: str,
     session_id: object,
 ) -> JSONResponse:
-    response = JSONResponse(
-        {
-            "account": {
-                "id": str(account_id),
-                "email": email,
-                "name": name,
-            },
-            "email_confirmed": False,
-            "period": None,
-            "quota": None,
-        }
-    )
+    response = JSONResponse(account_document(account_id, email, name))
     response.set_cookie(
         key="session",
         value=str(session_id),
@@ -143,3 +153,74 @@ async def login(request: Request) -> JSONResponse:
         )
     account_id, stored_email, name, session_id = opened
     return opened_session(account_id, stored_email, name, session_id)
+
+
+def session_id_from_cookie(request: Request) -> uuid.UUID | None:
+    raw = request.cookies.get("session")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        return None
+
+
+def current_account(
+    connection: Connection, request: Request, now: datetime
+) -> tuple[RowMapping, RowMapping] | None:
+    session_id = session_id_from_cookie(request)
+    if session_id is None:
+        return None
+    session = find_session(connection, session_id)
+    if session is None or not session_is_current(session["last_request_at"], now):
+        return None
+    account = find_account_by_id(connection, session["account_id"])
+    if account is None:
+        return None
+    return session, account
+
+
+def unauthenticated() -> JSONResponse:
+    return error_response(401, "unauthenticated", "Нужна сессия.")
+
+
+@router.get("/api/me")
+def me(request: Request) -> JSONResponse:
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            document = None
+        else:
+            session, account = current
+            touch_session(connection, session["id"], now)
+            document = account_document(account["id"], account["email"], account["name"])
+    if document is None:
+        return unauthenticated()
+    return JSONResponse(document)
+
+
+@router.post("/api/logout")
+def logout(request: Request) -> JSONResponse:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            removed = False
+        else:
+            delete_session(connection, current[0]["id"])
+            removed = True
+    if not removed:
+        return unauthenticated()
+    response = JSONResponse({})
+    response.delete_cookie(
+        key="session",
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
+    return response
