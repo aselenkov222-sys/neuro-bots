@@ -1,13 +1,19 @@
-import importlib
+import importlib.metadata
 import os
+import sys
+import threading
 
 PYWEBVIEW = "pywebview"
 PYSIDE6 = "pyside6"
 _QUIT_COMMAND = "Выйти"
-_tray_held: list[object] = []
-
 _PYWEBVIEW_PACKAGE = "webview"
 _MACOS_WEBKIT_BINDING = "webview.platforms.cocoa"
+
+_tray_held: list[object] = []
+_tray_installed = False
+_tray_ready = threading.Event()
+command_quit_action = None
+tray_quit_action = None
 
 
 def window_library() -> str:
@@ -22,21 +28,57 @@ def _pywebview_imports() -> bool:
         importlib.import_module(_MACOS_WEBKIT_BINDING)
     except ImportError:
         return False
-    return True
+    try:
+        version = importlib.metadata.version("pywebview")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    numbers = version.split(".")
+    return len(numbers) >= 2 and numbers[0] == "6" and numbers[1] == "2"
 
 
-def open_cabinet(origin: str) -> None:
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) != 1 or not argv[0]:
+        raise SystemExit("usage: python -m desktop ORIGIN")
+    open_cabinet(argv[0])
+
+
+def open_cabinet(origin: str, on_ready=None) -> None:
     if window_library() == PYWEBVIEW:
-        _open_pywebview(origin)
+        _open_pywebview(origin, on_ready)
         return
-    _open_pyside6(origin)
+    _open_pyside6(origin, on_ready)
 
 
-def _open_pywebview(origin: str) -> None:
+def _open_pywebview(origin: str, on_ready) -> None:
+    global _tray_installed
+    _tray_installed = False
+    _tray_ready.clear()
+    _stop_app_quit_with_command()
     webview = importlib.import_module(_PYWEBVIEW_PACKAGE)
-    window = webview.create_window("", url=origin)
+    menu_module = importlib.import_module("webview.menu")
+    window = webview.create_window(
+        "Кабинет",
+        url=origin,
+        menu=[menu_module.Menu("Кабинет", [menu_module.MenuAction(_QUIT_COMMAND, _quit_command)])],
+    )
     _hide_pywebview_on_close(window)
-    webview.start(_install_cocoa_quit_tray)
+    window.events.before_show += _install_cocoa_quit_tray
+    if on_ready is not None:
+        sent = {"done": False}
+
+        def loaded() -> None:
+            if sent["done"]:
+                return
+            sent["done"] = True
+            on_ready(window)
+
+        window.events.loaded += loaded
+    webview.start(
+        _install_cocoa_quit_tray,
+        localization={"cocoa.menu.quit": _QUIT_COMMAND, "global.quit": _QUIT_COMMAND},
+    )
 
 
 def _hide_pywebview_on_close(window) -> None:
@@ -47,12 +89,35 @@ def _hide_pywebview_on_close(window) -> None:
     window.events.closing += on_closing
 
 
+def _stop_app_quit_with_command() -> None:
+    cocoa = importlib.import_module(_MACOS_WEBKIT_BINDING)
+    foundation = importlib.import_module("Foundation")
+
+    def applicationShouldTerminate_(self, app):
+        _quit_command()
+        return foundation.YES
+
+    cocoa.BrowserView.AppDelegate.applicationShouldTerminate_ = applicationShouldTerminate_
+
+
 def _install_cocoa_quit_tray() -> None:
+    if threading.current_thread() is threading.main_thread():
+        _install_cocoa_tray_on_main()
+        return
+    app_helper = importlib.import_module("PyObjCTools.AppHelper")
+    app_helper.callAfter(_install_cocoa_tray_on_main)
+
+
+def _install_cocoa_tray_on_main() -> None:
+    global _tray_installed, tray_quit_action
+    if _tray_installed:
+        return
+    _tray_installed = True
     appkit = importlib.import_module("AppKit")
 
     class QuitTarget(appkit.NSObject):
         def quit_(self, _sender) -> None:
-            _stop_process()
+            _quit_from_tray()
 
     target = QuitTarget.alloc().init()
     status_item = appkit.NSStatusBar.systemStatusBar().statusItemWithLength_(
@@ -67,19 +132,42 @@ def _install_cocoa_quit_tray() -> None:
     status_item.setMenu_(menu)
     button = status_item.button()
     if button is not None:
-        button.setTitle_("·")
+        button.setTitle_("Кабинет")
+    tray_quit_action = command
     _tray_held.append((status_item, menu, command, target))
+    _tray_ready.set()
 
 
-def _open_pyside6(origin: str) -> None:
+def _open_pyside6(origin: str, on_ready) -> None:
+    global command_quit_action, tray_quit_action
     qt_core = importlib.import_module("PySide6.QtCore")
     webengine = importlib.import_module("PySide6.QtWebEngineWidgets")
     widgets = importlib.import_module("PySide6.QtWidgets")
     gui = importlib.import_module("PySide6.QtGui")
+    pyside = importlib.import_module("PySide6")
+    numbers = pyside.__version__.split(".")
+    if len(numbers) < 2 or numbers[0] != "6" or numbers[1] != "12":
+        raise RuntimeError(pyside.__version__)
     application = widgets.QApplication.instance() or widgets.QApplication([])
+    if type(application).__module__.startswith("PySide6"):
+        application.setQuitOnLastWindowClosed(False)
     view = _cabinet_view(webengine.QWebEngineView)()
+    command_quit_action = _pyside_quit_command(widgets, gui, view)
+    tray_quit_action = _install_pyside_quit_tray(widgets, gui, application)
+    if on_ready is not None:
+        sent = {"done": False}
+
+        def loaded(_ok: bool) -> None:
+            if sent["done"]:
+                return
+            current = view.url().toString().rstrip("/")
+            if current != origin.rstrip("/"):
+                return
+            sent["done"] = True
+            on_ready(view)
+
+        view.loadFinished.connect(loaded)
     view.load(qt_core.QUrl(origin))
-    _install_pyside_quit_tray(widgets, gui, application)
     view.show()
     application.exec()
 
@@ -90,14 +178,31 @@ def _cabinet_view(base):
             event.ignore()
             self.hide()
 
+    CabinetView._qt_base = base
     return CabinetView
 
 
-def _install_pyside_quit_tray(widgets, gui, application) -> None:
+def _pyside_quit_command(widgets, gui, view):
+    action = gui.QAction(_QUIT_COMMAND)
+    action.triggered.connect(_quit_command)
+    base = getattr(type(view), "_qt_base", None)
+    if base is not None and type(base).__module__.startswith("PySide6"):
+        bar = widgets.QMenuBar()
+        bar.addMenu("Кабинет").addAction(action)
+        bar.show()
+        _tray_held.append(bar)
+    else:
+        menu = widgets.QMenu()
+        menu.addAction(action)
+        _tray_held.append(menu)
+    return action
+
+
+def _install_pyside_quit_tray(widgets, gui, application):
     tray = widgets.QSystemTrayIcon(application)
     menu = widgets.QMenu()
     command = gui.QAction(_QUIT_COMMAND)
-    command.triggered.connect(_stop_process)
+    command.triggered.connect(_quit_from_tray)
     menu.addAction(command)
     tray.setContextMenu(menu)
     tray.setIcon(
@@ -105,6 +210,15 @@ def _install_pyside_quit_tray(widgets, gui, application) -> None:
     )
     tray.show()
     _tray_held.append(tray)
+    return command
+
+
+def _quit_command() -> None:
+    _stop_process()
+
+
+def _quit_from_tray() -> None:
+    _stop_process()
 
 
 def _stop_process() -> None:
