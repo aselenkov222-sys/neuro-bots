@@ -34,6 +34,7 @@ const state = {
   activeId: null,
   savedFlash: false,
   draft: "",
+  notice: "",
   bots: [],
   card: null,
   messages: []
@@ -116,12 +117,28 @@ function formatLocal(value) {
   return date.toLocaleString();
 }
 
+function logoutControl() {
+  return '<button type="button" class="btn-quiet" data-action="logout">Выход</button>';
+}
+
+function noticeHtml() {
+  if (!state.notice) return "";
+  return `<p class="flash" role="status">${esc(state.notice)}</p>`;
+}
+
+function note(result) {
+  const message = result && result.data && result.data.message;
+  if (typeof message === "string") state.notice = message;
+  else if (result && result.ok) state.notice = "";
+}
+
 function tariffScreen() {
   const resend = state.me && state.me.email_confirmed === false
     ? '<div class="actions" style="margin-top:12px"><button type="button" class="btn-orange" data-action="resend">Прислать новую</button></div>'
     : "";
   return `
-    ${topbar("Тариф", "")}
+    ${topbar("Тариф", "", logoutControl())}
+    ${noticeHtml()}
     <article class="tariff sheet"></article>
     ${resend}`;
 }
@@ -129,6 +146,7 @@ function tariffScreen() {
 function registerScreen() {
   return `
     ${topbar("Регистрация", "")}
+    ${noticeHtml()}
     <form class="panel sheet" data-form="register">
       <div class="fields">
         <label class="field" for="register-email">Почта
@@ -148,6 +166,7 @@ function registerScreen() {
 function loginScreen() {
   return `
     ${topbar("Вход", "")}
+    ${noticeHtml()}
     <form class="panel sheet" data-form="login">
       <div class="fields">
         <label class="field" for="login-email">Почта
@@ -202,17 +221,19 @@ function botsScreen() {
     </form>` : "";
 
   return `
-    ${topbar("Боты", "", '<button type="button" class="btn-orange" data-action="open-create">Создать бота</button>')}
+    ${topbar("Боты", "", '<button type="button" class="btn-orange" data-action="open-create">Создать бота</button>' + logoutControl())}
+    ${noticeHtml()}
     <div class="bot-grid">${state.bots.map(botCard).join("")}</div>
     ${form}`;
 }
 
 function botScreen() {
   const bot = state.card;
-  if (!bot) return `${topbar("Карточка бота", "")}`;
+  if (!bot) return `${topbar("Карточка бота", "", logoutControl())}${noticeHtml()}`;
   const dirty = state.draft !== bot.scenario;
   return `
-    ${topbar(esc(bot.name), "Карточка бота", '<a class="btn-green" href="#chat">В чат</a>')}
+    ${topbar(esc(bot.name), "Карточка бота", '<a class="btn-green" href="#chat">В чат</a>' + logoutControl())}
+    ${noticeHtml()}
     <section class="identity raised">
       <span class="avatar lg" style="--av:${bot.color}">${icon(bot.icon)}</span>
       <div class="identity-main">
@@ -251,7 +272,8 @@ function chatScreen() {
   const bot = state.card || { name: "", color: "#c85a12", icon: "spark" };
   const thread = state.messages.map((message) => messageHtml(message, bot)).join("");
   return `
-    ${topbar("Чаты", "")}
+    ${topbar("Чаты", "", logoutControl())}
+    ${noticeHtml()}
     <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
       <div class="thread-head">
         <h2 class="thread-title">${esc(bot.name)}</h2>
@@ -301,12 +323,14 @@ function render() {
 
 async function loadBots() {
   const result = await api("/api/bots");
+  note(result);
   if (result.ok && result.data) state.bots = result.data.bots;
 }
 
 async function loadCard() {
   if (!state.activeId) return;
   const result = await api(`/api/bots/${state.activeId}`);
+  note(result);
   if (!result.ok || !result.data) return;
   state.card = result.data;
   state.draft = result.data.scenario;
@@ -316,6 +340,7 @@ async function loadMessages() {
   if (!state.activeId) return;
   if (!state.card || state.card.id !== state.activeId) await loadCard();
   const result = await api(`/api/bots/${state.activeId}/messages`);
+  note(result);
   if (result.ok && result.data) state.messages = result.data.messages;
 }
 
@@ -334,7 +359,11 @@ async function showCurrent() {
 async function patchBot(changes) {
   if (!state.activeId) return;
   const result = await api(`/api/bots/${state.activeId}`, { method: "PATCH", body: changes });
-  if (!result.ok || !result.data) return;
+  note(result);
+  if (!result.ok || !result.data) {
+    render();
+    return;
+  }
   state.card = result.data;
   if (Object.prototype.hasOwnProperty.call(changes, "scenario")) state.draft = result.data.scenario;
   const index = state.bots.findIndex((item) => item.id === result.data.id);
@@ -346,7 +375,11 @@ async function submitRegister() {
   const email = document.getElementById("register-email").value;
   const password = document.getElementById("register-password").value;
   const result = await api("/api/register", { method: "POST", body: { email, password } });
-  if (!result.ok) return;
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
   state.me = result.data;
   location.hash = "#tariff";
 }
@@ -355,7 +388,11 @@ async function submitLogin() {
   const email = document.getElementById("login-email").value;
   const password = document.getElementById("login-password").value;
   const result = await api("/api/login", { method: "POST", body: { email, password } });
-  if (!result.ok) return;
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
   state.me = result.data;
   state.activeId = null;
   location.hash = result.data.email_confirmed ? "#bots" : "#tariff";
@@ -374,7 +411,11 @@ async function submitCreate() {
       icon: draft.icon
     }
   });
-  if (!result.ok || !result.data) return;
+  note(result);
+  if (!result.ok || !result.data) {
+    render();
+    return;
+  }
   state.bots.push(result.data);
   state.creating = null;
   render();
@@ -388,7 +429,11 @@ async function submitMessage() {
     method: "POST",
     body: { text }
   });
-  if (!result.ok || !result.data) return;
+  note(result);
+  if (!result.ok || !result.data) {
+    render();
+    return;
+  }
   state.messages = result.data.messages;
   render();
   const next = document.getElementById("composer");
@@ -452,7 +497,11 @@ app.addEventListener("click", (event) => {
   if (!target || target.disabled) return;
   const action = target.dataset.action;
   if (action === "resend") {
-    api("/api/confirmation", { method: "POST" });
+    sendConfirmation();
+    return;
+  }
+  if (action === "logout") {
+    signOut();
     return;
   }
   if (action === "open-create") {
@@ -492,16 +541,42 @@ app.addEventListener("click", (event) => {
   restoreFocus(target);
 });
 
+async function sendConfirmation() {
+  const result = await api("/api/confirmation", { method: "POST" });
+  note(result);
+  if (result.ok && result.data) state.me = result.data;
+  render();
+}
+
+async function signOut() {
+  const result = await api("/api/logout", { method: "POST" });
+  note(result);
+  state.me = null;
+  state.activeId = null;
+  state.creating = null;
+  state.savedFlash = false;
+  state.draft = "";
+  state.bots = [];
+  state.card = null;
+  state.messages = [];
+  if (location.hash !== "#login") location.hash = "#login";
+  else render();
+}
+
 async function boot() {
   if (location.pathname === "/api/confirm-email") {
     const result = await api(`${location.pathname}${location.search}`, {
       headers: { Accept: "application/json" }
     });
+    note(result);
     const destination = result.data && result.data.destination;
     const next = destination === "bots" || destination === "login" || destination === "tariff"
       ? destination
       : "register";
-    location.replace(`/#${next}`);
+    const me = await api("/api/me");
+    state.me = me.status === 401 || !me.ok ? null : me.data;
+    history.replaceState(null, "", `/#${next}`);
+    await showCurrent();
     return;
   }
   const me = await api("/api/me");

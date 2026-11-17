@@ -201,3 +201,93 @@ def test_browser_registers_confirms_and_sends_one_stub_message(database: None) -
             browser.close()
     finally:
         _stop(process, journal)
+
+
+def test_browser_shows_message_and_logout(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"cabinet-{uuid.uuid4()}@example.com"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/#login")
+            page.wait_for_selector("h1")
+            assert page.locator("h1").inner_text() == "Вход"
+            assert page.locator("button", has_text="Выход").count() == 0
+            page.fill("#login-email", f"missing-{uuid.uuid4()}@example.com")
+            page.fill("#login-password", ACCEPTED)
+            page.click("button:has-text('Войти')")
+            page.wait_for_selector("[role='status']")
+            assert page.locator("h1").inner_text() == "Вход"
+            assert page.locator("[role='status']").inner_text() == "Почта или пароль не сходятся"
+            assert "invalid_credentials" not in page.locator("[role='status']").inner_text()
+
+            page.click("text=Регистрация")
+            page.wait_for_selector("#register-email")
+            assert page.locator("button", has_text="Выход").count() == 0
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            assert page.locator("h1").inner_text() == "Тариф"
+            assert page.locator("button", has_text="Выход").count() == 1
+
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            link = _confirmation_urls(journal.text(), email)[-1]
+            page.goto(link)
+            page.wait_for_selector("text=Создать бота")
+            assert page.locator("h1").inner_text() == "Боты"
+            assert page.locator("button", has_text="Выход").count() == 1
+
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Заметки")
+            page.click("#save-bot")
+            page.wait_for_selector(".bot-card")
+            page.click(".bot-card")
+            page.wait_for_selector("text=Карточка бота")
+            assert page.locator("button", has_text="Выход").count() == 1
+            page.click("text=В чат")
+            page.wait_for_selector("#composer")
+            assert page.locator("button", has_text="Выход").count() == 1
+
+            page.click("button:has-text('Выход')")
+            page.wait_for_selector("text=Войти")
+            assert page.locator("h1").inner_text() == "Вход"
+            page.goto(f"{origin}/")
+            page.wait_for_selector("h1")
+            assert page.locator("h1").inner_text() == "Регистрация"
+            assert page.locator("text=Создать бота").count() == 0
+
+            page.goto(link)
+            page.wait_for_selector("[role='status']")
+            assert page.locator("[role='status']").inner_text() == "Ссылка больше не действует"
+            browser.close()
+    finally:
+        _stop(process, journal)
