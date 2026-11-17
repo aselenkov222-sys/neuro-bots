@@ -71,6 +71,41 @@ async function api(path, options) {
   return { ok: response.ok, status: response.status, data };
 }
 
+const PULSE_INTERVAL_MS = 30000;
+let pulseTimer = null;
+
+function claimDesktop() {
+  const bridge = window.__neuroDesktop;
+  if (!state.me || !bridge || typeof bridge.id !== "string") return;
+  api("/api/desktops", { method: "POST", body: { id: bridge.id } }).then((result) => {
+    if (!result.ok || !result.data || result.data.working !== true) return;
+    const current = window.__neuroDesktop;
+    if (!current || typeof current.id !== "string" || typeof current.timezone !== "string") return;
+    startPulse();
+  }).catch(() => {});
+}
+
+function sendPulse() {
+  const bridge = window.__neuroDesktop;
+  if (!state.me || !bridge || typeof bridge.id !== "string" || typeof bridge.timezone !== "string") return;
+  api(`/api/desktops/${bridge.id}/pulse`, {
+    method: "POST",
+    body: { timezone: bridge.timezone }
+  }).catch(() => {});
+}
+
+function startPulse() {
+  if (pulseTimer !== null) return;
+  sendPulse();
+  pulseTimer = setInterval(sendPulse, PULSE_INTERVAL_MS);
+}
+
+function stopPulse() {
+  if (pulseTimer === null) return;
+  clearInterval(pulseTimer);
+  pulseTimer = null;
+}
+
 function screen() {
   const hash = location.hash;
   if (hash === "#tariff" || hash === "#bots" || hash === "#bot" || hash === "#chat" || hash === "#register" || hash === "#login") {
@@ -382,6 +417,7 @@ async function submitRegister() {
     return;
   }
   state.me = result.data;
+  claimDesktop();
   location.hash = "#tariff";
 }
 
@@ -396,6 +432,7 @@ async function submitLogin() {
   }
   state.me = result.data;
   state.activeId = null;
+  claimDesktop();
   location.hash = result.data.email_confirmed ? "#bots" : "#tariff";
 }
 
@@ -550,6 +587,7 @@ async function sendConfirmation() {
 }
 
 async function signOut() {
+  stopPulse();
   const result = await api("/api/logout", { method: "POST" });
   note(result);
   state.me = null;
@@ -579,15 +617,20 @@ async function boot() {
     state.me = me.status === 401 || !me.ok ? null : me.data;
     state.holdTariff = next === "tariff";
     history.replaceState(null, "", `/#${next}`);
+    claimDesktop();
     await showCurrent();
     return;
   }
   const me = await api("/api/me");
   state.me = me.status === 401 || !me.ok ? null : me.data;
+  claimDesktop();
   await showCurrent();
 }
 
 window.addEventListener("hashchange", () => {
   showCurrent();
+});
+window.addEventListener("neuro-desktop", () => {
+  claimDesktop();
 });
 boot();

@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from server.auth import router
 from server.bots import router as bots_router
 from server.db import database_responds
+from server.desktops import router as desktops_router
 
 app = FastAPI()
 
@@ -27,4 +28,5 @@ def health() -> Response:
 
 app.include_router(router)
 app.include_router(bots_router)
+app.include_router(desktops_router)
 app.mount("/", StaticFiles(directory=_WEB_DIR, html=True), name="web")

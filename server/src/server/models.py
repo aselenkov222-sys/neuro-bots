@@ -4,10 +4,12 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Table,
     Text,
+    UniqueConstraint,
     Uuid,
     text,
 )
@@ -112,5 +114,24 @@ messages = Table(
     CheckConstraint(
         "role IN ('user', 'assistant', 'error')",
         name="messages_role_check",
+    ),
+)
+
+desktops = Table(
+    "desktops",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("account_id", Uuid(), ForeignKey("accounts.id"), nullable=False),
+    Column("computer_id", Uuid(), nullable=False),
+    Column("working", Boolean(), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("timezone", Text(), nullable=True),
+    Column("last_pulse_at", DateTime(timezone=True), nullable=True),
+    UniqueConstraint("account_id", "computer_id"),
+    Index(
+        "desktops_one_working",
+        "account_id",
+        unique=True,
+        postgresql_where=text("working"),
     ),
 )
