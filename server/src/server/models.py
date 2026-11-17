@@ -125,6 +125,8 @@ desktops = Table(
     Column("computer_id", Uuid(), nullable=False),
     Column("working", Boolean(), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("timezone", Text(), nullable=True),
+    Column("last_pulse_at", DateTime(timezone=True), nullable=True),
     UniqueConstraint("account_id", "computer_id"),
     Index(
         "desktops_one_working",

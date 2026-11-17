@@ -28,6 +28,11 @@ INVALID_DESKTOP = {
     "code": "invalid_request",
     "message": "Нужен идентификатор десктопа.",
 }
+NOT_FOUND = {"code": "not_found", "message": "Десктоп не найден."}
+INVALID_TIMEZONE = {
+    "code": "invalid_timezone",
+    "message": "Неизвестная временная зона.",
+}
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -116,6 +121,14 @@ def _post(client: TestClient, computer: uuid.UUID, origin: str = ORIGIN):
     return client.post(
         "/api/desktops",
         json={"id": str(computer)},
+        headers={"Origin": origin},
+    )
+
+
+def _pulse(client: TestClient, computer: str, body: dict, origin: str = ORIGIN):
+    return client.post(
+        f"/api/desktops/{computer}/pulse",
+        json=body,
         headers={"Origin": origin},
     )
 
@@ -409,3 +422,149 @@ def test_losing_first_claim_is_stored_as_not_working(database: None) -> None:
     assert set(rows) == {winner, loser}
     assert rows[winner]["working"] is True
     assert rows[loser]["working"] is False
+
+
+def test_working_desktop_pulse_stores_timezone_and_a_later_pulse_replaces_it(
+    database: None,
+) -> None:
+    cookie, account_id = _open_confirmed("pulse-desktop@example.com")
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        assert _post(client, computer).json() == {"id": str(computer), "working": True}
+        seen = _session(cookie)["last_request_at"]
+        pulsed = _pulse(client, str(computer), {"timezone": "Europe/Moscow"})
+        assert pulsed.status_code == 200
+        assert "set-cookie" not in pulsed.headers
+        assert tuple(pulsed.json()) == ("timezone",)
+        assert pulsed.json() == {"timezone": "Europe/Moscow"}
+        stored = _account_desktops(account_id)
+        assert len(stored) == 1
+        assert stored[0]["timezone"] == "Europe/Moscow"
+        assert stored[0]["last_pulse_at"] is not None
+        assert stored[0]["last_pulse_at"].tzinfo is not None
+        assert _session(cookie)["last_request_at"] > seen
+        first_at = stored[0]["last_pulse_at"]
+        again = _pulse(client, str(computer), {"timezone": "Asia/Tokyo"})
+        assert again.status_code == 200
+        assert again.json() == {"timezone": "Asia/Tokyo"}
+    replaced = _account_desktops(account_id)[0]
+    assert replaced["timezone"] == "Asia/Tokyo"
+    assert replaced["last_pulse_at"] > first_at
+    assert replaced["working"] is True
+
+
+def test_non_working_desktop_pulse_is_not_stored(database: None) -> None:
+    cookie, account_id = _open_confirmed("pulse-idle@example.com")
+    working = uuid.uuid4()
+    idle = uuid.uuid4()
+    with _client(cookie) as client:
+        assert _post(client, working).json()["working"] is True
+        assert _post(client, idle).json()["working"] is False
+        kept = _pulse(client, str(working), {"timezone": "Europe/Moscow"})
+        assert kept.status_code == 200
+        before = {row["computer_id"]: row for row in _account_desktops(account_id)}
+        missed = _pulse(client, str(idle), {"timezone": "Asia/Tokyo"})
+        assert missed.status_code == 404
+        assert missed.json() == NOT_FOUND
+    after = {row["computer_id"]: row for row in _account_desktops(account_id)}
+    assert after[working]["timezone"] == "Europe/Moscow"
+    assert after[working]["last_pulse_at"] == before[working]["last_pulse_at"]
+    assert after[idle]["timezone"] is None
+    assert after[idle]["last_pulse_at"] is None
+    assert after[idle]["working"] is False
+
+
+def test_pulse_rejects_unknown_timezone_missing_session_foreign_origin_and_bad_id(
+    database: None,
+) -> None:
+    cookie, account_id = _open_confirmed("pulse-errors@example.com")
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        assert _post(client, computer).json()["working"] is True
+        assert _pulse(client, str(computer), {"timezone": "Europe/Moscow"}).status_code == 200
+        before = _account_desktops(account_id)[0]
+        seen = _session(cookie)["last_request_at"]
+        for body in (
+            {"timezone": "Not/AZone"},
+            {"timezone": ""},
+            {},
+            {"timezone": 1},
+            {"timezone": None},
+            {"zone": "Europe/Moscow"},
+        ):
+            bad = _pulse(client, str(computer), body)
+            assert bad.status_code == 400
+            assert bad.json() == INVALID_TIMEZONE
+        for content in (b"[]", b"nope", b""):
+            bad = client.post(
+                f"/api/desktops/{computer}/pulse",
+                content=content,
+                headers={"Origin": ORIGIN, "Content-Type": "application/json"},
+            )
+            assert bad.status_code == 400
+            assert bad.json() == INVALID_TIMEZONE
+        assert _session(cookie)["last_request_at"] == seen
+        foreign = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Asia/Tokyo"},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert foreign.status_code == 403
+        assert foreign.json() == INVALID_ORIGIN
+        bad_id = client.post(
+            "/api/desktops/not-a-uuid/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert bad_id.status_code == 404
+        assert bad_id.json() == NOT_FOUND
+    with TestClient(app) as client:
+        missing = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+    assert missing.status_code == 401
+    assert missing.json() == UNAUTHENTICATED
+    row = _account_desktops(account_id)[0]
+    assert row["timezone"] == before["timezone"]
+    assert row["last_pulse_at"] == before["last_pulse_at"]
+
+
+def test_unconfirmed_session_can_pulse_its_working_desktop(database: None) -> None:
+    computer = uuid.uuid4()
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/register",
+            json={"email": "pulse-unconfirmed@example.com", "password": ACCEPTED},
+            headers={"Origin": ORIGIN},
+        )
+        assert registered.status_code == 200
+        assert registered.json()["email_confirmed"] is False
+        account_id = uuid.UUID(registered.json()["account"]["id"])
+        assert _post(client, computer).json()["working"] is True
+        pulsed = _pulse(client, str(computer), {"timezone": "Europe/Moscow"})
+    assert pulsed.status_code == 200
+    assert pulsed.json() == {"timezone": "Europe/Moscow"}
+    stored = _account_desktops(account_id)
+    assert len(stored) == 1
+    assert stored[0]["timezone"] == "Europe/Moscow"
+    assert stored[0]["last_pulse_at"] is not None
+
+
+def test_pulse_does_not_write_another_accounts_desktop(database: None) -> None:
+    first_cookie, first_account = _open_confirmed("pulse-shared-a@example.com")
+    second_cookie, second_account = _open_confirmed("pulse-shared-b@example.com")
+    shared = uuid.uuid4()
+    with _client(first_cookie) as client:
+        assert _post(client, shared).json()["working"] is True
+    with _client(second_cookie) as client:
+        assert _post(client, shared).json()["working"] is True
+        pulsed = _pulse(client, str(shared), {"timezone": "Europe/Moscow"})
+        assert pulsed.status_code == 200
+    assert _account_desktops(second_account)[0]["timezone"] == "Europe/Moscow"
+    untouched = _account_desktops(first_account)[0]
+    assert untouched["computer_id"] == shared
+    assert untouched["working"] is True
+    assert untouched["timezone"] is None
+    assert untouched["last_pulse_at"] is None

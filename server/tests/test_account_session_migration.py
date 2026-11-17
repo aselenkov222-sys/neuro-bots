@@ -56,11 +56,20 @@ BOT_COLUMNS = (
 )
 CHAT_COLUMNS = ("id", "bot_id", "updated_at")
 MESSAGE_COLUMNS = ("id", "chat_id", "role", "text", "code", "updated_at")
-DESKTOP_COLUMNS = ("id", "account_id", "computer_id", "working", "created_at")
+DESKTOP_COLUMNS = (
+    "id",
+    "account_id",
+    "computer_id",
+    "working",
+    "created_at",
+    "timezone",
+    "last_pulse_at",
+)
 ACCOUNT_REVISION = "3c87a0f84d5e"
 CONFIRMATION_REVISION = "ff582d8bc7fb"
 EMAIL_CONFIRMED_REVISION = "048ee727aa3e"
 SUBSCRIPTION_REVISION = "c54ff0c6fb42"
+DESKTOP_REVISION = "78372be7d547"
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
@@ -133,10 +142,12 @@ def _revision_chain() -> list[str]:
     assert links[CONFIRMATION_REVISION] == ACCOUNT_REVISION
     assert links[EMAIL_CONFIRMED_REVISION] == CONFIRMATION_REVISION
     assert links[SUBSCRIPTION_REVISION] == EMAIL_CONFIRMED_REVISION
-    assert links[chain[-1]] == SUBSCRIPTION_REVISION
+    assert links[DESKTOP_REVISION] == SUBSCRIPTION_REVISION
+    assert links[chain[-1]] == DESKTOP_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
+    assert chain[-1] != DESKTOP_REVISION
     return chain
 
 
@@ -615,6 +626,13 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=False,
         timezone=True,
     )
+    _assert_model_column(desktops.c.timezone, Text, nullable=True)
+    _assert_model_column(
+        desktops.c.last_pulse_at,
+        DateTime,
+        nullable=True,
+        timezone=True,
+    )
     unique_constraints = [
         constraint
         for constraint in desktops.constraints
@@ -978,6 +996,16 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "timestamptz",
                     "timestamp with time zone",
                     not_null=True,
+                )
+                _assert_catalog_column(
+                    desktop_columns, "timezone", "text", "text", not_null=False
+                )
+                _assert_catalog_column(
+                    desktop_columns,
+                    "last_pulse_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=False,
                 )
                 assert _constraints(connection, "desktops") == {
                     ("p", "PRIMARY KEY (id)"),

@@ -3,7 +3,12 @@ import os
 import sys
 import threading
 
-from desktop.identity import bridge_script, computer_id, default_state_dir
+from desktop.identity import (
+    bridge_script,
+    computer_id,
+    default_state_dir,
+    local_timezone_name,
+)
 
 PYWEBVIEW = "pywebview"
 PYSIDE6 = "pyside6"
@@ -233,7 +238,9 @@ def _quit_from_tray() -> None:
 
 def _inject_desktop_bridge(run_script) -> None:
     try:
-        run_script(bridge_script(computer_id(default_state_dir())))
+        run_script(
+            bridge_script(computer_id(default_state_dir()), local_timezone_name())
+        )
     except Exception:
         return
 

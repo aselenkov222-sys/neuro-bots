@@ -1,11 +1,17 @@
 import importlib
+import json
 import time
 import uuid
 from pathlib import Path
 
 import pytest
 
-from desktop.identity import bridge_script, computer_id, default_state_dir
+from desktop.identity import (
+    bridge_script,
+    computer_id,
+    default_state_dir,
+    local_timezone_name,
+)
 from desktop.window import PYSIDE6, PYWEBVIEW, open_cabinet
 
 
@@ -25,15 +31,19 @@ def test_corrupt_desktop_id_is_not_replaced(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == "not-a-uuid"
 
 
-def test_bridge_script_is_the_id_and_the_event() -> None:
+def test_bridge_script_is_the_id_timezone_and_the_event() -> None:
     computer = uuid.uuid4()
-    script = bridge_script(computer)
+    script = bridge_script(computer, "Europe/Moscow")
+    payload = script.split("window.__neuroDesktop = ", 1)[1].split(
+        ";window.dispatchEvent", 1
+    )[0]
+    assert json.loads(payload) == {"id": str(computer), "timezone": "Europe/Moscow"}
     assert script == (
         'window.__neuroDesktop = {"id": "'
         + str(computer)
-        + '"};window.dispatchEvent(new Event(\'neuro-desktop\'));'
+        + '", "timezone": "Europe/Moscow"};'
+        "window.dispatchEvent(new Event('neuro-desktop'));"
     )
-    assert "timezone" not in script
 
 
 def test_default_state_dir_honors_neuro_bots_state_dir(
@@ -166,7 +176,7 @@ def test_pyside6_loaded_injects_the_bridge_and_still_calls_on_ready(
     assert len(view.loadFinished.slots) == 1
     view.loadFinished.slots[0](True)
     computer = uuid.UUID((tmp_path / "desktop-id").read_text(encoding="utf-8"))
-    assert page.scripts == [bridge_script(computer)]
+    assert page.scripts == [bridge_script(computer, local_timezone_name())]
     assert ready == [view]
     assert view.loaded.toString() == origin
 
@@ -218,7 +228,7 @@ def test_pywebview_loaded_injects_the_bridge_and_still_calls_on_ready(
     finally:
         webview.windows[:] = before
     computer = uuid.UUID((tmp_path / "desktop-id").read_text(encoding="utf-8"))
-    assert scripts == [bridge_script(computer)]
+    assert scripts == [bridge_script(computer, local_timezone_name())]
     assert ready
 
 

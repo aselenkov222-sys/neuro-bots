@@ -23,7 +23,9 @@ ME = {
 class _Desk:
     def __init__(self) -> None:
         self.signed_in = False
+        self.working = True
         self.posts: list[object] = []
+        self.pulses: list[object] = []
 
     def handle(self, route) -> None:
         path = route.request.url.split("?", 1)[0]
@@ -42,9 +44,14 @@ class _Desk:
             self.signed_in = True
             self._json(route, 200, ME)
             return
+        if path.endswith("/pulse") and method == "POST":
+            self.pulses.append(route.request.post_data_json)
+            body = route.request.post_data_json or {}
+            self._json(route, 200, {"timezone": body.get("timezone")})
+            return
         if path.endswith("/api/desktops") and method == "POST":
             self.posts.append(route.request.post_data_json)
-            self._json(route, 200, {"id": COMPUTER, "working": True})
+            self._json(route, 200, {"id": COMPUTER, "working": self.working})
             return
         if path.endswith("/api/bots") and method == "GET":
             self._json(route, 200, {"bots": []})
@@ -67,10 +74,20 @@ def _serve() -> tuple[ThreadingHTTPServer, str]:
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
-def test_cabinet_claims_a_desktop_only_from_the_bridge() -> None:
+def test_cabinet_pulse_interval_is_thirty_seconds() -> None:
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
-    assert "setInterval" not in script
-    assert "pulse" not in script
+    assert "const PULSE_INTERVAL_MS = 30000;" in script
+    assert "setInterval(sendPulse, PULSE_INTERVAL_MS)" in script
+    assert "`/api/desktops/${bridge.id}/pulse`" in script
+    assert "timezone: bridge.timezone" in script
+    assert "if (pulseTimer !== null) return;" in script
+    sign_out = script.split("async function signOut()", 1)[1].split(
+        "async function boot()", 1
+    )[0]
+    assert "stopPulse();" in sign_out
+
+
+def test_cabinet_claims_a_desktop_only_from_the_bridge() -> None:
     server, origin = _serve()
     try:
         with sync_playwright() as playwright:
@@ -85,6 +102,8 @@ def test_cabinet_claims_a_desktop_only_from_the_bridge() -> None:
                 _assert_event_claims_after_boot(browser, origin)
                 _assert_register_claims(browser, origin)
                 _assert_login_claims(browser, origin)
+                _assert_working_bridge_sends_one_pulse(browser, origin)
+                _assert_idle_desktop_does_not_pulse(browser, origin)
             finally:
                 browser.close()
     finally:
@@ -110,6 +129,7 @@ def _assert_browser_boot_does_not_claim(browser, origin: str) -> None:
         assert page.locator("h1").inner_text() == "Тариф"
         assert "рабочий десктоп" not in page.locator("body").inner_text().lower()
         assert desk.posts == []
+        assert desk.pulses == []
     finally:
         context.close()
 
@@ -128,6 +148,7 @@ def _assert_boot_claims_when_the_bridge_is_present(browser, origin: str) -> None
             page.goto(f"{origin}/")
         page.wait_for_selector("h1")
         assert desk.posts == [{"id": COMPUTER}]
+        assert desk.pulses == []
     finally:
         context.close()
 
@@ -149,6 +170,7 @@ def _assert_event_claims_after_boot(browser, origin: str) -> None:
                 COMPUTER,
             )
         assert desk.posts == [{"id": COMPUTER}]
+        assert desk.pulses == []
     finally:
         context.close()
 
@@ -171,6 +193,7 @@ def _assert_register_claims(browser, origin: str) -> None:
             page.click("button:has-text('Зарегистрироваться')")
         page.wait_for_selector("text=Прислать новую")
         assert desk.posts == [{"id": COMPUTER}]
+        assert desk.pulses == []
     finally:
         context.close()
 
@@ -193,5 +216,41 @@ def _assert_login_claims(browser, origin: str) -> None:
             page.click("button:has-text('Войти')")
         page.wait_for_selector("text=Прислать новую")
         assert desk.posts == [{"id": COMPUTER}]
+        assert desk.pulses == []
+    finally:
+        context.close()
+
+
+def _bridge(timezone: str | None = None) -> str:
+    fields = {"id": COMPUTER}
+    if timezone is not None:
+        fields["timezone"] = timezone
+    return "window.__neuroDesktop = " + json.dumps(fields) + ";"
+
+
+def _assert_working_bridge_sends_one_pulse(browser, origin: str) -> None:
+    desk = _Desk()
+    desk.signed_in = True
+    context, page = _open(browser, origin, desk, bridge=_bridge("Europe/Moscow"))
+    try:
+        with page.expect_response("**/api/desktops/*/pulse"):
+            page.goto(f"{origin}/")
+        page.wait_for_selector("h1")
+        assert desk.posts == [{"id": COMPUTER}]
+        assert desk.pulses == [{"timezone": "Europe/Moscow"}]
+    finally:
+        context.close()
+
+
+def _assert_idle_desktop_does_not_pulse(browser, origin: str) -> None:
+    desk = _Desk()
+    desk.signed_in = True
+    desk.working = False
+    context, page = _open(browser, origin, desk, bridge=_bridge("Europe/Moscow"))
+    try:
+        page.goto(f"{origin}/")
+        page.wait_for_selector("h1")
+        assert desk.posts == [{"id": COMPUTER}]
+        assert desk.pulses == []
     finally:
         context.close()
