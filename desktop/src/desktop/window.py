@@ -12,6 +12,7 @@ _MACOS_WEBKIT_BINDING = "webview.platforms.cocoa"
 _tray_held: list[object] = []
 _tray_installed = False
 _tray_ready = threading.Event()
+_quit_target_classes: dict[type, type] = {}
 command_quit_action = None
 tray_quit_action = None
 
@@ -64,7 +65,7 @@ def _open_pywebview(origin: str, on_ready) -> None:
         menu=[menu_module.Menu("Кабинет", [menu_module.MenuAction(_QUIT_COMMAND, _quit_command)])],
     )
     _hide_pywebview_on_close(window)
-    window.events.before_show += _install_cocoa_quit_tray
+    _install_cocoa_quit_tray()
     if on_ready is not None:
         sent = {"done": False}
 
@@ -76,7 +77,6 @@ def _open_pywebview(origin: str, on_ready) -> None:
 
         window.events.loaded += loaded
     webview.start(
-        _install_cocoa_quit_tray,
         localization={"cocoa.menu.quit": _QUIT_COMMAND, "global.quit": _QUIT_COMMAND},
     )
 
@@ -101,11 +101,9 @@ def _stop_app_quit_with_command() -> None:
 
 
 def _install_cocoa_quit_tray() -> None:
-    if threading.current_thread() is threading.main_thread():
-        _install_cocoa_tray_on_main()
-        return
-    app_helper = importlib.import_module("PyObjCTools.AppHelper")
-    app_helper.callAfter(_install_cocoa_tray_on_main)
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("the Quit tray item must be created on the main thread")
+    _install_cocoa_tray_on_main()
 
 
 def _install_cocoa_tray_on_main() -> None:
@@ -114,12 +112,7 @@ def _install_cocoa_tray_on_main() -> None:
         return
     _tray_installed = True
     appkit = importlib.import_module("AppKit")
-
-    class QuitTarget(appkit.NSObject):
-        def quit_(self, _sender) -> None:
-            _quit_from_tray()
-
-    target = QuitTarget.alloc().init()
+    target = _quit_target(appkit.NSObject).alloc().init()
     status_item = appkit.NSStatusBar.systemStatusBar().statusItemWithLength_(
         appkit.NSVariableStatusItemLength
     )
@@ -211,6 +204,19 @@ def _install_pyside_quit_tray(widgets, gui, application):
     tray.show()
     _tray_held.append(tray)
     return command
+
+
+def _quit_target(nsobject: type) -> type:
+    cached = _quit_target_classes.get(nsobject)
+    if cached is not None:
+        return cached
+
+    class QuitTarget(nsobject):
+        def quit_(self, _sender) -> None:
+            _quit_from_tray()
+
+    _quit_target_classes[nsobject] = QuitTarget
+    return QuitTarget
 
 
 def _quit_command() -> None:

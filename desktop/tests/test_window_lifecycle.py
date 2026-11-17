@@ -219,6 +219,33 @@ def test_pywebview_quit_command_stops_process(monkeypatch: pytest.MonkeyPatch) -
     assert codes == [0]
 
 
+def test_pywebview_quit_item_is_created_on_the_main_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    import desktop.window as window_module
+
+    monkeypatch.setattr(window_module, "window_library", lambda: PYWEBVIEW)
+    webview = importlib.import_module("webview")
+    monkeypatch.setattr(webview, "start", lambda *args, **kwargs: None)
+    before = list(webview.windows)
+    held = len(window_module._tray_held)
+    try:
+        open_cabinet("http://cabinet.example")
+        assert threading.current_thread() is threading.main_thread()
+        assert len(window_module._tray_held) == held + 1
+        _status_item, _menu, command, _target = window_module._tray_held[-1]
+        title = command.title() if callable(command.title) else command.title
+        assert title == "Выйти"
+    finally:
+        webview.windows[:] = before
+        if len(window_module._tray_held) > held:
+            status_item = window_module._tray_held.pop()[0]
+            appkit = importlib.import_module("AppKit")
+            appkit.NSStatusBar.systemStatusBar().removeStatusItem_(status_item)
+
+
 def test_pyside6_close_hides_window_and_process_stays(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
