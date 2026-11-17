@@ -30,6 +30,47 @@ class _RecordingApplication:
         self.executed = True
         return 0
 
+    def style(self) -> "_IconStyle":
+        return _IconStyle()
+
+
+class _IconStyle:
+    def standardIcon(self, pixmap: object) -> object:
+        return pixmap
+
+
+class _TraySignal:
+    def connect(self, slot: object) -> None:
+        self.slot = slot
+
+
+class _TrayAction:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.triggered = _TraySignal()
+
+
+class _TrayMenu:
+    def __init__(self) -> None:
+        self.actions: list[object] = []
+
+    def addAction(self, action: object) -> None:
+        self.actions.append(action)
+
+
+class _TrayIcon:
+    def __init__(self, parent: object = None) -> None:
+        self.parent = parent
+
+    def setContextMenu(self, menu: object) -> None:
+        self.menu = menu
+
+    def setIcon(self, icon: object) -> None:
+        self.icon = icon
+
+    def show(self) -> None:
+        self.visible = True
+
 
 def _patch_pyside(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     holder: dict[str, object] = {}
@@ -46,8 +87,12 @@ def _patch_pyside(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 
     webengine = importlib.import_module("PySide6.QtWebEngineWidgets")
     widgets = importlib.import_module("PySide6.QtWidgets")
+    gui = importlib.import_module("PySide6.QtGui")
     monkeypatch.setattr(webengine, "QWebEngineView", View)
     monkeypatch.setattr(widgets, "QApplication", Application)
+    monkeypatch.setattr(widgets, "QSystemTrayIcon", _TrayIcon)
+    monkeypatch.setattr(widgets, "QMenu", _TrayMenu)
+    monkeypatch.setattr(gui, "QAction", _TrayAction)
     return holder
 
 
