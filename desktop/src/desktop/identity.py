@@ -5,6 +5,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 PULSE_INTERVAL = timedelta(seconds=30)
 
@@ -34,16 +35,40 @@ def pulse_due(last_sent_at: datetime | None, now: datetime) -> bool:
     return now - last_sent_at >= PULSE_INTERVAL
 
 
+def timezone_name_accepted(name: str) -> bool:
+    if name not in available_timezones():
+        return False
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return False
+    return True
+
+
+def timezone_name_from_zoneinfo_path(path: Path) -> str | None:
+    resolved = os.path.realpath(path)
+    marker = "zoneinfo/"
+    index = resolved.rfind(marker)
+    if index < 0:
+        return None
+    name = resolved[index + len(marker) :]
+    if name and timezone_name_accepted(name):
+        return name
+    return None
+
+
 def local_timezone_name() -> str:
-    tzset = getattr(time, "tzset", None)
-    if tzset is not None:
-        tzset()
-    key = getattr(datetime.now().astimezone().tzinfo, "key", None)
-    if isinstance(key, str) and key:
-        return key
     configured = os.environ.get("TZ")
-    if configured:
-        return configured
+    if configured is not None:
+        tzset = getattr(time, "tzset", None)
+        if tzset is not None:
+            tzset()
+        name = configured[1:] if configured.startswith(":") else configured
+        if timezone_name_accepted(name):
+            return name
+    from_file = timezone_name_from_zoneinfo_path(Path("/etc/localtime"))
+    if from_file is not None:
+        return from_file
     return "UTC"
 
 
