@@ -12,8 +12,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 VERSIONS_DIR = PROJECT_ROOT / "alembic" / "versions"
 
-ACCOUNT_COLUMNS = ("id", "email", "password_hash", "name")
+ACCOUNT_COLUMNS = ("id", "email", "password_hash", "name", "email_confirmed_at")
 SESSION_COLUMNS = ("id", "account_id", "last_request_at")
+CONFIRMATION_LINK_COLUMNS = (
+    "id",
+    "account_id",
+    "token_hash",
+    "expires_at",
+    "revoked_at",
+)
+ACCOUNT_REVISION = "3c87a0f84d5e"
+CONFIRMATION_REVISION = "ff582d8bc7fb"
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -34,20 +43,59 @@ def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _revision_id() -> str:
+def _revision_links() -> dict[str, str | None]:
     scripts = list(VERSIONS_DIR.glob("*.py"))
-    assert len(scripts) == 1
-    module = ast.parse(scripts[0].read_text())
-    for node in module.body:
-        if (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == "revision"
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            return node.value.value
-    raise AssertionError("migration revision id is missing")
+    assert scripts
+    links: dict[str, str | None] = {}
+    for script in scripts:
+        module = ast.parse(script.read_text())
+        revision: str | None = None
+        down_revision: str | None = None
+        saw_down = False
+        for node in module.body:
+            if not (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and isinstance(node.value, ast.Constant)
+            ):
+                continue
+            value = node.value.value
+            if node.target.id == "revision" and isinstance(value, str):
+                revision = value
+            elif node.target.id == "down_revision" and (
+                value is None or isinstance(value, str)
+            ):
+                saw_down = True
+                down_revision = value
+        if revision is None or not saw_down:
+            raise AssertionError("migration revision id is missing")
+        assert revision not in links
+        links[revision] = down_revision
+    return links
+
+
+def _revision_chain() -> list[str]:
+    links = _revision_links()
+    roots = [revision for revision, down in links.items() if down is None]
+    assert roots == [ACCOUNT_REVISION]
+    chain = [roots[0]]
+    while True:
+        children = [
+            revision for revision, down in links.items() if down == chain[-1]
+        ]
+        if not children:
+            break
+        assert len(children) == 1
+        chain.append(children[0])
+    assert set(chain) == set(links)
+    assert links[CONFIRMATION_REVISION] == ACCOUNT_REVISION
+    assert links[chain[-1]] == CONFIRMATION_REVISION
+    assert chain[-1] != CONFIRMATION_REVISION
+    return chain
+
+
+def _revision_id() -> str:
+    return _revision_chain()[-1]
 
 
 def _columns(connection: Connection, table_name: str) -> dict[str, dict[str, object]]:
@@ -111,11 +159,18 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
 
     accounts = metadata.tables["accounts"]
     sessions = metadata.tables["sessions"]
-    assert set(metadata.tables) == {"accounts", "sessions"}
+    confirmation_links = metadata.tables["confirmation_links"]
+    assert set(metadata.tables) == {
+        "accounts",
+        "sessions",
+        "confirmation_links",
+    }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
+    assert confirmation_links is server.models.confirmation_links
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
+    assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -130,6 +185,11 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert accounts.c.name.type.length == 80
     assert accounts.c.name.nullable is False
     assert accounts.c.name.server_default.arg.text == "''"
+    assert isinstance(accounts.c.email_confirmed_at.type, DateTime)
+    assert accounts.c.email_confirmed_at.type.timezone is True
+    assert accounts.c.email_confirmed_at.nullable is True
+    assert accounts.c.email_confirmed_at.default is None
+    assert accounts.c.email_confirmed_at.server_default is None
 
     assert isinstance(sessions.c.id.type, Uuid)
     assert sessions.c.id.nullable is False
@@ -144,6 +204,36 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert isinstance(sessions.c.last_request_at.type, DateTime)
     assert sessions.c.last_request_at.type.timezone is True
     assert sessions.c.last_request_at.nullable is False
+
+    assert isinstance(confirmation_links.c.id.type, Uuid)
+    assert confirmation_links.c.id.nullable is False
+    assert confirmation_links.c.id.default is None
+    assert confirmation_links.c.id.server_default is None
+    assert [column.name for column in confirmation_links.primary_key] == ["id"]
+    assert isinstance(confirmation_links.c.account_id.type, Uuid)
+    assert confirmation_links.c.account_id.nullable is False
+    assert confirmation_links.c.account_id.default is None
+    assert confirmation_links.c.account_id.server_default is None
+    link_foreign_keys = list(confirmation_links.c.account_id.foreign_keys)
+    assert len(link_foreign_keys) == 1
+    assert link_foreign_keys[0].column.table.name == "accounts"
+    assert link_foreign_keys[0].column.name == "id"
+    assert link_foreign_keys[0].ondelete is None
+    assert isinstance(confirmation_links.c.token_hash.type, Text)
+    assert confirmation_links.c.token_hash.nullable is False
+    assert confirmation_links.c.token_hash.unique is True
+    assert confirmation_links.c.token_hash.default is None
+    assert confirmation_links.c.token_hash.server_default is None
+    assert isinstance(confirmation_links.c.expires_at.type, DateTime)
+    assert confirmation_links.c.expires_at.type.timezone is True
+    assert confirmation_links.c.expires_at.nullable is False
+    assert confirmation_links.c.expires_at.default is None
+    assert confirmation_links.c.expires_at.server_default is None
+    assert isinstance(confirmation_links.c.revoked_at.type, DateTime)
+    assert confirmation_links.c.revoked_at.type.timezone is True
+    assert confirmation_links.c.revoked_at.nullable is True
+    assert confirmation_links.c.revoked_at.default is None
+    assert confirmation_links.c.revoked_at.server_default is None
 
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
@@ -174,7 +264,12 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     .scalars()
                     .all()
                 )
-                assert set(tables) == {"accounts", "sessions", "alembic_version"}
+                assert set(tables) == {
+                    "accounts",
+                    "sessions",
+                    "confirmation_links",
+                    "alembic_version",
+                }
                 stored_revision = connection.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
@@ -198,6 +293,13 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                 assert account_columns["name"]["format_type"] == "character varying(80)"
                 assert account_columns["name"]["not_null"] is True
                 assert account_columns["name"]["column_default"] == "''::character varying"
+                assert account_columns["email_confirmed_at"]["type_name"] == "timestamptz"
+                assert (
+                    account_columns["email_confirmed_at"]["format_type"]
+                    == "timestamp with time zone"
+                )
+                assert account_columns["email_confirmed_at"]["not_null"] is False
+                assert account_columns["email_confirmed_at"]["column_default"] is None
                 assert _constraints(connection, "accounts") == {
                     ("p", "PRIMARY KEY (id)"),
                     ("u", "UNIQUE (email)"),
@@ -221,6 +323,43 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                 assert session_columns["last_request_at"]["column_default"] is None
                 assert _constraints(connection, "sessions") == {
                     ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+                    ),
+                }
+
+                link_columns = _columns(connection, "confirmation_links")
+                assert tuple(link_columns) == CONFIRMATION_LINK_COLUMNS
+                assert link_columns["id"]["type_name"] == "uuid"
+                assert link_columns["id"]["format_type"] == "uuid"
+                assert link_columns["id"]["not_null"] is True
+                assert link_columns["id"]["column_default"] is None
+                assert link_columns["account_id"]["type_name"] == "uuid"
+                assert link_columns["account_id"]["format_type"] == "uuid"
+                assert link_columns["account_id"]["not_null"] is True
+                assert link_columns["account_id"]["column_default"] is None
+                assert link_columns["token_hash"]["type_name"] == "text"
+                assert link_columns["token_hash"]["format_type"] == "text"
+                assert link_columns["token_hash"]["not_null"] is True
+                assert link_columns["token_hash"]["column_default"] is None
+                assert link_columns["expires_at"]["type_name"] == "timestamptz"
+                assert (
+                    link_columns["expires_at"]["format_type"]
+                    == "timestamp with time zone"
+                )
+                assert link_columns["expires_at"]["not_null"] is True
+                assert link_columns["expires_at"]["column_default"] is None
+                assert link_columns["revoked_at"]["type_name"] == "timestamptz"
+                assert (
+                    link_columns["revoked_at"]["format_type"]
+                    == "timestamp with time zone"
+                )
+                assert link_columns["revoked_at"]["not_null"] is False
+                assert link_columns["revoked_at"]["column_default"] is None
+                assert _constraints(connection, "confirmation_links") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    ("u", "UNIQUE (token_hash)"),
                     (
                         "f",
                         "FOREIGN KEY (account_id) REFERENCES accounts(id)",
