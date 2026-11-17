@@ -27,4 +27,4 @@ def health() -> Response:
 
 app.include_router(router)
 app.include_router(bots_router)
-app.mount("/", StaticFiles(directory=_WEB_DIR), name="web")
+app.mount("/", StaticFiles(directory=_WEB_DIR, html=True), name="web")

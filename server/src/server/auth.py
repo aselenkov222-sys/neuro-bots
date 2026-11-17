@@ -3,10 +3,11 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import NamedTuple
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError
@@ -39,6 +40,7 @@ from server.models import quota_counters, subscription_periods
 from server.passwords import PasswordNotAccepted, password_accepted, verify_password
 
 router = APIRouter()
+_CABINET_HTML = Path(__file__).resolve().parents[3] / "web" / "index.html"
 
 
 def error_response(status: int, code: str, message: str) -> JSONResponse:
@@ -316,7 +318,9 @@ def me(request: Request) -> JSONResponse:
 
 
 @router.get("/api/confirm-email")
-def confirm_email(request: Request) -> JSONResponse:
+def confirm_email(request: Request) -> Response:
+    if "text/html" in request.headers.get("accept", "").lower():
+        return HTMLResponse(_CABINET_HTML.read_text(encoding="utf-8"))
     now = utc_now()
     token = request.query_params.get("token")
     with begin() as connection:
