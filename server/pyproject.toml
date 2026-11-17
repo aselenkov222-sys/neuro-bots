@@ -7,6 +7,7 @@ dependencies = [
     "fastapi>=0.163.1",
     "psycopg[binary]>=3",
     "sqlalchemy>=2.0.52",
+    "uvicorn>=0.54.0",
 ]
 
 [build-system]
