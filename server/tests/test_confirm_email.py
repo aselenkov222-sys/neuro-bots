@@ -15,7 +15,13 @@ from sqlalchemy import select
 from server.accounts import calendar_month_end, format_utc
 from server.confirmation import hash_token
 from server.db import create_db_engine
-from server.models import accounts, confirmation_links, sessions
+from server.models import (
+    accounts,
+    confirmation_links,
+    quota_counters,
+    sessions,
+    subscription_periods,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -224,6 +230,12 @@ def _register(origin: str, journal: Journal, client: httpx.Client, email: str) -
     assert response.status_code == 200
     assert response.json()["email_confirmed"] is False
     assert response.json()["period"] is None
+    assert response.json()["quota"] is None
+    assert [
+        row
+        for row in _rows(subscription_periods)
+        if row["account_id"] == uuid.UUID(response.json()["account"]["id"])
+    ] == []
     output = _wait_until(
         journal,
         lambda text: len(_confirmation_lines(text[len(before) :])) >= 1,
@@ -269,12 +281,26 @@ def _confirm(
 
 def _assert_active_period(body: dict, confirmed_at: datetime) -> None:
     assert body["email_confirmed"] is True
-    assert body["quota"] is None
+    assert body["quota"] == 500
     assert body["period"] == {
         "started_at": format_utc(confirmed_at),
         "ends_at": format_utc(calendar_month_end(confirmed_at)),
         "active": True,
     }
+    account_id = uuid.UUID(body["account"]["id"])
+    periods = [
+        row for row in _rows(subscription_periods) if row["account_id"] == account_id
+    ]
+    assert len(periods) == 1
+    period = periods[0]
+    assert period["started_at"] == confirmed_at
+    assert period["ends_at"] == calendar_month_end(confirmed_at)
+    assert period["active"] is True
+    counters = [
+        row for row in _rows(quota_counters) if row["period_id"] == period["id"]
+    ]
+    assert len(counters) == 1
+    assert counters[0]["used"] == 0
 
 
 def test_calendar_month_keeps_the_utc_time_of_day() -> None:
@@ -360,6 +386,7 @@ def test_valid_token_without_a_session_confirms_and_login_shows_the_period(
         )
         assert logged_in.status_code == 200
         assert logged_in.json()["email_confirmed"] is True
+        _assert_active_period(logged_in.json(), confirmed_at)
         me = client.get(f"{origin}/api/me")
     assert me.status_code == 200
     _assert_active_period(me.json(), confirmed_at)
@@ -380,6 +407,12 @@ def test_another_accounts_session_does_not_open_bots(
     assert me.status_code == 200
     assert me.json()["email_confirmed"] is False
     assert me.json()["period"] is None
+    assert me.json()["quota"] is None
+    assert [
+        row
+        for row in _rows(subscription_periods)
+        if row["account_id"] == uuid.UUID(me.json()["account"]["id"])
+    ] == []
     owner_id = uuid.UUID(me.json()["account"]["id"])
     # me above is the other account; find the owner by email
     owner_row = next(row for row in _rows(accounts) if row["email"] == "owner-confirm@example.com")

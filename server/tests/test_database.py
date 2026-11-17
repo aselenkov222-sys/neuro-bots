@@ -138,14 +138,28 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
         "accounts",
         "sessions",
         "confirmation_links",
+        "subscription_periods",
+        "quota_counters",
+        "quota_charges",
+        "bots",
+        "chats",
+        "messages",
     }
     assert server.models.accounts.metadata is metadata
     assert server.models.sessions.metadata is metadata
     assert server.models.confirmation_links.metadata is metadata
+    assert server.models.subscription_periods.metadata is metadata
+    assert server.models.quota_counters.metadata is metadata
+    assert server.models.quota_charges.metadata is metadata
+    assert server.models.bots.metadata is metadata
+    assert server.models.chats.metadata is metadata
+    assert server.models.messages.metadata is metadata
     chain = _revision_chain()
     assert chain[0] == ("3c87a0f84d5e", None)
     assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
-    assert chain[-1][1] == "ff582d8bc7fb"
+    assert ("048ee727aa3e", "ff582d8bc7fb") in chain
+    assert chain[-1][1] == "048ee727aa3e"
+    assert chain[-1][0] != "048ee727aa3e"
     assert chain[-1][0] != "ff582d8bc7fb"
 
 
@@ -176,7 +190,9 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         chain = _revision_chain()
         assert chain[0] == ("3c87a0f84d5e", None)
         assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
-        assert chain[-1][1] == "ff582d8bc7fb"
+        assert ("048ee727aa3e", "ff582d8bc7fb") in chain
+        assert chain[-1][1] == "048ee727aa3e"
+        assert chain[-1][0] != "048ee727aa3e"
         assert chain[-1][0] != "ff582d8bc7fb"
         assert "Running upgrade" in upgrade.stderr + upgrade.stdout
 
@@ -194,6 +210,12 @@ def test_select_one_and_alembic_upgrade_head() -> None:
             "accounts",
             "sessions",
             "confirmation_links",
+            "subscription_periods",
+            "quota_counters",
+            "quota_charges",
+            "bots",
+            "chats",
+            "messages",
             "alembic_version",
         }
     finally:
