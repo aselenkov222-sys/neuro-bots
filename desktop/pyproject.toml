@@ -1,0 +1,17 @@
+[project]
+name = "desktop"
+version = "0.1.0"
+requires-python = ">=3.15,<3.16"
+dependencies = [
+    "PySide6>=6.12,<6.13",
+    "pywebview>=6.2,<6.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.8,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
