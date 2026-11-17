@@ -57,6 +57,20 @@ def log_confirmation_link(base_url: str, token: str, email: str) -> None:
     logger.info("%s %s", confirmation_url(base_url, token), email)
 
 
+def replace_confirmation_link(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> str:
+    connection.execute(
+        confirmation_links.update()
+        .where(
+            confirmation_links.c.account_id == account_id,
+            confirmation_links.c.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    return issue_confirmation_link(connection, account_id)
+
+
 def apply_confirmation(
     connection: Connection, token: str, now: datetime
 ) -> uuid.UUID | None:

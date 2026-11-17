@@ -29,6 +29,7 @@ from server.confirmation import (
     apply_confirmation,
     issue_confirmation_link,
     log_confirmation_link,
+    replace_confirmation_link,
 )
 from server.db import create_db_engine
 from server.passwords import PasswordNotAccepted, password_accepted, verify_password
@@ -262,6 +263,37 @@ def confirm_email(request: Request) -> JSONResponse:
             "message": LINK_EXPIRED,
         }
     )
+
+
+@router.post("/api/confirmation")
+def request_confirmation(request: Request) -> JSONResponse:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            issued = None
+        else:
+            session, account = current
+            if account["email_confirmed_at"] is not None:
+                issued = "confirmed"
+            else:
+                token = replace_confirmation_link(connection, account["id"], now)
+                touch_session(connection, session["id"], now)
+                issued = (account["id"], account["email"], account["name"], token)
+    if issued is None:
+        return unauthenticated()
+    if issued == "confirmed":
+        return error_response(
+            400,
+            "email_already_confirmed",
+            "Почта уже подтверждена.",
+        )
+    account_id, email, name, token = issued
+    log_confirmation_link(str(request.base_url), token, email)
+    return JSONResponse(account_document(account_id, email, name, None))
 
 
 @router.post("/api/logout")

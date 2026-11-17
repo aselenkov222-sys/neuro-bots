@@ -502,6 +502,177 @@ def test_missing_empty_and_unknown_tokens_do_not_confirm(
     assert _link(account["id"])["revoked_at"] is None
 
 
+def _issued_token(origin: str, journal: Journal, before: str, email: str) -> str:
+    output = _wait_until(
+        journal,
+        lambda text: len(_confirmation_lines(text[len(before) :])) >= 1,
+    )
+    lines = _confirmation_lines(output[len(before) :])
+    assert len(lines) == 1
+    matched = re.fullmatch(
+        rf"{re.escape(origin)}{re.escape(CONFIRM_PATH)}([^ ]+) {re.escape(email)}",
+        lines[0],
+    )
+    assert matched is not None
+    return matched.group(1)
+
+
+def _links_for(account_id: uuid.UUID) -> list[dict]:
+    return [row for row in _rows(confirmation_links) if row["account_id"] == account_id]
+
+
+def test_new_confirmation_link_replaces_the_previous_one(
+    running_server: tuple[str, Journal],
+) -> None:
+    origin, journal = running_server
+    raw_email = "  Resend Person@Example.COM  "
+    email = "resend person@example.com"
+    other_email = "other-resend@example.com"
+    with httpx.Client(timeout=5) as other:
+        other_token = _register(origin, journal, other, other_email)
+    other_id = _account_by_email(other_email)["id"]
+    other_before = _link(other_id)
+    with httpx.Client(timeout=5) as client:
+        posted = journal.text()
+        registered = _post(
+            client,
+            origin,
+            "/api/register",
+            {"email": raw_email, "password": ACCEPTED},
+        )
+        assert registered.status_code == 200
+        assert registered.json()["account"]["email"] == email
+        old_token = _issued_token(origin, journal, posted, email)
+        account_id = _account_by_email(email)["id"]
+        engine = create_db_engine()
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    sessions.update()
+                    .where(sessions.c.account_id == account_id)
+                    .values(last_request_at=datetime.now(timezone.utc) - timedelta(hours=1))
+                )
+        finally:
+            engine.dispose()
+        seen = next(
+            row["last_request_at"]
+            for row in _rows(sessions)
+            if row["account_id"] == account_id
+        )
+        before = journal.text()
+        replaced = client.post(
+            f"{origin}/api/confirmation",
+            headers={"Origin": origin},
+        )
+        assert replaced.status_code == 200
+        assert "set-cookie" not in replaced.headers
+        body = replaced.json()
+        assert body["email_confirmed"] is False
+        assert body["period"] is None
+        assert body["quota"] is None
+        assert body["account"]["email"] == email
+        assert body["account"]["id"] == str(account_id)
+        new_token = _issued_token(origin, journal, before, email)
+        new_output = journal.text()[len(before) :]
+        assert new_token != old_token
+        assert f"{origin}{CONFIRM_PATH}{new_token} {email}" in new_output
+        assert ACCEPTED not in new_output
+        assert new_token not in replaced.text
+        assert old_token not in replaced.text
+        links = _links_for(account_id)
+        assert len(links) == 2
+        old_link = next(row for row in links if row["token_hash"] == hash_token(old_token))
+        new_link = next(row for row in links if row["token_hash"] == hash_token(new_token))
+        assert old_link["revoked_at"] is not None
+        assert old_link["revoked_at"].utcoffset() == timedelta(0)
+        assert new_link["revoked_at"] is None
+        assert new_link["expires_at"] > datetime.now(timezone.utc)
+        touched = next(
+            row["last_request_at"]
+            for row in _rows(sessions)
+            if row["account_id"] == account_id
+        )
+        assert touched > seen
+        assert abs((datetime.now(timezone.utc) - touched).total_seconds()) < 10
+        refused = _confirm(journal, client, origin, old_token)
+        assert refused.status_code == 200
+        assert refused.json() == TARIFF_REFUSAL
+        assert _account(account_id)["email_confirmed_at"] is None
+        opened = _confirm(journal, client, origin, new_token)
+        assert opened.status_code == 200
+        assert opened.json() == {"email_confirmed": True, "destination": "bots"}
+    assert _account(account_id)["email_confirmed_at"] is not None
+    assert _link(other_id)["revoked_at"] is None
+    assert _link(other_id)["token_hash"] == other_before["token_hash"]
+    assert other_before["token_hash"] == hash_token(other_token)
+
+
+def test_confirmation_is_refused_without_origin_session_or_when_confirmed(
+    running_server: tuple[str, Journal],
+) -> None:
+    origin, journal = running_server
+    email = "guard-resend@example.com"
+    confirmed_email = "already-confirmed@example.com"
+    invalid_origin = {
+        "code": "invalid_origin",
+        "message": "Запрос пришёл не с нашего сервера.",
+    }
+    unauthenticated = {"code": "unauthenticated", "message": "Нужна сессия."}
+    already = {"code": "email_already_confirmed", "message": "Почта уже подтверждена."}
+    with httpx.Client(timeout=5) as client:
+        _register(origin, journal, client, email)
+        account_id = _account_by_email(email)["id"]
+        before = journal.text()
+        missing_origin = client.post(f"{origin}/api/confirmation")
+        foreign = client.post(
+            f"{origin}/api/confirmation",
+            headers={"Origin": "http://evil.example"},
+        )
+        assert missing_origin.status_code == 403
+        assert foreign.status_code == 403
+        assert missing_origin.json() == foreign.json() == invalid_origin
+        assert _links_for(account_id) == [_link(account_id)]
+        assert _link(account_id)["revoked_at"] is None
+    with httpx.Client(timeout=5) as stranger:
+        missing_session = stranger.post(
+            f"{origin}/api/confirmation",
+            headers={"Origin": origin},
+        )
+    assert missing_session.status_code == 401
+    assert missing_session.json() == unauthenticated
+    assert len(_links_for(account_id)) == 1
+    assert _link(account_id)["revoked_at"] is None
+    assert _confirmation_lines(journal.text()[len(before) :]) == []
+    with httpx.Client(timeout=5) as client:
+        _register(origin, journal, client, confirmed_email)
+        confirmed_id = _account_by_email(confirmed_email)["id"]
+        engine = create_db_engine()
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    accounts.update()
+                    .where(accounts.c.id == confirmed_id)
+                    .values(email_confirmed_at=datetime(2026, 11, 16, tzinfo=timezone.utc))
+                )
+        finally:
+            engine.dispose()
+        marked = journal.text()
+        refused = client.post(
+            f"{origin}/api/confirmation",
+            headers={"Origin": origin},
+        )
+    assert refused.status_code == 400
+    assert refused.json() == already
+    assert "set-cookie" not in refused.headers
+    assert len(_links_for(confirmed_id)) == 1
+    assert _link(confirmed_id)["revoked_at"] is None
+    assert _account(confirmed_id)["email_confirmed_at"] == datetime(
+        2026, 11, 16, tzinfo=timezone.utc
+    )
+    assert _confirmation_lines(journal.text()[len(marked) :]) == []
+    assert ACCEPTED not in journal.text()[len(before) :]
+
+
 def test_expired_registration_session_does_not_count_as_current(
     running_server: tuple[str, Journal],
 ) -> None:
