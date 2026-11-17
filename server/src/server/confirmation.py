@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
-from server.accounts import utc_now
-from server.models import accounts, confirmation_links
+from server.accounts import calendar_month_end, utc_now
+from server.models import accounts, confirmation_links, quota_counters, subscription_periods
 
 logger = logging.getLogger("server.confirmation")
 CONFIRMATION_LIFETIME = timedelta(hours=24)
@@ -98,7 +98,7 @@ def apply_confirmation(
     )
     if updated.rowcount != 1:
         return None
-    connection.execute(
+    confirmed = connection.execute(
         accounts.update()
         .where(
             accounts.c.id == link["account_id"],
@@ -106,4 +106,22 @@ def apply_confirmation(
         )
         .values(email_confirmed_at=now)
     )
+    if confirmed.rowcount == 1:
+        period_id = uuid.uuid4()
+        connection.execute(
+            subscription_periods.insert().values(
+                id=period_id,
+                account_id=link["account_id"],
+                started_at=now,
+                ends_at=calendar_month_end(now),
+                active=True,
+            )
+        )
+        connection.execute(
+            quota_counters.insert().values(
+                id=uuid.uuid4(),
+                period_id=period_id,
+                used=0,
+            )
+        )
     return link["account_id"]

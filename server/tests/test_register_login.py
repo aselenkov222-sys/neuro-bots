@@ -12,7 +12,7 @@ from sqlalchemy import select
 from server.accounts import create_account
 from server.app import app
 from server.db import create_db_engine
-from server.models import accounts, sessions
+from server.models import accounts, sessions, subscription_periods
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -113,6 +113,24 @@ def _account_rows() -> tuple[list[dict], list[dict]]:
     return [dict(row) for row in rows], [dict(row) for row in sessions_rows]
 
 
+def _periods(account_id: uuid.UUID) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(subscription_periods).where(
+                        subscription_periods.c.account_id == account_id
+                    )
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
 def _cookie_value(response) -> str:
     header = response.headers["set-cookie"]
     parts = [part.strip().lower() for part in header.split(";")]
@@ -152,6 +170,7 @@ def test_register_stores_the_normalized_email_and_session_cookie(database: None)
     assert str(matched[0]["id"]) == body["account"]["id"]
     assert matched[0]["name"] == ""
     assert ACCEPTED not in matched[0]["password_hash"]
+    assert _periods(matched[0]["id"]) == []
     account_sessions = [
         row for row in session_rows if row["account_id"] == matched[0]["id"]
     ]
@@ -227,6 +246,7 @@ def test_login_with_either_spelling_opens_a_new_session(database: None) -> None:
     second_cookie = _cookie_value(raw)
     assert first_cookie != second_cookie
     account_id = uuid.UUID(normalized.json()["account"]["id"])
+    assert _periods(account_id) == []
     _, session_rows = _account_rows()
     opened = [row for row in session_rows if row["account_id"] == account_id]
     assert {str(row["id"]) for row in opened} == {first_cookie, second_cookie}

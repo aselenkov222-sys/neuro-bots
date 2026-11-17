@@ -3,9 +3,11 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
+from typing import NamedTuple
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError
 
@@ -25,6 +27,7 @@ from server.accounts import (
     touch_session,
     utc_now,
 )
+from server.config import development_tariff
 from server.confirmation import (
     apply_confirmation,
     issue_confirmation_link,
@@ -32,6 +35,7 @@ from server.confirmation import (
     replace_confirmation_link,
 )
 from server.db import create_db_engine
+from server.models import quota_counters, subscription_periods
 from server.passwords import PasswordNotAccepted, password_accepted, verify_password
 
 router = APIRouter()
@@ -69,21 +73,66 @@ async def read_credentials(request: Request) -> tuple[str, str] | JSONResponse:
 LINK_EXPIRED = "Ссылка больше не действует"
 
 
+class StoredPeriod(NamedTuple):
+    started_at: datetime
+    ends_at: datetime
+    active: bool
+    used: int
+
+
+def find_stored_period(
+    connection: Connection, account_id: uuid.UUID
+) -> StoredPeriod | None:
+    period = (
+        connection.execute(
+            select(subscription_periods).where(
+                subscription_periods.c.account_id == account_id
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if period is None:
+        return None
+    used = connection.execute(
+        select(quota_counters.c.used).where(
+            quota_counters.c.period_id == period["id"]
+        )
+    ).scalar_one()
+    return StoredPeriod(
+        started_at=period["started_at"],
+        ends_at=period["ends_at"],
+        active=period["active"],
+        used=used,
+    )
+
+
 def account_document(
     account_id: object,
     email: str,
     name: str,
     email_confirmed_at: datetime | None,
+    stored_period: StoredPeriod | None = None,
 ) -> dict[str, object]:
     if email_confirmed_at is None:
         period = None
+        quota = None
         confirmed = False
-    else:
+    elif stored_period is None:
         period = {
             "started_at": format_utc(email_confirmed_at),
             "ends_at": format_utc(calendar_month_end(email_confirmed_at)),
             "active": True,
         }
+        quota = None
+        confirmed = True
+    else:
+        period = {
+            "started_at": format_utc(stored_period.started_at),
+            "ends_at": format_utc(stored_period.ends_at),
+            "active": stored_period.active,
+        }
+        quota = development_tariff.model_requests - stored_period.used
         confirmed = True
     return {
         "account": {
@@ -93,7 +142,7 @@ def account_document(
         },
         "email_confirmed": confirmed,
         "period": period,
-        "quota": None,
+        "quota": quota,
     }
 
 
@@ -103,9 +152,16 @@ def opened_session(
     name: str,
     session_id: object,
     email_confirmed_at: datetime | None,
+    stored_period: StoredPeriod | None = None,
 ) -> JSONResponse:
     response = JSONResponse(
-        account_document(account_id, email, name, email_confirmed_at)
+        account_document(
+            account_id,
+            email,
+            name,
+            email_confirmed_at,
+            stored_period,
+        )
     )
     response.set_cookie(
         key="session",
@@ -171,12 +227,19 @@ async def login(request: Request) -> JSONResponse:
         if account is None or not verify_password(password, account["password_hash"]):
             opened = None
         else:
+            confirmed_at = account["email_confirmed_at"]
+            stored_period = (
+                None
+                if confirmed_at is None
+                else find_stored_period(connection, account["id"])
+            )
             opened = (
                 account["id"],
                 account["email"],
                 account["name"],
                 create_session(connection, account["id"]),
-                account["email_confirmed_at"],
+                confirmed_at,
+                stored_period,
             )
     if opened is None:
         return error_response(
@@ -184,8 +247,15 @@ async def login(request: Request) -> JSONResponse:
             "invalid_credentials",
             "Почта или пароль не сходятся",
         )
-    account_id, stored_email, name, session_id, confirmed_at = opened
-    return opened_session(account_id, stored_email, name, session_id, confirmed_at)
+    account_id, stored_email, name, session_id, confirmed_at, stored_period = opened
+    return opened_session(
+        account_id,
+        stored_email,
+        name,
+        session_id,
+        confirmed_at,
+        stored_period,
+    )
 
 
 def session_id_from_cookie(request: Request) -> uuid.UUID | None:
@@ -227,11 +297,18 @@ def me(request: Request) -> JSONResponse:
         else:
             session, account = current
             touch_session(connection, session["id"], now)
+            confirmed_at = account["email_confirmed_at"]
+            stored_period = (
+                None
+                if confirmed_at is None
+                else find_stored_period(connection, account["id"])
+            )
             document = account_document(
                 account["id"],
                 account["email"],
                 account["name"],
-                account["email_confirmed_at"],
+                confirmed_at,
+                stored_period,
             )
     if document is None:
         return unauthenticated()
