@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+from collections.abc import Mapping
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
@@ -22,6 +23,7 @@ INVALID_ROUTINE = "Нужны дни недели и одно время."
 SCENARIO_REQUIRED = "Без сценария рутину создать нельзя."
 ROUTINE_LIMIT = "Лимит рутин исчерпан."
 ROUTINE_NOT_FOUND = "Рутина не найдена."
+INVALID_PAUSE = "Нужен признак паузы."
 _CLOCK = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
@@ -39,6 +41,10 @@ def _routine_limit() -> JSONResponse:
 
 def _routine_not_found() -> JSONResponse:
     return error_response(404, "not_found", ROUTINE_NOT_FOUND)
+
+
+def _invalid_pause() -> JSONResponse:
+    return error_response(400, "invalid_request", INVALID_PAUSE)
 
 
 def _clock(value: str) -> time:
@@ -66,11 +72,16 @@ def working_desktop_zone(
     return desktop["timezone"]
 
 
+def starts_when_due(row: Mapping[str, object]) -> bool:
+    return row["paused"] is not True
+
+
 def routine_document(row: RowMapping) -> dict[str, object]:
     return {
         "id": str(row["id"]),
         "weekdays": sorted(int(day) for day in row["weekdays"]),
         "time": format_clock(row["time_of_day"]),
+        "paused": row["paused"] is True,
     }
 
 
@@ -163,6 +174,7 @@ async def create_routine(request: Request, bot_id: str) -> JSONResponse:
                 bot_id=parsed_id,
                 weekdays=days,
                 time_of_day=_clock(clock),
+                paused=False,
             )
         )
         row = (
@@ -208,3 +220,67 @@ def delete_routine(
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse({})
+
+
+async def read_paused(request: Request) -> bool | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_pause()
+    if not isinstance(body, dict) or "paused" not in body:
+        return _invalid_pause()
+    paused = body["paused"]
+    if not isinstance(paused, bool):
+        return _invalid_pause()
+    return paused
+
+
+def _owned_routine(
+    connection: Connection, routine_id: uuid.UUID, bot_id: uuid.UUID
+) -> RowMapping | None:
+    return (
+        connection.execute(
+            select(routines).where(
+                routines.c.id == routine_id,
+                routines.c.bot_id == bot_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+@router.patch("/api/bots/{bot_id}/routines/{routine_id}")
+async def update_routine_pause(
+    request: Request, bot_id: str, routine_id: str
+) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_bot = parse_id(bot_id)
+        if parsed_bot is None:
+            return not_found()
+        paused = await read_paused(request)
+        if isinstance(paused, JSONResponse):
+            return paused
+        bot = _owned_bot(opened.connection, parsed_bot, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_routine = parse_id(routine_id)
+        if parsed_routine is None:
+            return _routine_not_found()
+        existing = _owned_routine(opened.connection, parsed_routine, parsed_bot)
+        if existing is None:
+            return _routine_not_found()
+        opened.connection.execute(
+            routines.update()
+            .where(
+                routines.c.id == parsed_routine,
+                routines.c.bot_id == parsed_bot,
+            )
+            .values(paused=paused)
+        )
+        row = _owned_routine(opened.connection, parsed_routine, parsed_bot)
+        assert row is not None
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(routine_document(row))

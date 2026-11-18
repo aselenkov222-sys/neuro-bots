@@ -145,4 +145,5 @@ routines = Table(
     Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
     Column("weekdays", ARRAY(Integer()), nullable=False),
     Column("time_of_day", Time(timezone=False), nullable=False),
+    Column("paused", Boolean(), nullable=False, server_default=text("false")),
 )

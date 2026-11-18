@@ -67,13 +67,14 @@ DESKTOP_COLUMNS = (
     "timezone",
     "last_pulse_at",
 )
-ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day")
+ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day", "paused")
 ACCOUNT_REVISION = "3c87a0f84d5e"
 CONFIRMATION_REVISION = "ff582d8bc7fb"
 EMAIL_CONFIRMED_REVISION = "048ee727aa3e"
 SUBSCRIPTION_REVISION = "c54ff0c6fb42"
 DESKTOP_REVISION = "78372be7d547"
 PULSE_REVISION = "f524099440d0"
+ROUTINE_REVISION = "b7e2c4a91d58"
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
@@ -148,12 +149,14 @@ def _revision_chain() -> list[str]:
     assert links[SUBSCRIPTION_REVISION] == EMAIL_CONFIRMED_REVISION
     assert links[DESKTOP_REVISION] == SUBSCRIPTION_REVISION
     assert links[PULSE_REVISION] == DESKTOP_REVISION
-    assert links[chain[-1]] == PULSE_REVISION
+    assert links[ROUTINE_REVISION] == PULSE_REVISION
+    assert links[chain[-1]] == ROUTINE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
     assert chain[-1] != DESKTOP_REVISION
     assert chain[-1] != PULSE_REVISION
+    assert chain[-1] != ROUTINE_REVISION
     return chain
 
 
@@ -677,6 +680,10 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=False,
         timezone=False,
     )
+    assert isinstance(routines.c.paused.type, Boolean)
+    assert routines.c.paused.nullable is False
+    assert routines.c.paused.default is None
+    assert routines.c.paused.server_default.arg.text == "false"
     assert [
         constraint
         for constraint in routines.constraints
@@ -1081,6 +1088,10 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "time without time zone",
                     not_null=True,
                 )
+                assert routine_columns["paused"]["type_name"] == "bool"
+                assert routine_columns["paused"]["format_type"] == "boolean"
+                assert routine_columns["paused"]["not_null"] is True
+                assert routine_columns["paused"]["column_default"] == "false"
                 assert _constraints(connection, "routines") == {
                     ("p", "PRIMARY KEY (id)"),
                     (

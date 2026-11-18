@@ -6,21 +6,22 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import ARRAY, Integer, Text, Time, Uuid, select, text
+from sqlalchemy import ARRAY, Boolean, Integer, Text, Time, Uuid, select, text
 
 from server.accounts import create_account, create_session
 from server.app import app
 from server.config import development_tariff
 from server.db import create_db_engine, metadata
-from server.models import accounts, bots, desktops, routines, sessions
-from server.routines import appointed_utc, working_desktop_zone
+from server.models import accounts, bots, chats, desktops, messages, routines, sessions
+from server.routines import appointed_utc, starts_when_due, working_desktop_zone
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 ORIGIN = "http://testserver"
 ACCEPTED = "abcdef1!"
-ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day")
-ROUTINE_FIELDS = ("id", "weekdays", "time")
+ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day", "paused")
+ROUTINE_FIELDS = ("id", "weekdays", "time", "paused")
+INVALID_PAUSE = {"code": "invalid_request", "message": "Нужен признак паузы."}
 INVALID_ROUTINE = {
     "code": "invalid_routine",
     "message": "Нужны дни недели и одно время.",
@@ -122,6 +123,11 @@ def _session(session_id: str) -> dict:
     return matched[0]
 
 
+def _chat_messages(bot_id: uuid.UUID) -> list[dict]:
+    chat_ids = {row["id"] for row in _rows(chats) if row["bot_id"] == bot_id}
+    return [row for row in _rows(messages) if row["chat_id"] in chat_ids]
+
+
 def _account_routines(account_id: uuid.UUID) -> list[dict]:
     bot_ids = {
         row["id"] for row in _rows(bots) if row["account_id"] == account_id
@@ -143,6 +149,14 @@ def _create_bot(client: TestClient, name: str, scenario: str) -> dict:
     )
     assert response.status_code == 200
     return response.json()
+
+
+def _pause(client: TestClient, bot_id: str, routine_id: str, paused: object) -> object:
+    return client.patch(
+        f"/api/bots/{bot_id}/routines/{routine_id}",
+        json={"paused": paused},
+        headers={"Origin": ORIGIN},
+    )
 
 
 def _create_routine(client: TestClient, bot_id: str, payload: dict) -> object:
@@ -202,7 +216,10 @@ def test_routine_model_and_table_have_schedule_columns_only(database: None) -> N
     assert routines.c.time_of_day.nullable is False
     for column in routines.columns:
         assert not isinstance(column.type, Text)
-        assert column.name not in {"scenario", "text", "title", "paused", "created_at"}
+        assert column.name not in {"scenario", "text", "title", "created_at"}
+    assert isinstance(routines.c.paused.type, Boolean)
+    assert routines.c.paused.nullable is False
+    assert routines.c.paused.server_default.arg.text == "false"
 
     engine = create_db_engine()
     try:
@@ -251,6 +268,7 @@ def test_routine_model_and_table_have_schedule_columns_only(database: None) -> N
         "uuid",
         "integer[]",
         "time without time zone",
+        "boolean",
     ]
     assert all(row["not_null"] is True for row in columns)
     assert set(constraints) == {
@@ -611,3 +629,93 @@ def test_saved_clock_stays_local_in_the_working_desktop_zone(
     appointed = appointed_utc(row["time_of_day"], _zone(account_id), date(2026, 11, 18))
     assert appointed == datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
     assert appointed != datetime(2026, 11, 18, 9, 0, tzinfo=timezone.utc)
+
+
+def test_pause_blocks_a_start_and_writes_no_chat_message(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_complete(*args: object, **kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", fail_complete)
+    cookie, account_id = _open_account("pause-routine@example.com", confirmed=True)
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        created = _create_routine(
+            client,
+            bot["id"],
+            {"weekdays": [1, 3], "time": "09:00"},
+        )
+        assert created.status_code == 200
+        assert tuple(created.json()) == ROUTINE_FIELDS
+        assert created.json()["paused"] is False
+        routine_id = created.json()["id"]
+        bot_id = uuid.UUID(bot["id"])
+        created_row = _account_routines(account_id)[0]
+        assert created_row["paused"] is False
+        assert starts_when_due(created_row) is True
+        assert len([row for row in _rows(chats) if row["bot_id"] == bot_id]) == 1
+        assert _chat_messages(bot_id) == []
+        for payload in (1, "true", "false", None):
+            rejected = _pause(client, bot["id"], routine_id, payload)
+            assert rejected.status_code == 400
+            assert rejected.json() == INVALID_PAUSE
+        missing_flag = client.patch(
+            f"/api/bots/{bot['id']}/routines/{routine_id}",
+            json={},
+            headers={"Origin": ORIGIN},
+        )
+        foreign_shape = client.patch(
+            f"/api/bots/{bot['id']}/routines/{routine_id}",
+            json=[],
+            headers={"Origin": ORIGIN},
+        )
+        raw = client.patch(
+            f"/api/bots/{bot['id']}/routines/{routine_id}",
+            content=b"not-json",
+            headers={"Origin": ORIGIN},
+        )
+        assert (
+            missing_flag.status_code
+            == foreign_shape.status_code
+            == raw.status_code
+            == 400
+        )
+        assert missing_flag.json() == foreign_shape.json() == raw.json() == INVALID_PAUSE
+        missing_bot = client.patch(
+            f"/api/bots/{uuid.uuid4()}/routines/{routine_id}",
+            json={"paused": True},
+            headers={"Origin": ORIGIN},
+        )
+        missing_routine = client.patch(
+            f"/api/bots/{bot['id']}/routines/{uuid.uuid4()}",
+            json={"paused": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert missing_bot.status_code == 404
+        assert missing_bot.json() == NOT_FOUND
+        assert missing_routine.status_code == 404
+        assert missing_routine.json() == ROUTINE_NOT_FOUND
+        assert _account_routines(account_id)[0]["paused"] is False
+        assert _chat_messages(bot_id) == []
+        paused = _pause(client, bot["id"], routine_id, True)
+        assert paused.status_code == 200
+        assert tuple(paused.json()) == ROUTINE_FIELDS
+        assert paused.json()["paused"] is True
+        assert paused.json()["weekdays"] == [1, 3]
+        assert paused.json()["time"] == "09:00"
+        held = _account_routines(account_id)[0]
+        assert held["paused"] is True
+        assert starts_when_due(held) is False
+        assert held["time_of_day"] == time(9, 0)
+        assert _chat_messages(bot_id) == []
+        resumed = _pause(client, bot["id"], routine_id, False)
+        assert resumed.status_code == 200
+        assert resumed.json()["paused"] is False
+        assert resumed.json()["time"] == "09:00"
+        assert resumed.json()["weekdays"] == [1, 3]
+        released = _account_routines(account_id)[0]
+        assert released["paused"] is False
+        assert starts_when_due(released) is True
+        assert released["time_of_day"] == time(9, 0)
+        assert _chat_messages(bot_id) == []
