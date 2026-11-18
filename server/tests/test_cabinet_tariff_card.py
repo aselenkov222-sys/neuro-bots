@@ -7,7 +7,6 @@ from server.app import app
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 REMOVED = (
-    "Проверить сейчас",
     "библиотек",
     "Библиотек",
     "Главный",
@@ -89,6 +88,8 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
             assert label in shown
         assert 'id="routine-time"' in card
         assert "Пауза" in card
+        assert "Проверить сейчас" in card
+        assert 'data-action="check-now"' in card
         assert "Своего текста у рутины нет." in card
         start = script.index(card)
         remainder = script[:start] + script[start + len(card):]
@@ -104,7 +105,7 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
         assert 'id="composer"' in chat
         assert 'data-form="send"' in chat
         assert 'type="text"' in chat
-        for piece in ("рутин", "Рутин"):
+        for piece in ("рутин", "Рутин", "Проверить сейчас"):
             assert piece not in tariff
             assert piece not in bots
             assert piece not in chat

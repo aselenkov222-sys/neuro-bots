@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
-from server.accounts import touch_session, utc_now
+from server.accounts import format_utc, touch_session, utc_now
 from server.auth import (
     begin,
     current_account,
@@ -26,6 +26,7 @@ from server.bots import (
     _adapter_messages,
     _insert_message,
     _lock_quota_counter,
+    _messages_document,
     not_found,
     open_confirmed,
     parse_id,
@@ -45,6 +46,7 @@ from server.models import (
     messages,
     quota_charges,
     quota_counters,
+    routine_checks,
     routine_runs,
     routines,
     subscription_periods,
@@ -59,6 +61,7 @@ ROUTINE_NOT_FOUND = "Рутина не найдена."
 INVALID_PAUSE = "Нужен признак паузы."
 SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
 SKIP_CODE = "routine_skipped"
+QUEUE_CODE = "routine_queue"
 SCENARIO_INSUFFICIENT = "scenario_insufficient"
 SCENARIO_INSUFFICIENT_TEXT = "Запуск завершён: сценария недостаточно."
 SITE_NOT_OPENED = "site_not_opened"
@@ -223,6 +226,59 @@ def _write_chat_error(
 
 def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
     _write_chat_error(connection, bot_id, now, SKIP_CODE, SKIP_TEXT)
+
+
+def queue_text(name: str) -> str:
+    return f"Ждёт бота «{name}»."
+
+
+def _queue_note_since(
+    connection: Connection, bot_id: uuid.UUID, due_at: datetime
+) -> bool:
+    return (
+        connection.execute(
+            select(messages.c.id)
+            .join(chats, chats.c.id == messages.c.chat_id)
+            .where(
+                chats.c.bot_id == bot_id,
+                messages.c.code == QUEUE_CODE,
+                messages.c.updated_at >= _aware(due_at),
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
+def _note_queue(
+    connection: Connection,
+    account_id: uuid.UUID,
+    holder_bot_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    name = connection.execute(
+        select(bots.c.name).where(bots.c.id == holder_bot_id)
+    ).scalar_one()
+    waiting = connection.execute(
+        select(
+            routines.c.bot_id,
+            func.min(routine_runs.c.due_at).label("due_at"),
+        )
+        .join(routine_runs, routine_runs.c.routine_id == routines.c.id)
+        .join(bots, bots.c.id == routines.c.bot_id)
+        .where(
+            bots.c.account_id == account_id,
+            routines.c.paused.is_(False),
+            routine_runs.c.status == "pending",
+            routine_runs.c.due_at > _aware(now) - CLAIM_WAIT,
+        )
+        .group_by(routines.c.bot_id)
+    ).all()
+    text = queue_text(str(name))
+    for bot_id, due_at in waiting:
+        if _queue_note_since(connection, bot_id, due_at):
+            continue
+        _write_chat_error(connection, bot_id, now, QUEUE_CODE, text)
 
 
 def scenario_insufficient(value: object) -> bool:
@@ -570,14 +626,10 @@ def settle_due(connection: Connection, now: datetime) -> None:
         )
 
 
-def claim_earliest_pending(
-    connection: Connection, account_id: uuid.UUID, now: datetime
+def _earliest_claimable_run(
+    connection: Connection, account_id: uuid.UUID, moment: datetime
 ) -> RowMapping | None:
-    moment = _aware(now)
-    settle_due(connection, moment)
-    if working_routines_stopped(connection, account_id):
-        return None
-    pending = (
+    return (
         connection.execute(
             select(
                 routine_runs.c.id,
@@ -593,13 +645,28 @@ def claim_earliest_pending(
                 routine_runs.c.status == "pending",
                 routine_runs.c.due_at > moment - CLAIM_WAIT,
             )
-            .order_by(routine_runs.c.due_at.asc(), routine_runs.c.id.asc())
+            .order_by(
+                routine_runs.c.due_at.asc(),
+                routines.c.created_at.asc(),
+                routine_runs.c.id.asc(),
+            )
             .limit(1)
         )
         .mappings()
         .one_or_none()
     )
+
+
+def claim_earliest_pending(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> RowMapping | None:
+    moment = _aware(now)
+    settle_due(connection, moment)
+    if working_routines_stopped(connection, account_id):
+        return None
+    pending = _earliest_claimable_run(connection, account_id, moment)
     if pending is None:
+        _claim_earliest_check(connection, account_id, moment)
         return None
     if scenario_insufficient(pending["scenario"]):
         _mark_failed(
@@ -622,8 +689,73 @@ def claim_earliest_pending(
     )
     if updated.rowcount != 1:
         return None
+    _note_queue(connection, account_id, pending["bot_id"], moment)
     _complete_claimed_run(connection, account_id, pending["bot_id"], moment)
     return pending
+
+
+def _desktop_live(connection: Connection, account_id: uuid.UUID) -> bool:
+    desktop = find_working_desktop(connection, account_id)
+    return desktop is not None and desktop["last_pulse_at"] is not None
+
+
+def _claim_earliest_check(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> None:
+    if working_routines_stopped(connection, account_id):
+        return
+    if _earliest_claimable_run(connection, account_id, now) is not None:
+        return
+    pending = (
+        connection.execute(
+            select(routine_checks.c.id, routine_checks.c.bot_id)
+            .join(bots, bots.c.id == routine_checks.c.bot_id)
+            .where(
+                bots.c.account_id == account_id,
+                routine_checks.c.status == "pending",
+            )
+            .order_by(
+                routine_checks.c.created_at.asc(),
+                routine_checks.c.id.asc(),
+            )
+            .limit(1)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if pending is None:
+        return
+    updated = connection.execute(
+        routine_checks.update()
+        .where(
+            routine_checks.c.id == pending["id"],
+            routine_checks.c.status == "pending",
+        )
+        .values(status="claimed")
+    )
+    if updated.rowcount != 1:
+        return
+    bot = (
+        connection.execute(select(bots).where(bots.c.id == pending["bot_id"]))
+        .mappings()
+        .one()
+    )
+    if scenario_insufficient(bot["scenario"]):
+        _write_chat_error(
+            connection,
+            pending["bot_id"],
+            now,
+            SCENARIO_INSUFFICIENT,
+            SCENARIO_INSUFFICIENT_TEXT,
+        )
+        return
+    _speak_scenario(
+        connection,
+        account_id,
+        pending["bot_id"],
+        now,
+        desktop_available=True,
+    )
 
 
 def _complete_claimed_run(
@@ -631,6 +763,23 @@ def _complete_claimed_run(
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
     now: datetime,
+) -> None:
+    _speak_scenario(
+        connection,
+        account_id,
+        bot_id,
+        now,
+        desktop_available=True,
+    )
+
+
+def _speak_scenario(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    now: datetime,
+    *,
+    desktop_available: bool,
 ) -> None:
     bot = (
         connection.execute(select(bots).where(bots.c.id == bot_id))
@@ -663,7 +812,7 @@ def _complete_claimed_run(
         description=bot["description"],
         scenario=scenario,
         messages=_adapter_messages(connection, chat["id"]),
-        desktop_available=True,
+        desktop_available=desktop_available,
     )
     if reply == "":
         _insert_message(
@@ -706,6 +855,7 @@ def routine_document(row: RowMapping) -> dict[str, object]:
         "weekdays": sorted(int(day) for day in row["weekdays"]),
         "time": format_clock(row["time_of_day"]),
         "paused": row["paused"] is True,
+        "created_at": format_utc(row["created_at"]),
     }
 
 
@@ -803,6 +953,7 @@ async def create_routine(request: Request, bot_id: str) -> JSONResponse:
                 weekdays=days,
                 time_of_day=_clock(clock),
                 paused=False,
+                created_at=opened.now,
             )
         )
         row = (
@@ -838,6 +989,56 @@ def list_routines(request: Request, bot_id: str) -> JSONResponse:
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse([routine_document(row) for row in rows])
+
+
+@router.post("/api/bots/{bot_id}/check")
+def check_now(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _owned_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        if scenario_insufficient(bot["scenario"]):
+            return _scenario_required()
+        chat = (
+            opened.connection.execute(
+                select(chats).where(chats.c.bot_id == parsed_id)
+            )
+            .mappings()
+            .one()
+        )
+        queued = (
+            _earliest_claimable_run(
+                opened.connection, opened.account["id"], opened.now
+            )
+            is not None
+        )
+        opened.connection.execute(
+            routine_checks.insert().values(
+                id=uuid.uuid4(),
+                bot_id=parsed_id,
+                status="pending" if queued else "claimed",
+                created_at=opened.now,
+            )
+        )
+        if not queued:
+            _speak_scenario(
+                opened.connection,
+                opened.account["id"],
+                parsed_id,
+                opened.now,
+                desktop_available=_desktop_live(
+                    opened.connection, opened.account["id"]
+                ),
+            )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        document = _messages_document(opened.connection, chat["id"])
+        document["queued"] = queued
+        return JSONResponse(document)
 
 
 @router.delete("/api/bots/{bot_id}/routines/{routine_id}")

@@ -44,6 +44,7 @@ _QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 _lock = threading.Lock()
 _opens: dict[tuple[uuid.UUID, uuid.UUID], list["_Open"]] = {}
 _choices: dict[tuple[uuid.UUID, uuid.UUID], "_Pending"] = {}
+_held: dict[tuple[uuid.UUID, uuid.UUID], list[str]] = {}
 _SAVED_FACT = "Доступ сохранён."
 
 
@@ -142,6 +143,19 @@ def clear_opens() -> None:
     with _lock:
         _opens.clear()
         _choices.clear()
+        _held.clear()
+
+
+def bot_holds_browser(
+    account_id: uuid.UUID, computer_id: uuid.UUID, bot_id: uuid.UUID
+) -> bool:
+    item = _first_open(account_id, computer_id)
+    return item is not None and item.bot_id == bot_id
+
+
+def hold_text(account_id: uuid.UUID, bot_id: uuid.UUID, text: str) -> None:
+    with _lock:
+        _held.setdefault((account_id, bot_id), []).append(text)
 
 
 def take_login_choice(
@@ -456,7 +470,99 @@ def finish_open(
     connection.execute(
         chats.update().where(chats.c.id == pending.chat_id).values(updated_at=reply_at)
     )
+    release_held(connection, account_id, computer_id, pending.bot_id, reply_at)
     return JSONResponse(_messages_document(connection, pending.chat_id))
+
+
+def release_held(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    if bot_holds_browser(account_id, computer_id, bot_id):
+        return
+    with _lock:
+        waiting = _held.pop((account_id, bot_id), [])
+    for _text in waiting:
+        _answer_held(connection, account_id, bot_id, now)
+
+
+def _answer_held(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    bot = (
+        connection.execute(
+            select(bots).where(
+                bots.c.id == bot_id,
+                bots.c.account_id == account_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if bot is None:
+        return
+    chat_id = connection.execute(
+        select(chats.c.id).where(chats.c.bot_id == bot_id)
+    ).scalar_one_or_none()
+    if chat_id is None:
+        return
+    reply_at = _reply_at(connection, chat_id, now)
+    counter = _lock_quota(connection, account_id)
+    if counter is None or counter["used"] >= development_tariff.model_requests:
+        _insert_message(
+            connection,
+            chat_id,
+            "error",
+            _QUOTA_EXHAUSTED_TEXT,
+            None,
+            reply_at,
+        )
+    else:
+        reply = aggregator.complete(
+            description=bot["description"],
+            scenario=bot["scenario"],
+            messages=_adapter_messages(connection, chat_id),
+            desktop_available=_pulse_live(connection, account_id),
+        )
+        if reply == "":
+            _insert_message(
+                connection,
+                chat_id,
+                "error",
+                _EMPTY_MODEL_TEXT,
+                _EMPTY_MODEL_CODE,
+                reply_at,
+            )
+        else:
+            _insert_message(
+                connection,
+                chat_id,
+                "assistant",
+                reply,
+                None,
+                reply_at,
+            )
+            connection.execute(
+                quota_charges.insert().values(
+                    id=uuid.uuid4(),
+                    period_id=counter["period_id"],
+                    created_at=now,
+                )
+            )
+            connection.execute(
+                quota_counters.update()
+                .where(quota_counters.c.id == counter["id"])
+                .values(used=counter["used"] + 1)
+            )
+    connection.execute(
+        chats.update().where(chats.c.id == chat_id).values(updated_at=reply_at)
+    )
 
 
 def _write_assistant(
@@ -531,7 +637,7 @@ def finish_choose(
         computer_id,
         _Pending(pending.url, site, choices, pending.bot_id, pending.chat_id, "choose"),
     )
-    return _write_assistant(
+    document = _write_assistant(
         connection,
         account_id,
         pending.bot_id,
@@ -539,6 +645,8 @@ def finish_choose(
         now,
         question,
     )
+    release_held(connection, account_id, computer_id, pending.bot_id, now)
+    return document
 
 
 def finish_form(
@@ -560,7 +668,7 @@ def finish_form(
         computer_id,
         _Pending(pending.url, site, (), pending.bot_id, pending.chat_id, "form"),
     )
-    return _write_assistant(
+    document = _write_assistant(
         connection,
         account_id,
         pending.bot_id,
@@ -568,6 +676,8 @@ def finish_form(
         now,
         sentence,
     )
+    release_held(connection, account_id, computer_id, pending.bot_id, now)
+    return document
 
 
 def finish_saved(
@@ -582,7 +692,7 @@ def finish_saved(
         if pending is None or pending.kind != "form" or pending.site != site:
             return Response(status_code=204)
         del _choices[(account_id, computer_id)]
-    return _write_assistant(
+    document = _write_assistant(
         connection,
         account_id,
         pending.bot_id,
@@ -590,6 +700,8 @@ def finish_saved(
         now,
         _SAVED_FACT,
     )
+    release_held(connection, account_id, computer_id, pending.bot_id, now)
+    return document
 
 
 @router.get("/api/desktops/{computer_id}/browser-task")

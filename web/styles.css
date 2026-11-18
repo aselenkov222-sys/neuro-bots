@@ -598,6 +598,18 @@ legend {
   border: 1px solid color-mix(in srgb, var(--green-line) 40%, transparent);
 }
 
+.warn {
+  margin-top: 10px;
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--warn-bg);
+  border: 1px solid color-mix(in srgb, var(--orange) 45%, transparent);
+}
+
 .dirty { color: var(--danger-ink); font-size: 14px; font-weight: 600; }
 
 .chat {

@@ -360,6 +360,7 @@ def test_browser_shows_routine_days_and_one_time(database: None) -> None:
             assert page.locator(".day").first.is_disabled()
             assert page.locator("#routine-time").is_disabled()
             assert page.locator("[data-action='toggle-pause']").is_disabled()
+            assert page.locator("[data-action='check-now']").is_disabled()
 
             page.goto(f"{origin}/#bots")
             page.wait_for_selector("text=Создать бота")
@@ -383,7 +384,15 @@ def test_browser_shows_routine_days_and_one_time(database: None) -> None:
                 page.locator("text=Дни недели и одно время. Своего текста у рутины нет.").count()
                 == 1
             )
-            assert page.locator("text=Проверить сейчас").count() == 0
+            check_now = page.locator("[data-action='check-now']")
+            assert check_now.inner_text() == "Проверить сейчас"
+            assert check_now.is_enabled()
+            check_now.click()
+            page.wait_for_selector(f"text={STUB}")
+            assert page.locator(".bubble").filter(has_text=STUB).count() == 1
+            page.locator("a", has_text="Карточка").click()
+            page.wait_for_selector("#routine-time")
+            assert page.locator("h1").inner_text() == "Искра"
             assert page.locator("text=Кликабельный макет").count() == 0
             assert page.locator(".proto").count() == 0
             assert page.locator(".proto-nav").count() == 0
@@ -417,6 +426,151 @@ def test_browser_shows_routine_days_and_one_time(database: None) -> None:
             ):
                 page.locator(".day.is-on").click()
             assert page.locator(".day.is-on").count() == 0
+            browser.close()
+    finally:
+        _stop(process, journal)
+
+
+def test_browser_warns_before_saving_a_taken_time(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"clash-{uuid.uuid4()}@example.com"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text
+                and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/")
+            page.wait_for_selector("h1")
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Ранний")
+            page.fill("#create-scenario", "план")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Ранний").click()
+            page.wait_for_selector("#routine-time")
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/routines")
+                and response.ok
+            ):
+                page.locator(".day", has_text="Пн").click()
+            assert page.locator("#routine-warn").count() == 0
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Поздний")
+            page.fill("#create-scenario", "другой план")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Поздний").click()
+            page.wait_for_selector("#routine-time")
+            saved: list[str] = []
+
+            def remember(response) -> None:
+                if (
+                    response.request.method == "POST"
+                    and response.url.endswith("/routines")
+                ):
+                    saved.append(response.url)
+
+            page.on("response", remember)
+            page.locator(".day", has_text="Пн").click()
+            page.wait_for_selector("#routine-warn")
+            page.wait_for_timeout(400)
+            assert saved == []
+            assert page.locator("[data-action='toggle-pause']").is_disabled()
+            assert (
+                page.locator("#routine-warn").inner_text()
+                == "В это время уже стоит рутина бота «Ранний». Она создана раньше и пойдёт первой. Эта выполнит весь сценарий после неё."
+            )
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/routines")
+                and response.ok
+            ):
+                page.locator("[data-action='keep-routine-time']").click()
+            assert page.locator("#routine-warn").count() == 0
+            assert page.locator(".day.is-on").inner_text() == "Пн"
+            assert page.locator("[data-action='toggle-pause']").is_enabled()
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.locator(".bot-card", has_text="Ранний").click()
+            page.wait_for_selector("#bot-name")
+            name = page.locator("#bot-name")
+            name.fill("Ранний-2")
+            name.blur()
+            page.wait_for_selector("h1:has-text('Ранний-2')")
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Третий")
+            page.fill("#create-scenario", "ещё план")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Третий").click()
+            page.wait_for_selector("#routine-time")
+            page.locator(".day", has_text="Пн").click()
+            page.wait_for_selector("#routine-warn")
+            assert (
+                page.locator("#routine-warn").inner_text()
+                == "В это время уже стоит рутина бота «Ранний-2». Она создана раньше и пойдёт первой. Эта выполнит весь сценарий после неё."
+            )
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.locator(".bot-card", has_text="Поздний").click()
+            page.wait_for_selector("#routine-time")
+            with page.expect_response(
+                lambda response: response.request.method == "PATCH"
+                and "/routines/" in response.url
+                and response.ok
+            ):
+                page.locator("#routine-time").fill("11:00")
+                page.locator("#routine-time").blur()
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.locator(".bot-card", has_text="Ранний-2").click()
+            page.wait_for_selector("#routine-time")
+            page.locator("#routine-time").fill("11:00")
+            page.locator("#routine-time").blur()
+            page.wait_for_selector("#routine-warn")
+            assert (
+                page.locator("#routine-warn").inner_text()
+                == "В это время уже стоит рутина бота «Поздний». Раньше создана эта рутина, и она пойдёт первой. Рутина бота «Поздний» выполнит весь сценарий после неё."
+            )
             browser.close()
     finally:
         _stop(process, journal)

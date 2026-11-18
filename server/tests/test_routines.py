@@ -6,7 +6,17 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import ARRAY, Boolean, Integer, Text, Time, Uuid, select, text
+from sqlalchemy import (
+    ARRAY,
+    Boolean,
+    DateTime,
+    Integer,
+    Text,
+    Time,
+    Uuid,
+    select,
+    text,
+)
 
 from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
@@ -20,6 +30,7 @@ from server.models import (
     messages,
     quota_charges,
     quota_counters,
+    routine_checks,
     routine_runs,
     routines,
     sessions,
@@ -38,8 +49,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 ORIGIN = "http://testserver"
 ACCEPTED = "abcdef1!"
-ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day", "paused")
-ROUTINE_FIELDS = ("id", "weekdays", "time", "paused")
+ROUTINE_COLUMNS = (
+    "id",
+    "bot_id",
+    "weekdays",
+    "time_of_day",
+    "paused",
+    "created_at",
+)
+ROUTINE_FIELDS = ("id", "weekdays", "time", "paused", "created_at")
 INVALID_PAUSE = {"code": "invalid_request", "message": "Нужен признак паузы."}
 INVALID_ROUTINE = {
     "code": "invalid_routine",
@@ -249,10 +267,14 @@ def test_routine_model_and_table_have_schedule_columns_only(database: None) -> N
     assert routines.c.time_of_day.nullable is False
     for column in routines.columns:
         assert not isinstance(column.type, Text)
-        assert column.name not in {"scenario", "text", "title", "created_at"}
+        assert column.name not in {"scenario", "text", "title"}
     assert isinstance(routines.c.paused.type, Boolean)
     assert routines.c.paused.nullable is False
     assert routines.c.paused.server_default.arg.text == "false"
+    assert isinstance(routines.c.created_at.type, DateTime)
+    assert routines.c.created_at.type.timezone is True
+    assert routines.c.created_at.nullable is False
+    assert routines.c.created_at.server_default.arg.text == "now()"
 
     engine = create_db_engine()
     try:
@@ -302,6 +324,7 @@ def test_routine_model_and_table_have_schedule_columns_only(database: None) -> N
         "integer[]",
         "time without time zone",
         "boolean",
+        "timestamp with time zone",
     ]
     assert all(row["not_null"] is True for row in columns)
     assert set(constraints) == {
@@ -2146,3 +2169,416 @@ def test_active_period_from_confirmation_still_opens_the_minute(
     assert opened[0]["status"] == "pending"
     assert opened[0]["due_at"] == DUE
     assert _chat_messages(bot_id) == []
+
+
+def test_two_routines_at_one_time_run_in_creation_order(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    def spy(**kwargs: object) -> str:
+        scenario = kwargs["scenario"]
+        assert isinstance(scenario, str)
+        seen.append(scenario)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id = _open_account("queue-order@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        second = _create_bot(client, "Второй", "сценарий второго")
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert later.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    stored = {row["bot_id"]: row for row in _account_routines(account_id)}
+    assert (
+        stored[uuid.UUID(first["id"])]["created_at"]
+        < stored[uuid.UUID(second["id"])]["created_at"]
+    )
+    first_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert first_claim.status_code == 200
+    assert first_claim.json()["bot_id"] == first["id"]
+    assert first_claim.json()["routine_id"] == earlier.json()["id"]
+    assert _runs_for(earlier.json()["id"])[0]["status"] == "claimed"
+    assert _runs_for(later.json()["id"])[0]["status"] == "pending"
+    earlier_chat = _chat_messages(uuid.UUID(first["id"]))
+    assert [row["role"] for row in earlier_chat] == ["assistant"]
+    assert earlier_chat[0]["text"] == STUB_TEXT
+    waiting = _chat_messages(uuid.UUID(second["id"]))
+    assert [row["role"] for row in waiting] == ["error"]
+    assert all(row["role"] != "assistant" for row in waiting)
+    assert seen == ["сценарий первого"]
+    second_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert second_claim.status_code == 200
+    assert second_claim.json()["bot_id"] == second["id"]
+    assert second_claim.json()["routine_id"] == later.json()["id"]
+    assert _runs_for(later.json()["id"])[0]["status"] == "claimed"
+    later_chat = _chat_messages(uuid.UUID(second["id"]))
+    assert any(
+        row["role"] == "assistant" and row["text"] == STUB_TEXT for row in later_chat
+    )
+    assert seen == ["сценарий первого", "сценарий второго"]
+
+
+def test_waiting_bot_is_told_once_who_holds_the_browser(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("queue-note@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        second = _create_bot(client, "Второй", "сценарий второго")
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert later.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    claimed = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert claimed.status_code == 200
+    assert set(claimed.json()) == {"id", "routine_id", "bot_id"}
+    waiting = _chat_messages(uuid.UUID(second["id"]))
+    assert len(waiting) == 1
+    assert waiting[0]["role"] == "error"
+    assert waiting[0]["code"] == "routine_queue"
+    assert waiting[0]["text"] == "Ждёт бота «Первый»."
+    holder = _chat_messages(uuid.UUID(first["id"]))
+    assert [row["code"] for row in holder] == [None]
+    assert all(row["code"] != "routine_queue" for row in holder)
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 200
+    assert again.json()["routine_id"] == later.json()["id"]
+    after = sorted(
+        _chat_messages(uuid.UUID(second["id"])),
+        key=lambda row: (row["updated_at"], row["role"] != "error", str(row["id"])),
+    )
+    assert [row["code"] for row in after] == ["routine_queue", None]
+    assert [row["text"] for row in after] == [
+        "Ждёт бота «Первый».",
+        STUB_TEXT,
+    ]
+    assert sum(row["code"] == "routine_queue" for row in after) == 1
+
+
+def test_two_runs_of_one_bot_get_one_queue_message(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("queue-same-bot@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Один", "сценарий")
+        first = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        second = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+    _desktop(cookie, computer)
+    claimed = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert claimed.status_code == 200
+    spoken = _chat_messages(uuid.UUID(bot["id"]))
+    assert sum(row["code"] == "routine_queue" for row in spoken) == 1
+    assert sum(row["role"] == "assistant" for row in spoken) == 1
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 200
+    after = _chat_messages(uuid.UUID(bot["id"]))
+    assert sum(row["code"] == "routine_queue" for row in after) == 1
+    assert [row["text"] for row in after if row["code"] == "routine_queue"] == [
+        "Ждёт бота «Один»."
+    ]
+
+
+def test_a_later_claim_does_not_repeat_the_queue_message(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("queue-three@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        second = _create_bot(client, "Второй", "сценарий второго")
+        third = _create_bot(client, "Третий", "сценарий третьего")
+        for bot in (first, second, third):
+            created = _create_routine(
+                client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+            )
+            assert created.status_code == 200
+    _desktop(cookie, computer)
+    opened = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert opened.status_code == 200
+    assert opened.json()["bot_id"] == first["id"]
+    for bot_id in (second["id"], third["id"]):
+        waiting = _chat_messages(uuid.UUID(bot_id))
+        assert [row["text"] for row in waiting] == ["Ждёт бота «Первый»."]
+        assert [row["code"] for row in waiting] == ["routine_queue"]
+    middle = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert middle.status_code == 200
+    assert middle.json()["bot_id"] == second["id"]
+    still = _chat_messages(uuid.UUID(third["id"]))
+    assert [row["text"] for row in still] == ["Ждёт бота «Первый»."]
+    assert sum(row["code"] == "routine_queue" for row in still) == 1
+
+
+def _checks(bot_id: uuid.UUID) -> list[dict]:
+    return [row for row in _rows(routine_checks) if row["bot_id"] == bot_id]
+
+
+def _post_check(cookie: str, bot_id: str):
+    with _client(cookie) as client:
+        return client.post(
+            f"/api/bots/{bot_id}/check",
+            headers={"Origin": ORIGIN},
+        )
+
+
+def _desktop(cookie: str, computer: uuid.UUID) -> None:
+    with _client(cookie) as client:
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+
+
+def test_check_now_runs_the_scenario_and_spends_quota(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def spy(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id = _open_account("check-now@example.com", confirmed=True)
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Проверка", "сценарий проверки")
+    bot_id = uuid.UUID(bot["id"])
+    first = _post_check(cookie, bot["id"])
+    assert first.status_code == 200
+    body = first.json()
+    assert body["queued"] is False
+    assert [row["role"] for row in body["messages"]] == ["assistant"]
+    assert body["messages"][0]["text"] == STUB_TEXT
+    assert calls == [
+        {
+            "description": "",
+            "scenario": "сценарий проверки",
+            "messages": [],
+            "desktop_available": False,
+        }
+    ]
+    assert _used(account_id) == 1
+    assert len(_charges(account_id)) == 1
+    assert [row["status"] for row in _checks(bot_id)] == ["claimed"]
+    computer = uuid.uuid4()
+    _desktop(cookie, computer)
+    second = _post_check(cookie, bot["id"])
+    assert second.status_code == 200
+    assert second.json()["queued"] is False
+    assert calls[1]["desktop_available"] is True
+    assert calls[1]["scenario"] == "сценарий проверки"
+    assert _used(account_id) == 2
+    assert len(_charges(account_id)) == 2
+    spoken = _chat_messages(bot_id)
+    assert [row["text"] for row in spoken] == [STUB_TEXT, STUB_TEXT]
+
+
+def test_check_now_empty_reply_does_not_charge(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: "")
+    cookie, account_id = _open_account("check-empty@example.com", confirmed=True)
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Пустой ответ", "сценарий")
+    posted = _post_check(cookie, bot["id"])
+    assert posted.status_code == 200
+    assert posted.json()["queued"] is False
+    spoken = posted.json()["messages"]
+    assert len(spoken) == 1
+    assert spoken[0]["role"] == "error"
+    assert spoken[0]["code"] == "empty_model_response"
+    assert spoken[0]["text"] == EMPTY_MODEL_TEXT
+    assert _used(account_id) == 0
+    assert _charges(account_id) == []
+    assert [row["status"] for row in _checks(uuid.UUID(bot["id"]))] == ["claimed"]
+
+
+def test_check_now_exhausted_quota_does_not_call_the_model(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(**kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", forbidden)
+    cookie, account_id = _open_account("check-quota@example.com", confirmed=True)
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Без квоты", "сценарий")
+    _set_used(account_id, development_tariff.model_requests)
+    posted = _post_check(cookie, bot["id"])
+    assert posted.status_code == 200
+    assert posted.json()["queued"] is False
+    spoken = posted.json()["messages"]
+    assert len(spoken) == 1
+    assert spoken[0]["role"] == "error"
+    assert spoken[0]["code"] is None
+    assert spoken[0]["text"] == QUOTA_EXHAUSTED_TEXT
+    assert _used(account_id) == 500
+    assert _charges(account_id) == []
+
+
+def test_blank_scenario_refuses_a_check(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(**kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", forbidden)
+    cookie, _account_id = _open_account("check-blank@example.com", confirmed=True)
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Без сценария", "план")
+    _set_scenario(cookie, bot["id"], " \n ")
+    posted = _post_check(cookie, bot["id"])
+    assert posted.status_code == 400
+    assert posted.json() == SCENARIO_REQUIRED
+    assert _checks(uuid.UUID(bot["id"])) == []
+
+
+def test_check_waits_behind_a_pending_routine(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    def spy(**kwargs: object) -> str:
+        scenario = kwargs["scenario"]
+        assert isinstance(scenario, str)
+        seen.append(scenario)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id = _open_account("check-queue@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        second = _create_bot(client, "Второй", "сценарий второго")
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert later.status_code == 200
+        early = _create_bot(client, "Ранняя", "проверка ранняя")
+        late = _create_bot(client, "Поздняя", "проверка поздняя")
+    _desktop(cookie, computer)
+    first_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert first_claim.status_code == 200
+    assert first_claim.json()["bot_id"] == first["id"]
+    assert set(first_claim.json()) == {"id", "routine_id", "bot_id"}
+    assert _used(account_id) == 1
+    monkeypatch.setattr("server.bots.utc_now", lambda: CLAIM_AT)
+    early_check = _post_check(cookie, early["id"])
+    assert early_check.status_code == 200
+    assert early_check.json()["queued"] is True
+    assert all(row["role"] != "assistant" for row in early_check.json()["messages"])
+    monkeypatch.setattr(
+        "server.bots.utc_now", lambda: CLAIM_AT + timedelta(microseconds=1)
+    )
+    late_check = _post_check(cookie, late["id"])
+    assert late_check.status_code == 200
+    assert late_check.json()["queued"] is True
+    assert _chat_messages(uuid.UUID(early["id"])) == []
+    assert _chat_messages(uuid.UUID(late["id"])) == []
+    assert [row["status"] for row in _checks(uuid.UUID(early["id"]))] == ["pending"]
+    assert [row["status"] for row in _checks(uuid.UUID(late["id"]))] == ["pending"]
+    assert (
+        _checks(uuid.UUID(early["id"]))[0]["created_at"]
+        < _checks(uuid.UUID(late["id"]))[0]["created_at"]
+    )
+    assert _runs_for(earlier.json()["id"])[0]["status"] == "claimed"
+    assert _runs_for(later.json()["id"])[0]["status"] == "pending"
+    assert seen == ["сценарий первого"]
+    assert _used(account_id) == 1
+    second_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert second_claim.status_code == 200
+    assert second_claim.json()["bot_id"] == second["id"]
+    assert [row["status"] for row in _checks(uuid.UUID(early["id"]))] == ["pending"]
+    assert seen == ["сценарий первого", "сценарий второго"]
+    assert _used(account_id) == 2
+    third_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert third_claim.status_code == 204
+    assert [row["status"] for row in _checks(uuid.UUID(early["id"]))] == ["claimed"]
+    assert [row["status"] for row in _checks(uuid.UUID(late["id"]))] == ["pending"]
+    assert [row["text"] for row in _chat_messages(uuid.UUID(early["id"]))] == [
+        STUB_TEXT
+    ]
+    assert _chat_messages(uuid.UUID(late["id"])) == []
+    assert seen == ["сценарий первого", "сценарий второго", "проверка ранняя"]
+    fourth_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert fourth_claim.status_code == 204
+    assert [row["status"] for row in _checks(uuid.UUID(late["id"]))] == ["claimed"]
+    assert [row["text"] for row in _chat_messages(uuid.UUID(late["id"]))] == [
+        STUB_TEXT
+    ]
+    assert seen == [
+        "сценарий первого",
+        "сценарий второго",
+        "проверка ранняя",
+        "проверка поздняя",
+    ]
+    assert _used(account_id) == 4
+    assert len(_charges(account_id)) == 4
+    idle = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert idle.status_code == 204
+    assert seen == [
+        "сценарий первого",
+        "сценарий второго",
+        "проверка ранняя",
+        "проверка поздняя",
+    ]
+    assert _used(account_id) == 4

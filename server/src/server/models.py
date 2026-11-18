@@ -154,6 +154,12 @@ routines = Table(
     Column("weekdays", ARRAY(Integer()), nullable=False),
     Column("time_of_day", Time(timezone=False), nullable=False),
     Column("paused", Boolean(), nullable=False, server_default=text("false")),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
 )
 
 routine_runs = Table(
@@ -175,4 +181,17 @@ routine_runs = Table(
         name="routine_runs_status_check",
     ),
     UniqueConstraint("routine_id", "local_date"),
+)
+
+routine_checks = Table(
+    "routine_checks",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "status IN ('pending', 'claimed')",
+        name="routine_checks_status_check",
+    ),
 )
