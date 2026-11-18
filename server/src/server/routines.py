@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.engine import Connection, RowMapping
 
+import server.aggregator as aggregator
 from server.accounts import touch_session, utc_now
 from server.auth import (
     begin,
@@ -18,7 +19,17 @@ from server.auth import (
     origin_rejected,
     unauthenticated,
 )
-from server.bots import not_found, open_confirmed, parse_id
+from server.bots import (
+    EMPTY_MODEL_CODE,
+    EMPTY_MODEL_TEXT,
+    QUOTA_EXHAUSTED_TEXT,
+    _adapter_messages,
+    _insert_message,
+    _lock_quota_counter,
+    not_found,
+    open_confirmed,
+    parse_id,
+)
 from server.config import development_tariff
 from server.desktops import (
     desktop_not_found,
@@ -32,6 +43,8 @@ from server.models import (
     chats,
     desktops,
     messages,
+    quota_charges,
+    quota_counters,
     routine_runs,
     routines,
     subscription_periods,
@@ -609,7 +622,82 @@ def claim_earliest_pending(
     )
     if updated.rowcount != 1:
         return None
+    _complete_claimed_run(connection, account_id, pending["bot_id"], moment)
     return pending
+
+
+def _complete_claimed_run(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    bot = (
+        connection.execute(select(bots).where(bots.c.id == bot_id))
+        .mappings()
+        .one()
+    )
+    scenario = bot["scenario"]
+    if not isinstance(scenario, str) or scenario_insufficient(scenario):
+        return
+    chat = (
+        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        .mappings()
+        .one()
+    )
+    counter = _lock_quota_counter(connection, account_id)
+    if counter["used"] >= development_tariff.model_requests:
+        _insert_message(
+            connection,
+            chat["id"],
+            "error",
+            QUOTA_EXHAUSTED_TEXT,
+            None,
+            now,
+        )
+        connection.execute(
+            chats.update().where(chats.c.id == chat["id"]).values(updated_at=now)
+        )
+        return
+    reply = aggregator.complete(
+        description=bot["description"],
+        scenario=scenario,
+        messages=_adapter_messages(connection, chat["id"]),
+        desktop_available=True,
+    )
+    if reply == "":
+        _insert_message(
+            connection,
+            chat["id"],
+            "error",
+            EMPTY_MODEL_TEXT,
+            EMPTY_MODEL_CODE,
+            now,
+        )
+    else:
+        _insert_message(
+            connection,
+            chat["id"],
+            "assistant",
+            reply,
+            None,
+            now,
+        )
+        connection.execute(
+            quota_charges.insert().values(
+                id=uuid.uuid4(),
+                period_id=counter["period_id"],
+                created_at=now,
+            )
+        )
+        connection.execute(
+            quota_counters.update()
+            .where(quota_counters.c.id == counter["id"])
+            .values(used=counter["used"] + 1)
+        )
+    connection.execute(
+        chats.update().where(chats.c.id == chat["id"]).values(updated_at=now)
+    )
 
 
 def routine_document(row: RowMapping) -> dict[str, object]:

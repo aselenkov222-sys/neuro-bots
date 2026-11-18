@@ -18,6 +18,7 @@ from server.models import (
     chats,
     desktops,
     messages,
+    quota_charges,
     quota_counters,
     routine_runs,
     routines,
@@ -908,6 +909,9 @@ DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
 CLAIM_AT = DUE + timedelta(seconds=59)
 SKIP_AT = DUE + timedelta(seconds=60)
 SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
+STUB_TEXT = "Сейчас я на заглушке агрегатора и не вызываю модель."
+EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
+QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 
 
 def _refuse_aggregator(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -986,7 +990,6 @@ def _prepare_due_routine(
 def test_claim_inside_the_window_takes_the_run_and_writes_no_skip(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _refuse_aggregator(monkeypatch)
     cookie, _account_id, computer, bot, created = _prepare_due_routine(
         "claim-window@example.com"
     )
@@ -1008,11 +1011,14 @@ def test_claim_inside_the_window_takes_the_run_and_writes_no_skip(
     assert runs[0]["claimed_at"] == CLAIM_AT
     assert runs[0]["due_at"] == DUE
     assert runs[0]["local_date"] == date(2026, 11, 18)
-    assert _chat_messages(bot_id) == []
+    spoken = _chat_messages(bot_id)
+    assert [row["role"] for row in spoken] == ["assistant"]
+    assert spoken[0]["text"] == STUB_TEXT
+    assert all(row["code"] != "routine_skipped" for row in spoken)
     assert _session(cookie)["last_request_at"] == CLAIM_AT
     _settle(SKIP_AT)
     assert _runs_for(created["id"])[0]["status"] == "claimed"
-    assert _chat_messages(bot_id) == []
+    assert _chat_messages(bot_id) == spoken
     stored = _account_routines(_account_id)[0]
     assert stored["time_of_day"] == time(9, 0)
     assert stored["time_of_day"].tzinfo is None
@@ -1618,6 +1624,18 @@ def _one_failure(bot_id: uuid.UUID, code: str, text: str) -> list[dict]:
     return messages
 
 
+def _stub_and_failure(bot_id: uuid.UUID, code: str, text: str) -> list[dict]:
+    rows = _chat_messages(bot_id)
+    assert len(rows) == 2
+    by_role = {row["role"]: row for row in rows}
+    assert by_role["assistant"]["text"] == STUB_TEXT
+    assert by_role["assistant"]["code"] is None
+    assert by_role["error"]["role"] == "error"
+    assert by_role["error"]["code"] == code
+    assert by_role["error"]["text"] == text
+    return rows
+
+
 def test_blank_scenario_fails_once_and_the_next_date_can_open(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1693,7 +1711,6 @@ def _open_and_claim(
 def test_site_not_opened_fails_the_claimed_run_once(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _refuse_aggregator(monkeypatch)
     cookie, _account_id, computer, bot, created = _prepare_due_routine(
         "site-failed@example.com"
     )
@@ -1715,13 +1732,13 @@ def test_site_not_opened_fails_the_claimed_run_once(
     assert unknown.status_code == 400
     assert unknown.json() == UNKNOWN_RUN_REASON
     assert _runs_for(created["id"])[0]["status"] == "claimed"
-    assert _chat_messages(bot_id) == []
+    assert [row["text"] for row in _chat_messages(bot_id)] == [STUB_TEXT]
     reported = _report(
         cookie, computer, run_id, "site_not_opened", DUE, monkeypatch
     )
     assert reported.status_code == 204
     assert _runs_for(created["id"])[0]["status"] == "failed"
-    messages = _one_failure(bot_id, "site_not_opened", SITE_FAILURE)
+    messages = _stub_and_failure(bot_id, "site_not_opened", SITE_FAILURE)
     repeated = _report(
         cookie, computer, run_id, "site_not_opened", SKIP_AT, monkeypatch
     )
@@ -1736,7 +1753,6 @@ def test_site_not_opened_fails_the_claimed_run_once(
 def test_login_failed_fails_the_claimed_run_once(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _refuse_aggregator(monkeypatch)
     cookie, computer, bot, created = _open_and_claim(
         "login-failed@example.com", monkeypatch
     )
@@ -1745,7 +1761,7 @@ def test_login_failed_fails_the_claimed_run_once(
     reported = _report(cookie, computer, run_id, "login_failed", DUE, monkeypatch)
     assert reported.status_code == 204
     assert _runs_for(created["id"])[0]["status"] == "failed"
-    messages = _one_failure(bot_id, "login_failed", LOGIN_FAILURE)
+    messages = _stub_and_failure(bot_id, "login_failed", LOGIN_FAILURE)
     repeated = _report(
         cookie, computer, run_id, "login_failed", SKIP_AT, monkeypatch
     )
@@ -1763,7 +1779,6 @@ VAULT_FAILURE = "Запуск завершён: без выбора записи
 def test_vault_choice_fails_the_claimed_run_once(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _refuse_aggregator(monkeypatch)
     cookie, computer, bot, created = _open_and_claim(
         "vault-choice@example.com", monkeypatch
     )
@@ -1772,9 +1787,9 @@ def test_vault_choice_fails_the_claimed_run_once(
     reported = _report(cookie, computer, run_id, "vault_choice", DUE, monkeypatch)
     assert reported.status_code == 204
     assert _runs_for(created["id"])[0]["status"] == "failed"
-    messages = _one_failure(bot_id, "vault_choice_required", VAULT_FAILURE)
-    assert messages[0]["text"] == VAULT_FAILURE
-    assert "Какую запись" not in messages[0]["text"]
+    messages = _stub_and_failure(bot_id, "vault_choice_required", VAULT_FAILURE)
+    assert messages[-1]["text"] == VAULT_FAILURE
+    assert "Какую запись" not in messages[-1]["text"]
     repeated = _report(
         cookie, computer, run_id, "vault_choice", SKIP_AT, monkeypatch
     )
@@ -1784,6 +1799,203 @@ def test_vault_choice_fails_the_claimed_run_once(
     _settle(SKIP_AT)
     assert _runs_for(created["id"])[0]["status"] == "failed"
     assert _chat_messages(bot_id) == messages
+
+
+NEW_SCENARIO = "Сначала прочитать почту.\nПотом записать итог."
+USER_LINE = "Проверь почту"
+
+
+def _period_id(account_id: uuid.UUID) -> uuid.UUID:
+    periods = [
+        row["id"]
+        for row in _rows(subscription_periods)
+        if row["account_id"] == account_id
+    ]
+    assert len(periods) == 1
+    return periods[0]
+
+
+def _used(account_id: uuid.UUID) -> int:
+    period_id = _period_id(account_id)
+    counters = [
+        row for row in _rows(quota_counters) if row["period_id"] == period_id
+    ]
+    assert len(counters) == 1
+    return counters[0]["used"]
+
+
+def _charges(account_id: uuid.UUID) -> list[dict]:
+    period_id = _period_id(account_id)
+    return [row for row in _rows(quota_charges) if row["period_id"] == period_id]
+
+
+def _set_used(account_id: uuid.UUID, used: int) -> None:
+    period_id = _period_id(account_id)
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                quota_counters.update()
+                .where(quota_counters.c.period_id == period_id)
+                .values(used=used)
+            )
+    finally:
+        engine.dispose()
+
+
+def _seed_chat(bot_id: uuid.UUID) -> None:
+    chat = next(row for row in _rows(chats) if row["bot_id"] == bot_id)
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                messages.insert().values(
+                    id=uuid.uuid4(),
+                    chat_id=chat["id"],
+                    role="user",
+                    text=USER_LINE,
+                    code=None,
+                    updated_at=DUE - timedelta(seconds=2),
+                )
+            )
+            connection.execute(
+                messages.insert().values(
+                    id=uuid.uuid4(),
+                    chat_id=chat["id"],
+                    role="error",
+                    text="старая ошибка",
+                    code="earlier",
+                    updated_at=DUE - timedelta(seconds=1),
+                )
+            )
+    finally:
+        engine.dispose()
+
+
+def _open_pending(email: str, monkeypatch: pytest.MonkeyPatch):
+    cookie, account_id, computer, bot, created = _prepare_due_routine(email)
+    _set_scenario(cookie, bot["id"], NEW_SCENARIO)
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    assert _runs_for(created["id"])[0]["status"] == "pending"
+    return cookie, account_id, computer, bot, created
+
+
+def test_claimed_run_sends_the_current_scenario_and_charges_once(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict] = []
+
+    def spy(**kwargs: object) -> str:
+        seen.append(kwargs)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id, computer, bot, created = _open_pending(
+        "routine-stub@example.com", monkeypatch
+    )
+    bot_id = uuid.UUID(bot["id"])
+    stored_bot = next(row for row in _rows(bots) if row["id"] == bot_id)
+    _seed_chat(bot_id)
+    assert development_tariff.model_requests == 500
+    assert _used(account_id) == 0
+    assert development_tariff.model_requests - _used(account_id) == 500
+    assert _charges(account_id) == []
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert len(seen) == 1
+    assert seen[0]["description"] == stored_bot["description"]
+    assert seen[0]["scenario"] == NEW_SCENARIO
+    assert seen[0]["desktop_available"] is True
+    assert seen[0]["messages"] == [{"role": "user", "text": USER_LINE}]
+    spoken = _chat_messages(bot_id)
+    ordered = sorted(
+        spoken, key=lambda row: (row["updated_at"], str(row["id"]))
+    )
+    assert [row["role"] for row in ordered] == ["user", "error", "assistant"]
+    assert ordered[2]["text"] == STUB_TEXT
+    assert ordered[2]["code"] is None
+    assert ordered[2]["updated_at"] == DUE
+    assert _used(account_id) == 1
+    assert development_tariff.model_requests - _used(account_id) == 499
+    charges = _charges(account_id)
+    assert len(charges) == 1
+    assert charges[0]["created_at"] == DUE
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 204
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert len(seen) == 1
+    assert _used(account_id) == 1
+    assert _chat_messages(bot_id) == spoken
+
+
+def test_empty_model_text_does_not_charge_the_claimed_run(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict] = []
+
+    def empty(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return ""
+
+    monkeypatch.setattr("server.aggregator.complete", empty)
+    cookie, account_id, computer, _bot, created = _open_pending(
+        "routine-empty@example.com", monkeypatch
+    )
+    bot_id = uuid.UUID(_bot["id"])
+    assert development_tariff.model_requests - _used(account_id) == 500
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["scenario"] == NEW_SCENARIO
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    spoken = _chat_messages(bot_id)
+    assert len(spoken) == 1
+    assert spoken[0]["role"] == "error"
+    assert spoken[0]["code"] == "empty_model_response"
+    assert spoken[0]["text"] == EMPTY_MODEL_TEXT
+    assert _used(account_id) == 0
+    assert development_tariff.model_requests - _used(account_id) == 500
+    assert _charges(account_id) == []
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 204
+    _settle(SKIP_AT)
+    assert len(calls) == 1
+    assert _used(account_id) == 0
+    assert _chat_messages(bot_id) == spoken
+
+
+def test_exhausted_quota_stops_the_claimed_run_without_the_model(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(**kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", forbidden)
+    cookie, account_id, computer, bot, created = _open_pending(
+        "routine-quota@example.com", monkeypatch
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_used(account_id, development_tariff.model_requests)
+    assert _used(account_id) == 500
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    spoken = _chat_messages(bot_id)
+    assert len(spoken) == 1
+    assert spoken[0]["role"] == "error"
+    assert spoken[0]["code"] is None
+    assert spoken[0]["text"] == QUOTA_EXHAUSTED_TEXT
+    assert _used(account_id) == 500
+    assert _charges(account_id) == []
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 204
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert _used(account_id) == 500
+    assert _chat_messages(bot_id) == spoken
 
 
 def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
