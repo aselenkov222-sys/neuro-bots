@@ -52,10 +52,14 @@ SITE_NOT_OPENED = "site_not_opened"
 SITE_NOT_OPENED_TEXT = "Запуск завершён: сайт не открылся."
 LOGIN_FAILED = "login_failed"
 LOGIN_FAILED_TEXT = "Запуск завершён: вход не удался."
+VAULT_CHOICE = "vault_choice"
+VAULT_CHOICE_CODE = "vault_choice_required"
+VAULT_CHOICE_TEXT = "Запуск завершён: без выбора записи войти нельзя."
 UNKNOWN_RUN_REASON = "Неизвестная причина запуска."
 RUN_FAILURES = {
-    SITE_NOT_OPENED: SITE_NOT_OPENED_TEXT,
-    LOGIN_FAILED: LOGIN_FAILED_TEXT,
+    SITE_NOT_OPENED: (SITE_NOT_OPENED, SITE_NOT_OPENED_TEXT),
+    LOGIN_FAILED: (LOGIN_FAILED, LOGIN_FAILED_TEXT),
+    VAULT_CHOICE: (VAULT_CHOICE_CODE, VAULT_CHOICE_TEXT),
 }
 CLAIM_WAIT = timedelta(seconds=60)
 PULSE_INTERVAL = timedelta(seconds=30)
@@ -835,9 +839,10 @@ def report_run_failure(
 ) -> None:
     if run_id is None:
         return
-    text = RUN_FAILURES.get(reason)
-    if text is None:
+    failure = RUN_FAILURES.get(reason)
+    if failure is None:
         return
+    code, text = failure
     row = (
         connection.execute(
             select(
@@ -863,7 +868,7 @@ def report_run_failure(
         "claimed",
         row["bot_id"],
         _aware(now),
-        reason,
+        code,
         text,
     )
 

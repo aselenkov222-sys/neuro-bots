@@ -1757,6 +1757,35 @@ def test_login_failed_fails_the_claimed_run_once(
     assert _chat_messages(bot_id) == messages
 
 
+VAULT_FAILURE = "Запуск завершён: без выбора записи войти нельзя."
+
+
+def test_vault_choice_fails_the_claimed_run_once(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, computer, bot, created = _open_and_claim(
+        "vault-choice@example.com", monkeypatch
+    )
+    bot_id = uuid.UUID(bot["id"])
+    run_id = _runs_for(created["id"])[0]["id"]
+    reported = _report(cookie, computer, run_id, "vault_choice", DUE, monkeypatch)
+    assert reported.status_code == 204
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    messages = _one_failure(bot_id, "vault_choice_required", VAULT_FAILURE)
+    assert messages[0]["text"] == VAULT_FAILURE
+    assert "Какую запись" not in messages[0]["text"]
+    repeated = _report(
+        cookie, computer, run_id, "vault_choice", SKIP_AT, monkeypatch
+    )
+    assert repeated.status_code == 204
+    again = _claim(cookie, computer, SKIP_AT, monkeypatch)
+    assert again.status_code == 204
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    assert _chat_messages(bot_id) == messages
+
+
 def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
     engine = create_db_engine()
     try:
