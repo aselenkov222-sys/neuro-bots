@@ -1,3 +1,5 @@
+import json
+import secrets
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -137,6 +139,7 @@ class Screen:
         self.thread = thread
         self.port = port
         self.url = f"http://{host}:{port}"
+        self.open_token = httpd.open_token
 
     def close(self) -> None:
         self.httpd.shutdown()
@@ -147,6 +150,8 @@ class Screen:
 class PasswordServer(ThreadingHTTPServer):
     def __init__(self, handler, run) -> None:
         self.run = run
+        self.open_token = secrets.token_urlsafe(32)
+        self.cabinet_origin: str | None = None
         super().__init__((LOOPBACK, 0), handler)
 
     def server_bind(self) -> None:
@@ -170,6 +175,26 @@ def start_password_screen() -> str:
     if _started is None:
         _started = serve_password_screen()
     return _started.url
+
+
+def allow_cabinet_origin(origin: str) -> None:
+    if _started is None:
+        return
+    _started.httpd.cabinet_origin = origin.rstrip("/")
+
+
+def screen_bridge() -> tuple[str, str] | None:
+    if _started is None:
+        return None
+    return _started.url, _started.open_token
+
+
+def stop_password_screen() -> None:
+    global _started
+    if _started is None:
+        return
+    _started.close()
+    _started = None
 
 
 def _page(saved: bool) -> bytes:
@@ -196,6 +221,16 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
+    def do_OPTIONS(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path != "/open" or not self._loopback_host():
+            self._text(404, "")
+            return
+        if not self._cabinet_origin():
+            self._text(403, "")
+            return
+        self._open_bytes(204, b"", "text/plain; charset=utf-8")
+
     def do_GET(self) -> None:
         if not self._allowed():
             self._text(403, "")
@@ -211,11 +246,14 @@ class _Handler(BaseHTTPRequestHandler):
         self._text(404, "")
 
     def do_POST(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
         body = self._body()
+        if parsed.path == "/open":
+            self._open(body)
+            return
         if not self._allowed():
             self._text(403, "")
             return
-        parsed = urllib.parse.urlsplit(self.path)
         if parsed.path != "/passwords" or body is None:
             self._text(400, _NEED)
             return
@@ -256,6 +294,68 @@ class _Handler(BaseHTTPRequestHandler):
             self._text(404, _MISSING)
             return
         self._text(200, password)
+
+    def _open(self, body: bytes | None) -> None:
+        if not self._loopback_host() or not self._cabinet_origin():
+            self._text(403, "")
+            return
+        if self.headers.get("X-Desktop-Open") != self.server.open_token:
+            self._open_bytes(403, b"")
+            return
+        if body is None:
+            self._open_bytes(400, b"")
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._open_bytes(400, b"")
+            return
+        if not isinstance(payload, dict) or set(payload) != {"url"}:
+            self._open_bytes(400, b"")
+            return
+        url = payload.get("url")
+        from desktop.browser import http_address, open_address
+
+        if not isinstance(url, str) or http_address(url) is None:
+            self._open_bytes(400, b"")
+            return
+        try:
+            text = open_address(url)
+        except Exception:
+            self._open_bytes(500, b"{}")
+            return
+        encoded = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
+        self._open_bytes(200, encoded)
+
+    def _cabinet_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        expected = self.server.cabinet_origin
+        return (
+            origin is not None
+            and expected is not None
+            and origin.rstrip("/") == expected
+        )
+
+    def _loopback_host(self) -> bool:
+        if self.client_address[0] != LOOPBACK:
+            return False
+        port = self.server.server_address[1]
+        return self.headers.get("Host", "") == f"{LOOPBACK}:{port}"
+
+    def _open_bytes(self, status: int, body: bytes, content_type: str = "application/json; charset=utf-8") -> None:
+        origin = self.server.cabinet_origin or ""
+        self._bytes(
+            status,
+            body,
+            content_type,
+            {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "POST",
+                "Access-Control-Allow-Headers": "Content-Type, X-Desktop-Open",
+                "Access-Control-Allow-Private-Network": "true",
+                "Vary": "Origin",
+            },
+        )
 
     def _allowed(self) -> bool:
         if self.client_address[0] != LOOPBACK:

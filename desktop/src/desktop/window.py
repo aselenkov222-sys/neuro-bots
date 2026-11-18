@@ -56,6 +56,9 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def open_cabinet(origin: str, on_ready=None) -> None:
+    from desktop.password_screen import allow_cabinet_origin
+
+    allow_cabinet_origin(origin)
     if window_library() == PYWEBVIEW:
         _open_pywebview(origin, on_ready)
         return
@@ -241,8 +244,19 @@ def _quit_from_tray() -> None:
 
 def _inject_desktop_bridge(run_script) -> None:
     try:
+        from desktop.password_screen import screen_bridge
+
+        opened = screen_bridge()
+        extra = {}
+        if opened is not None:
+            extra["open_url"] = opened[0]
+            extra["open_token"] = opened[1]
         run_script(
-            bridge_script(computer_id(default_state_dir()), local_timezone_name())
+            bridge_script(
+                computer_id(default_state_dir()),
+                local_timezone_name(),
+                **extra,
+            )
         )
     except Exception:
         return

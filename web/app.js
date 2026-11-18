@@ -72,7 +72,10 @@ async function api(path, options) {
 }
 
 const PULSE_INTERVAL_MS = 30000;
+const BROWSER_WAIT_MS = 60000;
 let pulseTimer = null;
+let browserTimer = null;
+let browserBusy = false;
 
 function claimDesktop() {
   const bridge = window.__neuroDesktop;
@@ -98,12 +101,57 @@ function startPulse() {
   if (pulseTimer !== null) return;
   sendPulse();
   pulseTimer = setInterval(sendPulse, PULSE_INTERVAL_MS);
+  if (browserTimer === null) browserTimer = setInterval(finishBrowserTask, 1000);
 }
 
 function stopPulse() {
-  if (pulseTimer === null) return;
-  clearInterval(pulseTimer);
-  pulseTimer = null;
+  if (pulseTimer !== null) {
+    clearInterval(pulseTimer);
+    pulseTimer = null;
+  }
+  if (browserTimer !== null) {
+    clearInterval(browserTimer);
+    browserTimer = null;
+  }
+}
+
+async function finishBrowserTask() {
+  const bridge = window.__neuroDesktop;
+  if (browserBusy || !state.me || !bridge) return;
+  if (typeof bridge.id !== "string" || typeof bridge.openUrl !== "string" || typeof bridge.openToken !== "string") return;
+  browserBusy = true;
+  try {
+    const task = await api(`/api/desktops/${bridge.id}/browser-task`);
+    if (!task.ok || !task.data || typeof task.data.url !== "string" || !task.data.url) return;
+    let opened;
+    try {
+      opened = await fetch(`${bridge.openUrl.replace(/\/$/, "")}/open`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Desktop-Open": bridge.openToken
+        },
+        body: JSON.stringify({ url: task.data.url })
+      });
+    } catch (error) {
+      return;
+    }
+    if (!opened.ok) return;
+    const payload = await opened.json();
+    if (!payload || typeof payload.text !== "string") return;
+    await api(`/api/desktops/${bridge.id}/browser-task`, {
+      method: "POST",
+      body: { text: payload.text }
+    });
+  } finally {
+    browserBusy = false;
+  }
+}
+
+function replyPending(messages, text) {
+  if (!messages.length) return true;
+  const last = messages[messages.length - 1];
+  return last.role === "user" && last.text === text;
 }
 
 function screen() {
@@ -472,7 +520,17 @@ async function submitMessage() {
     render();
     return;
   }
-  state.messages = result.data.messages;
+  const started = Date.now();
+  let listed = result;
+  while (Date.now() - started <= BROWSER_WAIT_MS) {
+    await finishBrowserTask();
+    const next = await api(`/api/bots/${state.activeId}/messages`);
+    if (next.ok && next.data) listed = next;
+    const messages = listed.data && listed.data.messages;
+    if (!messages || !replyPending(messages, text)) break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  state.messages = listed.data.messages;
   render();
   const next = document.getElementById("composer");
   if (next) next.focus();
