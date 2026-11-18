@@ -631,9 +631,10 @@ def test_cabinet_opens_the_named_address(database: None) -> None:
                 assert page.locator(".bubble").filter(has_text=STUB).count() == 1
                 chrome.close()
         assert opened == [ADDRESS]
-        bodies = [body for url, body in posts if "/open" in url or "browser-task" in url or "/messages" in url]
-        assert json.dumps({"url": ADDRESS}, separators=(",", ":")) in bodies or any(
-            json.loads(body) == {"url": ADDRESS} for url, body in posts if url.endswith("/open")
+        assert any(
+            json.loads(body).get("url") == ADDRESS
+            for url, body in posts
+            if url.endswith("/sign-in") or url.endswith("/open")
         )
         assert not any(SECRET in body or COOKIE in body for _url, body in posts)
         assert all(

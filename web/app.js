@@ -123,25 +123,45 @@ async function finishBrowserTask() {
   try {
     const task = await api(`/api/desktops/${bridge.id}/browser-task`);
     if (!task.ok || !task.data || typeof task.data.url !== "string" || !task.data.url) return;
+    const bot = state.card;
+    const payload = {
+      url: task.data.url,
+      bot_id: bot && typeof bot.id === "string" ? bot.id : "",
+      scenario: bot && typeof bot.scenario === "string" ? bot.scenario : ""
+    };
+    if (typeof task.data.login === "string" && task.data.login && !("password" in task.data) && !("cookie" in task.data)) {
+      payload.login = task.data.login;
+    }
     let opened;
     try {
-      opened = await fetch(`${bridge.openUrl.replace(/\/$/, "")}/open`, {
+      opened = await fetch(`${bridge.openUrl.replace(/\/$/, "")}/sign-in`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-Desktop-Open": bridge.openToken
         },
-        body: JSON.stringify({ url: task.data.url })
+        body: JSON.stringify(payload)
       });
     } catch (error) {
       return;
     }
     if (!opened.ok) return;
-    const payload = await opened.json();
-    if (!payload || typeof payload.text !== "string") return;
+    const result = await opened.json();
+    if (!result || typeof result.text !== "string" || "password" in result || "cookie" in result) return;
+    const report = { text: result.text };
+    if (result.login === "entered") {
+      report.login = "entered";
+    } else if (result.login === "choose" && typeof result.site === "string" && Array.isArray(result.choices)) {
+      report.login = "choose";
+      report.site = result.site;
+      report.choices = result.choices.filter((item) => typeof item === "string");
+    } else if (result.login === "form" && typeof result.site === "string") {
+      report.login = "form";
+      report.site = result.site;
+    }
     await api(`/api/desktops/${bridge.id}/browser-task`, {
       method: "POST",
-      body: { text: payload.text }
+      body: report
     });
   } finally {
     browserBusy = false;
@@ -340,6 +360,19 @@ function botScreen() {
     </section>`;
 }
 
+function accessSite(message) {
+  if (!message || message.role !== "assistant" || typeof message.text !== "string") return "";
+  const match = message.text.match(/^Сайт (\S+) просит вход\. Записи для него нет\.$/);
+  return match ? match[1] : "";
+}
+
+function accessLink(site, bot) {
+  const bridge = window.__neuroDesktop;
+  if (!site || !bridge || typeof bridge.openUrl !== "string" || !bot || typeof bot.id !== "string" || !bot.id) return "";
+  const href = `${bridge.openUrl.replace(/\/$/, "")}/?bot=${encodeURIComponent(bot.id)}&site=${encodeURIComponent(site)}`;
+  return `<p><a href="${esc(href)}" target="_blank" rel="opener">Ввести доступ</a></p>`;
+}
+
 function messageHtml(message, bot) {
   const when = esc(formatLocal(message.updated_at));
   const text = esc(message.text || "");
@@ -349,7 +382,8 @@ function messageHtml(message, bot) {
   const avatar = message.role === "assistant" && bot
     ? `<span class="avatar sm" style="--av:${bot.color}">${icon(bot.icon)}</span>`
     : "";
-  return `<article class="bubble bot">${avatar}<div><p>${text}</p><p class="meta">${when}</p></div></article>`;
+  const link = accessLink(accessSite(message), bot);
+  return `<article class="bubble bot">${avatar}<div><p>${text}</p>${link}<p class="meta">${when}</p></div></article>`;
 }
 
 function chatScreen() {
@@ -684,6 +718,32 @@ async function boot() {
   claimDesktop();
   await showCurrent();
 }
+
+window.addEventListener("message", (event) => {
+  const bridge = window.__neuroDesktop;
+  if (!bridge || typeof bridge.openUrl !== "string" || typeof bridge.id !== "string") return;
+  let origin = "";
+  try {
+    origin = new URL(bridge.openUrl).origin;
+  } catch (error) {
+    return;
+  }
+  if (event.origin !== origin) return;
+  const data = event.data;
+  if (!data || typeof data !== "object" || "password" in data || "cookie" in data) return;
+  if (data.login !== "saved" || typeof data.site !== "string" || !data.site) return;
+  api(`/api/desktops/${bridge.id}/browser-task`, {
+    method: "POST",
+    body: { login: "saved", site: data.site }
+  }).then((result) => {
+    if (!result.ok || !state.activeId) return null;
+    return api(`/api/bots/${state.activeId}/messages`);
+  }).then((listed) => {
+    if (!listed || !listed.ok || !listed.data) return;
+    state.messages = listed.data.messages;
+    render();
+  }).catch(() => {});
+});
 
 window.addEventListener("hashchange", () => {
   showCurrent();

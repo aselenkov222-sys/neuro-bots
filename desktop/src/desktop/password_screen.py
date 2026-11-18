@@ -6,7 +6,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from desktop.identity import default_state_dir
 from desktop.keychain import KeychainError, RecordRejected, read_password, store_password
-from desktop.vault import read_record_password, records, user_add_from_profile, user_delete, user_replace
+from desktop.sign_in import perform
+from desktop.vault import (
+    read_record_password,
+    records,
+    user_add_from_profile,
+    user_add_requested,
+    user_delete,
+    user_replace,
+)
 
 LOOPBACK = "127.0.0.1"
 _MAX_BODY = 64 * 1024
@@ -389,7 +397,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path != "/open" or not self._loopback_host():
+        if parsed.path not in {"/open", "/sign-in"} or not self._loopback_host():
             self._text(404, "")
             return
         if not self._cabinet_origin():
@@ -398,10 +406,19 @@ class _Handler(BaseHTTPRequestHandler):
         self._open_bytes(204, b"", "text/plain; charset=utf-8")
 
     def do_GET(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        form = _form_query(parsed)
+        if form is not None and not self._allowed() and self._form_navigation():
+            bot, site, saved = form
+            self._bytes(200, _request_page(saved, bot, site), "text/html; charset=utf-8")
+            return
         if not self._allowed():
             self._text(403, "")
             return
-        parsed = urllib.parse.urlsplit(self.path)
+        if form is not None:
+            bot, site, saved = form
+            self._bytes(200, _request_page(saved, bot, site), "text/html; charset=utf-8")
+            return
         if parsed.path == "/":
             saved = urllib.parse.parse_qs(parsed.query).get("saved", [""])[0] == "1"
             self._bytes(200, _page(saved), "text/html; charset=utf-8")
@@ -421,11 +438,17 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/open":
             self._open(body)
             return
+        if parsed.path == "/sign-in":
+            self._sign_in(body)
+            return
         if not self._allowed():
             self._text(403, "")
             return
         if parsed.path == "/passwords":
             self._store_password(body)
+            return
+        if parsed.path == "/vault/request":
+            self._vault_request(body)
             return
         target = _vault_target(parsed.path)
         if target is None or body is None or not _form(self.headers.get("Content-Type", "")):
@@ -590,6 +613,107 @@ class _Handler(BaseHTTPRequestHandler):
             return
         encoded = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
         self._open_bytes(200, encoded)
+
+    def _sign_in(self, body: bytes | None) -> None:
+        if not self._loopback_host() or not self._cabinet_origin():
+            self._text(403, "")
+            return
+        if self.headers.get("X-Desktop-Open") != self.server.open_token:
+            self._open_bytes(403, b"")
+            return
+        if body is None:
+            self._open_bytes(400, b"")
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._open_bytes(400, b"")
+            return
+        if not isinstance(payload, dict) or "password" in payload or "cookie" in payload:
+            self._open_bytes(400, b"")
+            return
+        keys = set(payload)
+        if not {"url", "bot_id", "scenario"} <= keys or not keys <= {"url", "bot_id", "scenario", "login"}:
+            self._open_bytes(400, b"")
+            return
+        url = payload.get("url")
+        bot_id = payload.get("bot_id")
+        scenario = payload.get("scenario")
+        chosen = None
+        if "login" in payload:
+            chosen = payload.get("login")
+            if not isinstance(chosen, str) or chosen == "":
+                self._open_bytes(400, b"")
+                return
+        if not isinstance(url, str) or not isinstance(bot_id, str) or not isinstance(scenario, str):
+            self._open_bytes(400, b"")
+            return
+        try:
+            result = perform(
+                url,
+                bot_id,
+                scenario,
+                chosen=chosen,
+                run=self.server.run,
+            )
+        except ValueError:
+            self._open_bytes(400, b"")
+            return
+        except Exception:
+            self._open_bytes(500, b"{}")
+            return
+        safe = {
+            "text": result.get("text", ""),
+            "login": result.get("login", "session"),
+        }
+        if safe["login"] in {"choose", "form"} and isinstance(result.get("site"), str):
+            safe["site"] = result["site"]
+        if safe["login"] == "choose" and isinstance(result.get("choices"), list):
+            safe["choices"] = result["choices"]
+        encoded = json.dumps(safe, ensure_ascii=False).encode("utf-8")
+        self._open_bytes(200, encoded)
+
+    def _vault_request(self, body: bytes | None) -> None:
+        if body is None or not _form(self.headers.get("Content-Type", "")):
+            self._text(400, _NEED)
+            return
+        fields = _fields(body)
+        bot = _request_token(fields.get("request_bot", ""))
+        site = _request_site(fields.get("request_site", ""))
+        if bot is None or site is None:
+            self._text(400, _NEED)
+            return
+        try:
+            user_add_requested(
+                site,
+                fields.get("request_login", ""),
+                fields.get("request_password", ""),
+                bot,
+                shared="request_shared" in fields,
+                run=self.server.run,
+            )
+        except RecordRejected:
+            self._text(400, _NEED)
+            return
+        except (KeychainError, OSError):
+            self._text(500, _WRITE_FAILED)
+            return
+        query = urllib.parse.urlencode({"saved": "1", "bot": bot, "site": site})
+        self._bytes(303, b"", "text/plain; charset=utf-8", {"Location": "/?" + query})
+
+    def _form_navigation(self) -> bool:
+        if self.client_address[0] != LOOPBACK:
+            return False
+        port = self.server.server_address[1]
+        if self.headers.get("Host", "") != f"{LOOPBACK}:{port}":
+            return False
+        if self.headers.get("Sec-Fetch-Mode") not in (None, "navigate"):
+            return False
+        if self.headers.get("Sec-Fetch-Dest") not in (None, "document"):
+            return False
+        if self.headers.get("Sec-Fetch-Site") not in (None, "none", "cross-site", "same-site"):
+            return False
+        return True
 
     def _cabinet_origin(self) -> bool:
         origin = self.headers.get("Origin")
@@ -768,6 +892,96 @@ def _esc(value: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _form_query(parsed) -> tuple[str, str, bool] | None:
+    if parsed.path != "/":
+        return None
+    query = urllib.parse.parse_qs(parsed.query)
+    bot = _request_token(query.get("bot", [""])[0])
+    site = _request_site(query.get("site", [""])[0])
+    if bot is None or site is None:
+        return None
+    return bot, site, query.get("saved", [""])[0] == "1"
+
+
+def _request_token(value: str) -> str | None:
+    if value == "" or len(value) > 80:
+        return None
+    if any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for char in value):
+        return None
+    return value
+
+
+def _request_site(value: str) -> str | None:
+    if value == "" or len(value) > 253:
+        return None
+    if any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-" for char in value):
+        return None
+    if value.startswith(".") or value.endswith(".") or ".." in value:
+        return None
+    return value
+
+
+def _request_page(saved: bool, bot: str, site: str) -> bytes:
+    site_html = _esc(site)
+    bot_html = _esc(bot)
+    if saved:
+        body = (
+            '<p id="saved">'
+            + _SAVED
+            + '</p><p id="request-saved" data-site="'
+            + site_html
+            + '" hidden></p>'
+        )
+    else:
+        body = (
+            '<form class="vault raised" method="post" action="/vault/request" autocomplete="off">'
+            '<span class="shield" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.8 7-7 9-4.2-2-7-4.8-7-9V6z"/></svg></span>'
+            "<div><p class=\"meta\">Защищённая форма</p><h1>Доступ для бота</h1></div>"
+            '<label class="field">Сайт <input name="request_site" value="'
+            + site_html
+            + '" readonly></label>'
+            '<label class="field">Логин <input name="request_login" autocomplete="off" required></label>'
+            '<label class="field">Пароль <span class="lock"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>'
+            '<input name="request_password" type="password" autocomplete="off" required></span></label>'
+            '<label class="switch"><input name="request_shared" type="checkbox" value="1">'
+            '<span class="switch-ui" aria-hidden="true"></span>Сделать запись общей</label>'
+            '<p class="hint">Пока переключатель выключен, запись личная для этого бота. Пароль в чат не попадает. После сохранения там будет только факт, что доступ сохранён.</p>'
+            '<input type="hidden" name="request_bot" value="'
+            + bot_html
+            + '">'
+            '<div class="actions"><button class="btn-orange" type="submit">Сохранить доступ</button></div>'
+            "</form>"
+        )
+    html = (
+        "<!DOCTYPE html><html lang=\"ru\"><head><meta charset=\"utf-8\">"
+        "<title>Доступ</title><style>"
+        "body{font-family:Onest,\"Segoe UI\",\"Liberation Sans\",sans-serif;background:#c5ced6;color:#1c2128;}"
+        ".vault-screen{width:min(460px,calc(100% - 2rem));margin:8vh auto;}"
+        ".vault{padding:22px;border-radius:24px;display:grid;gap:12px;color:#f4f6f8;"
+        "background:linear-gradient(180deg,#454c56 0%,#2c333c 46%,#1c2229 100%);}"
+        ".shield{width:48px;height:48px;border-radius:16px;display:grid;place-items:center;color:#f3fff8;"
+        "background:linear-gradient(180deg,#2f9a62,#146b3f 58%,#0e4e2e);}"
+        ".shield svg,.lock svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.6;}"
+        ".vault h1{margin:0;font-size:30px;}.vault .meta,.vault .hint{color:#c5ccd4;}"
+        ".field{display:grid;gap:6px;}.vault input{width:100%;min-height:44px;padding:12px 14px;"
+        "border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.32);color:#f4f6f8;}"
+        ".lock{display:flex;align-items:center;gap:8px;}.lock input{flex:1;}"
+        ".switch{display:inline-flex;align-items:center;gap:10px;min-height:44px;}"
+        ".switch input{width:44px;height:26px;}.switch-ui{width:44px;height:26px;border-radius:999px;"
+        "background:rgba(255,255,255,.14);display:inline-block;}"
+        ".btn-orange{min-height:44px;border:0;border-radius:999px;background:#c2410c;color:#fff7f3;padding:0 18px;}"
+        "</style></head><body><section class=\"vault-screen\">"
+        + body
+        + "</section><script>"
+        "var savedAccess=document.getElementById(\"request-saved\");"
+        "if(savedAccess){var savedSite=savedAccess.getAttribute(\"data-site\");"
+        "var notify=window.opener;if(!notify&&window.parent!==window)notify=window.parent;"
+        "if(savedSite&&notify)notify.postMessage({login:\"saved\",site:savedSite},\"*\");}"
+        "</script></body></html>"
+    )
+    return html.encode("utf-8")
 
 
 def _form(content_type: str) -> bool:

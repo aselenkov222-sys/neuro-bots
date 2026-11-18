@@ -43,13 +43,40 @@ _QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 
 _lock = threading.Lock()
 _opens: dict[tuple[uuid.UUID, uuid.UUID], list["_Open"]] = {}
+_choices: dict[tuple[uuid.UUID, uuid.UUID], "_Pending"] = {}
+_SAVED_FACT = "Доступ сохранён."
 
 
 class _Open:
-    def __init__(self, url: str, bot_id: uuid.UUID, chat_id: uuid.UUID) -> None:
+    def __init__(
+        self,
+        url: str,
+        bot_id: uuid.UUID,
+        chat_id: uuid.UUID,
+        login: str | None = None,
+    ) -> None:
         self.url = url
         self.bot_id = bot_id
         self.chat_id = chat_id
+        self.login = login
+
+
+class _Pending:
+    def __init__(
+        self,
+        url: str,
+        site: str,
+        logins: tuple[str, ...],
+        bot_id: uuid.UUID,
+        chat_id: uuid.UUID,
+        kind: str,
+    ) -> None:
+        self.url = url
+        self.site = site
+        self.logins = logins
+        self.bot_id = bot_id
+        self.chat_id = chat_id
+        self.kind = kind
 
 
 def named_address(text: str) -> str | None:
@@ -75,19 +102,29 @@ def enqueue_open(
     url: str,
     bot_id: uuid.UUID,
     chat_id: uuid.UUID,
+    login: str | None = None,
 ) -> None:
     with _lock:
+        if login is None:
+            _choices.pop((account_id, computer_id), None)
         _opens.setdefault((account_id, computer_id), []).append(
-            _Open(url, bot_id, chat_id)
+            _Open(url, bot_id, chat_id, login)
         )
 
 
 def peek_open(account_id: uuid.UUID, computer_id: uuid.UUID) -> str | None:
+    item = _first_open(account_id, computer_id)
+    if item is None:
+        return None
+    return item.url
+
+
+def _first_open(account_id: uuid.UUID, computer_id: uuid.UUID) -> _Open | None:
     with _lock:
         items = _opens.get((account_id, computer_id))
         if not items:
             return None
-        return items[0].url
+        return items[0]
 
 
 def pop_open(account_id: uuid.UUID, computer_id: uuid.UUID) -> _Open | None:
@@ -104,6 +141,24 @@ def pop_open(account_id: uuid.UUID, computer_id: uuid.UUID) -> _Open | None:
 def clear_opens() -> None:
     with _lock:
         _opens.clear()
+        _choices.clear()
+
+
+def take_login_choice(
+    *,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    text: str,
+) -> str | None:
+    with _lock:
+        pending = _choices.get((account_id, computer_id))
+        if pending is None or pending.kind != "choose" or pending.bot_id != bot_id:
+            return None
+        if text not in pending.logins:
+            return None
+        del _choices[(account_id, computer_id)]
+        return pending.url
 
 
 def _parse_computer_id(value: str) -> uuid.UUID | None:
@@ -155,17 +210,71 @@ def _pulse_live(connection: Connection, account_id: uuid.UUID) -> bool:
     return pulsed is not None
 
 
-async def _read_page_text(request: Request) -> str | JSONResponse:
+class _Report:
+    def __init__(self, kind: str, text: str, site: str, choices: tuple[str, ...]) -> None:
+        self.kind = kind
+        self.text = text
+        self.site = site
+        self.choices = choices
+
+
+def _page_text_ok(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > _PAGE_TEXT_LIMIT:
+        return None
+    return value
+
+
+def _site_ok(value: object) -> str | None:
+    if not isinstance(value, str) or value == "" or len(value) > 253 or "\x00" in value:
+        return None
+    return value
+
+
+def _choices_ok(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, list) or value == [] or len(value) > 20:
+        return None
+    choices: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item == "" or len(item) > 200 or "\x00" in item:
+            return None
+        choices.append(item)
+    return tuple(choices)
+
+
+async def _read_browser_report(request: Request) -> _Report | JSONResponse:
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         return error_response(400, "invalid_request", _PAGE_TEXT)
-    if not isinstance(body, dict) or set(body) != {"text"}:
+    if not isinstance(body, dict) or "password" in body or "cookie" in body:
         return error_response(400, "invalid_request", _PAGE_TEXT)
-    text = body.get("text")
-    if not isinstance(text, str) or len(text) > _PAGE_TEXT_LIMIT:
-        return error_response(400, "invalid_request", _PAGE_TEXT)
-    return text
+    keys = set(body)
+    if keys == {"text"} or (
+        keys == {"text", "login"} and body.get("login") in {"session", "entered"}
+    ):
+        text = _page_text_ok(body.get("text"))
+        if text is None:
+            return error_response(400, "invalid_request", _PAGE_TEXT)
+        return _Report("page", text, "", ())
+    if keys == {"text", "login", "site", "choices"} and body.get("login") == "choose":
+        text = _page_text_ok(body.get("text"))
+        site = _site_ok(body.get("site"))
+        choices = _choices_ok(body.get("choices"))
+        if text is None or site is None or choices is None:
+            return error_response(400, "invalid_request", _PAGE_TEXT)
+        return _Report("choose", text, site, choices)
+    if keys == {"text", "login", "site"} and body.get("login") == "form":
+        text = _page_text_ok(body.get("text"))
+        site = _site_ok(body.get("site"))
+        if text is None or site is None:
+            return error_response(400, "invalid_request", _PAGE_TEXT)
+        return _Report("form", text, site, ())
+    if keys == {"login", "site"} and body.get("login") == "saved":
+        site = _site_ok(body.get("site"))
+        if site is None:
+            return error_response(400, "invalid_request", _PAGE_TEXT)
+        return _Report("saved", "", site, ())
+    return error_response(400, "invalid_request", _PAGE_TEXT)
 
 
 def _adapter_messages(connection: Connection, chat_id: uuid.UUID) -> list[dict[str, str]]:
@@ -350,6 +459,139 @@ def finish_open(
     return JSONResponse(_messages_document(connection, pending.chat_id))
 
 
+def _write_assistant(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    chat_id: uuid.UUID,
+    now: datetime,
+    text: str,
+) -> JSONResponse:
+    bot = (
+        connection.execute(
+            select(bots).where(
+                bots.c.id == bot_id,
+                bots.c.account_id == account_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if bot is None:
+        return _bot_not_found()
+    chat = (
+        connection.execute(
+            select(chats.c.id).where(
+                chats.c.id == chat_id,
+                chats.c.bot_id == bot["id"],
+            )
+        )
+        .scalar_one_or_none()
+    )
+    if chat is None:
+        return _bot_not_found()
+    reply_at = _reply_at(connection, chat_id, now)
+    _insert_message(connection, chat_id, "assistant", text, None, reply_at)
+    connection.execute(
+        chats.update().where(chats.c.id == chat_id).values(updated_at=reply_at)
+    )
+    return JSONResponse(_messages_document(connection, chat_id))
+
+
+def _same_host(url: str, site: str) -> bool:
+    return urlsplit(url).hostname == site
+
+
+def _remember(
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    pending: _Pending,
+) -> None:
+    with _lock:
+        _choices[(account_id, computer_id)] = pending
+
+
+def finish_choose(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    now: datetime,
+    site: str,
+    choices: tuple[str, ...],
+) -> JSONResponse | Response:
+    pending = _first_open(account_id, computer_id)
+    if pending is None:
+        return Response(status_code=204)
+    if not _same_host(pending.url, site):
+        return error_response(400, "invalid_request", _PAGE_TEXT)
+    pop_open(account_id, computer_id)
+    question = f"Какую запись использовать для {site}? {' или '.join(choices)}."
+    _remember(
+        account_id,
+        computer_id,
+        _Pending(pending.url, site, choices, pending.bot_id, pending.chat_id, "choose"),
+    )
+    return _write_assistant(
+        connection,
+        account_id,
+        pending.bot_id,
+        pending.chat_id,
+        now,
+        question,
+    )
+
+
+def finish_form(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    now: datetime,
+    site: str,
+) -> JSONResponse | Response:
+    pending = _first_open(account_id, computer_id)
+    if pending is None:
+        return Response(status_code=204)
+    if not _same_host(pending.url, site):
+        return error_response(400, "invalid_request", _PAGE_TEXT)
+    pop_open(account_id, computer_id)
+    sentence = f"Сайт {site} просит вход. Записи для него нет."
+    _remember(
+        account_id,
+        computer_id,
+        _Pending(pending.url, site, (), pending.bot_id, pending.chat_id, "form"),
+    )
+    return _write_assistant(
+        connection,
+        account_id,
+        pending.bot_id,
+        pending.chat_id,
+        now,
+        sentence,
+    )
+
+
+def finish_saved(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    now: datetime,
+    site: str,
+) -> JSONResponse | Response:
+    with _lock:
+        pending = _choices.get((account_id, computer_id))
+        if pending is None or pending.kind != "form" or pending.site != site:
+            return Response(status_code=204)
+        del _choices[(account_id, computer_id)]
+    return _write_assistant(
+        connection,
+        account_id,
+        pending.bot_id,
+        pending.chat_id,
+        now,
+        _SAVED_FACT,
+    )
+
+
 @router.get("/api/desktops/{computer_id}/browser-task")
 def get_browser_task(request: Request, computer_id: str) -> Response:
     now = utc_now()
@@ -363,11 +605,14 @@ def get_browser_task(request: Request, computer_id: str) -> Response:
         parsed = _parse_computer_id(computer_id)
         if parsed is None or not _working(connection, account["id"], parsed):
             return _desktop_not_found()
-        url = peek_open(account["id"], parsed)
+        item = _first_open(account["id"], parsed)
         touch_session(connection, session["id"], now)
-    if url is None:
+    if item is None:
         return Response(status_code=204)
-    return JSONResponse({"url": url})
+    payload = {"url": item.url}
+    if item.login:
+        payload["login"] = item.login
+    return JSONResponse(payload)
 
 
 @router.post("/api/desktops/{computer_id}/browser-task")
@@ -375,9 +620,9 @@ async def post_browser_task(request: Request, computer_id: str) -> Response:
     rejected = origin_rejected(request)
     if rejected is not None:
         return rejected
-    page_text = await _read_page_text(request)
-    if isinstance(page_text, JSONResponse):
-        return page_text
+    report = await _read_browser_report(request)
+    if isinstance(report, JSONResponse):
+        return report
     now = utc_now()
     with begin() as connection:
         current = current_account(connection, request, now)
@@ -389,6 +634,15 @@ async def post_browser_task(request: Request, computer_id: str) -> Response:
         parsed = _parse_computer_id(computer_id)
         if parsed is None or not _working(connection, account["id"], parsed):
             return _desktop_not_found()
-        document = finish_open(connection, account["id"], parsed, now, page_text)
+        if report.kind == "page":
+            document = finish_open(connection, account["id"], parsed, now, report.text)
+        elif report.kind == "choose":
+            document = finish_choose(
+                connection, account["id"], parsed, now, report.site, report.choices
+            )
+        elif report.kind == "form":
+            document = finish_form(connection, account["id"], parsed, now, report.site)
+        else:
+            document = finish_saved(connection, account["id"], parsed, now, report.site)
         touch_session(connection, session["id"], now)
     return document

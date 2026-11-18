@@ -19,7 +19,7 @@ from server.auth import (
     origin_rejected,
     unauthenticated,
 )
-from server.browser_action import enqueue_open, named_address
+from server.browser_action import enqueue_open, named_address, take_login_choice
 from server.config import development_tariff
 from server.desktops import find_working_desktop
 from server.models import (
@@ -511,6 +511,18 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
             desktop is not None and desktop["last_pulse_at"] is not None
         )
         address = named_address(text)
+        chosen_url = None
+        if (
+            desktop is not None
+            and desktop_available
+            and counter["used"] < development_tariff.model_requests
+        ):
+            chosen_url = take_login_choice(
+                account_id=opened.account["id"],
+                computer_id=desktop["computer_id"],
+                bot_id=parsed_id,
+                text=text,
+            )
         if counter["used"] >= development_tariff.model_requests:
             _insert_message(
                 opened.connection,
@@ -529,6 +541,17 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
                 None,
                 follow_at,
             )
+        elif chosen_url is not None:
+            assert desktop is not None
+            enqueue_open(
+                account_id=opened.account["id"],
+                computer_id=desktop["computer_id"],
+                url=chosen_url,
+                bot_id=parsed_id,
+                chat_id=chat["id"],
+                login=text,
+            )
+            follow_at = opened.now
         elif address is not None:
             assert desktop is not None
             enqueue_open(
