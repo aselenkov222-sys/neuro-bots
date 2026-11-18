@@ -49,6 +49,9 @@ def main(argv: list[str] | None = None) -> None:
         argv = sys.argv[1:]
     if len(argv) != 1 or not argv[0]:
         raise SystemExit("usage: python -m desktop ORIGIN")
+    from desktop.password_screen import start_password_screen
+
+    start_password_screen()
     open_cabinet(argv[0])
 
 
