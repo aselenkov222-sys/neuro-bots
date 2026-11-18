@@ -160,7 +160,12 @@ routine_runs = Table(
     "routine_runs",
     metadata,
     Column("id", Uuid(), primary_key=True),
-    Column("routine_id", Uuid(), ForeignKey("routines.id"), nullable=False),
+    Column(
+        "routine_id",
+        Uuid(),
+        ForeignKey("routines.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
     Column("local_date", Date(), nullable=False),
     Column("due_at", DateTime(timezone=True), nullable=False),
     Column("status", String(16), nullable=False),

@@ -80,6 +80,7 @@ PULSE_REVISION = "f524099440d0"
 ROUTINE_REVISION = "b7e2c4a91d58"
 PAUSED_REVISION = "a4f0c8e21b67"
 STOPPED_REVISION = "9e4b1c7a6d20"
+RUN_REVISION = "f7a2c6e81d04"
 ROUTINE_RUN_COLUMNS = (
     "id",
     "routine_id",
@@ -169,7 +170,8 @@ def _revision_chain() -> list[str]:
     assert links[ROUTINE_REVISION] == PULSE_REVISION
     assert links[PAUSED_REVISION] == ROUTINE_REVISION
     assert links[STOPPED_REVISION] == PAUSED_REVISION
-    assert links[chain[-1]] == STOPPED_REVISION
+    assert links[RUN_REVISION] == STOPPED_REVISION
+    assert links[chain[-1]] == RUN_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
@@ -178,6 +180,7 @@ def _revision_chain() -> list[str]:
     assert chain[-1] != ROUTINE_REVISION
     assert chain[-1] != PAUSED_REVISION
     assert chain[-1] != STOPPED_REVISION
+    assert chain[-1] != RUN_REVISION
     return chain
 
 
@@ -281,6 +284,7 @@ def _assert_model_column(
     timezone: bool | None = None,
     unique: bool = False,
     foreign_table: str | None = None,
+    ondelete: str | None = None,
 ) -> None:
     assert isinstance(column.type, type_)
     assert column.nullable is nullable
@@ -298,7 +302,7 @@ def _assert_model_column(
         assert len(foreign_keys) == 1
         assert foreign_keys[0].column.table.name == foreign_table
         assert foreign_keys[0].column.name == "id"
-        assert foreign_keys[0].ondelete is None
+        assert foreign_keys[0].ondelete == ondelete
 
 
 def _assert_catalog_column(
@@ -728,6 +732,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         Uuid,
         nullable=False,
         foreign_table="routines",
+        ondelete="CASCADE",
     )
     _assert_model_column(routine_runs.c.local_date, Date, nullable=False)
     _assert_model_column(
@@ -1220,7 +1225,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     ("u", "UNIQUE (routine_id, local_date)"),
                     (
                         "f",
-                        "FOREIGN KEY (routine_id) REFERENCES routines(id)",
+                        "FOREIGN KEY (routine_id) REFERENCES routines(id) ON DELETE CASCADE",
                     ),
                     ("c", ROUTINE_RUN_STATUS_CHECK),
                 }

@@ -1048,6 +1048,11 @@ def test_missing_claim_writes_one_skip_for_that_local_date(
         "late-skip@example.com"
     )
     late_bot_id = uuid.UUID(late_bot["id"])
+    _settle(DUE)
+    late_opened = _runs_for(late["id"])
+    assert len(late_opened) == 1
+    assert late_opened[0]["status"] == "pending"
+    assert _chat_messages(late_bot_id) == []
     _settle(SKIP_AT)
     late_runs = _runs_for(late["id"])
     assert len(late_runs) == 1
@@ -1092,3 +1097,131 @@ def test_pause_and_logout_hold_open_neither_a_run_nor_a_skip(
     assert _runs_for(held["id"]) == []
     assert _chat_messages(held_bot_id) == []
     assert _account_routines(held_account)[0]["paused"] is False
+
+
+def test_unpause_after_the_minute_does_not_write_a_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, _computer, bot, created = _prepare_due_routine(
+        "unpause-after@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    with _client(cookie) as client:
+        paused = _pause(client, bot["id"], created["id"], True)
+        assert paused.status_code == 200
+    _settle(DUE - timedelta(seconds=1))
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"]) == []
+    assert _chat_messages(bot_id) == []
+    with _client(cookie) as client:
+        resumed = _pause(client, bot["id"], created["id"], False)
+        assert resumed.status_code == 200
+        assert resumed.json()["paused"] is False
+    _settle(SKIP_AT + timedelta(hours=3))
+    assert _runs_for(created["id"]) == []
+    assert _chat_messages(bot_id) == []
+    assert _account_routines(account_id)[0]["paused"] is False
+
+
+def test_sign_in_after_the_minute_does_not_write_a_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    email = "signin-after@example.com"
+    cookie, account_id, computer, bot, created = _prepare_due_routine(email)
+    bot_id = uuid.UUID(bot["id"])
+    with _client(cookie) as client:
+        signed_out = client.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+    _settle(DUE)
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"]) == []
+    assert _chat_messages(bot_id) == []
+    with _login(email) as client:
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    desktop = next(
+        row for row in _rows(desktops) if row["account_id"] == account_id
+    )
+    assert desktop["working"] is True
+    assert desktop["routines_stopped"] is False
+    _settle(SKIP_AT + timedelta(hours=3))
+    assert _runs_for(created["id"]) == []
+    assert _chat_messages(bot_id) == []
+    assert _account_routines(account_id)[0]["paused"] is False
+
+
+def test_deleting_a_routine_removes_its_run_and_frees_the_slot(
+    database: None,
+) -> None:
+    assert development_tariff.routines == 5
+    cookie, account_id = _open_account("delete-run@example.com", confirmed=True)
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий")
+        second = _create_bot(client, "Второй", "другой сценарий")
+        created_ids: list[str] = []
+        for index in range(development_tariff.routines):
+            created = _create_routine(
+                client,
+                first["id"],
+                {"weekdays": [index + 1], "time": f"09:{index:02d}"},
+            )
+            assert created.status_code == 200
+            created_ids.append(created.json()["id"])
+        blocked = _create_routine(
+            client, second["id"], {"weekdays": [6], "time": "10:00"}
+        )
+        assert blocked.status_code == 400
+        assert blocked.json() == ROUTINE_LIMIT
+    routine_id = uuid.UUID(created_ids[0])
+    bot_id = uuid.UUID(first["id"])
+    chat = next(row for row in _rows(chats) if row["bot_id"] == bot_id)
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                routine_runs.insert().values(
+                    id=uuid.uuid4(),
+                    routine_id=routine_id,
+                    local_date=date(2026, 11, 18),
+                    due_at=DUE,
+                    status="skipped",
+                )
+            )
+            connection.execute(
+                messages.insert().values(
+                    id=uuid.uuid4(),
+                    chat_id=chat["id"],
+                    role="error",
+                    text=SKIP_TEXT,
+                    code="routine_skipped",
+                    updated_at=SKIP_AT,
+                )
+            )
+    finally:
+        engine.dispose()
+    assert len(_runs_for(created_ids[0])) == 1
+    with _client(cookie) as client:
+        removed = client.delete(
+            f"/api/bots/{first['id']}/routines/{created_ids[0]}",
+            headers={"Origin": ORIGIN},
+        )
+        assert removed.status_code == 200
+        assert removed.json() == {}
+        assert len(_account_routines(account_id)) == 4
+        again = _create_routine(
+            client, second["id"], {"weekdays": [6], "time": "10:00"}
+        )
+        assert again.status_code == 200
+        assert again.json()["weekdays"] == [6]
+        assert again.json()["time"] == "10:00"
+    assert _runs_for(created_ids[0]) == []
+    assert len(_account_routines(account_id)) == 5
+    kept = _chat_messages(bot_id)
+    assert len(kept) == 1
+    assert kept[0]["text"] == SKIP_TEXT

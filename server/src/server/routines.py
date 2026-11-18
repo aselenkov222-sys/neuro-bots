@@ -130,6 +130,18 @@ def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> Non
     )
 
 
+def _drop_pending(
+    connection: Connection, routine_id: uuid.UUID, local_date: date
+) -> None:
+    connection.execute(
+        routine_runs.delete().where(
+            routine_runs.c.routine_id == routine_id,
+            routine_runs.c.local_date == local_date,
+            routine_runs.c.status == "pending",
+        )
+    )
+
+
 def _settle_occurrence(
     connection: Connection,
     routine_id: uuid.UUID,
@@ -150,18 +162,17 @@ def _settle_occurrence(
     )
     deadline = due_at + CLAIM_WAIT
     if existing is None:
-        status = "skipped" if now >= deadline else "pending"
+        if now >= deadline:
+            return
         connection.execute(
             routine_runs.insert().values(
                 id=uuid.uuid4(),
                 routine_id=routine_id,
                 local_date=local_date,
                 due_at=due_at,
-                status=status,
+                status="pending",
             )
         )
-        if status == "skipped":
-            _write_skip(connection, bot_id, now)
         return
     if existing["status"] != "pending" or now < deadline:
         return
@@ -195,10 +206,9 @@ def settle_due(connection: Connection, now: datetime) -> None:
     )
     for row in rows:
         account_id = row["account_id"]
-        if not routine_may_start(
+        allowed = routine_may_start(
             row, working_routines_stopped(connection, account_id)
-        ):
-            continue
+        )
         zone = working_desktop_zone(connection, account_id)
         if zone is None or not timezone_name_accepted(zone):
             continue
@@ -207,6 +217,9 @@ def settle_due(connection: Connection, now: datetime) -> None:
             continue
         due_at = appointed_utc(row["time_of_day"], zone, local.date())
         if moment < due_at:
+            continue
+        if not allowed:
+            _drop_pending(connection, row["id"], local.date())
             continue
         _settle_occurrence(
             connection,
