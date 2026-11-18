@@ -11,10 +11,9 @@ _MARKER_NAME = "launch-marker"
 _MARKER_TEXT = "kept"
 
 
-def test_open_browser_launches_installed_chrome_in_the_app_profile(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+def _record_persistent_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[object, dict[str, object]]]:
     calls: list[tuple[object, dict[str, object]]] = []
 
     class _Chromium:
@@ -36,6 +35,22 @@ def test_open_browser_launches_installed_chrome_in_the_app_profile(
             return _Playwright()
 
     monkeypatch.setattr("desktop.browser.sync_playwright", lambda: _Manager())
+    return calls
+
+
+def _installed(
+    monkeypatch: pytest.MonkeyPatch, *, chrome: bool, edge: bool
+) -> None:
+    monkeypatch.setattr("desktop.browser._chrome_installed", lambda: chrome)
+    monkeypatch.setattr("desktop.browser._edge_installed", lambda: edge)
+
+
+def test_open_browser_launches_installed_chrome_in_the_app_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    _installed(monkeypatch, chrome=True, edge=True)
+    calls = _record_persistent_launch(monkeypatch)
     open_browser()
     profile = browser_profile_dir()
     assert default_state_dir() == tmp_path
@@ -44,10 +59,35 @@ def test_open_browser_launches_installed_chrome_in_the_app_profile(
     assert calls == [(profile, {"channel": "chrome"})]
 
 
+def test_edge_is_selected_when_chrome_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    _installed(monkeypatch, chrome=False, edge=True)
+    calls = _record_persistent_launch(monkeypatch)
+    open_browser()
+    profile = browser_profile_dir()
+    assert calls == [(profile, {"channel": "msedge"})]
+    assert [path.name for path in tmp_path.iterdir()] == ["browser-profile"]
+
+
+def test_other_chromium_is_selected_when_chrome_and_edge_are_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    _installed(monkeypatch, chrome=False, edge=False)
+    calls = _record_persistent_launch(monkeypatch)
+    open_browser()
+    profile = browser_profile_dir()
+    assert calls == [(profile, {})]
+    assert [path.name for path in tmp_path.iterdir()] == ["browser-profile"]
+
+
 def test_second_launch_sees_the_same_profile_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    _installed(monkeypatch, chrome=True, edge=False)
     calls: list[object] = []
 
     class _Chromium:
@@ -91,6 +131,8 @@ class _Manager:
     def start(self):
         return _Playwright()
 
+browser._chrome_installed = lambda: True
+browser._edge_installed = lambda: False
 browser.sync_playwright = lambda: _Manager()
 open_browser()
 profile = browser_profile_dir()
