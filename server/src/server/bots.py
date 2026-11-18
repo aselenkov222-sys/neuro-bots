@@ -19,7 +19,13 @@ from server.auth import (
     origin_rejected,
     unauthenticated,
 )
-from server.browser_action import enqueue_open, named_address, take_login_choice
+from server.browser_action import (
+    bot_holds_browser,
+    enqueue_open,
+    hold_text,
+    named_address,
+    take_login_choice,
+)
 from server.config import development_tariff
 from server.desktops import find_working_desktop
 from server.models import (
@@ -551,6 +557,15 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
                 chat_id=chat["id"],
                 login=text,
             )
+            follow_at = opened.now
+        elif (
+            desktop is not None
+            and address is None
+            and bot_holds_browser(
+                opened.account["id"], desktop["computer_id"], parsed_id
+            )
+        ):
+            hold_text(opened.account["id"], parsed_id, text)
             follow_at = opened.now
         elif address is not None:
             assert desktop is not None

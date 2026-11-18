@@ -831,3 +831,65 @@ def _bot_name_posts(body: str) -> list[dict[str, str]]:
     assert isinstance(bots, list)
     assert all(set(bot) == {"id", "name"} for bot in bots)
     return bots
+
+
+def test_a_message_to_the_busy_bot_waits_and_another_answers(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+
+    def spy(**kwargs: object) -> str:
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        calls.append([item["text"] for item in messages])
+        return STUB
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id = _open_ready("busy-bot@example.com")
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        _claim(client, computer)
+        _pulse(client, computer)
+        busy = _bot(client)
+        other = client.post(
+            "/api/bots",
+            json={
+                "name": "Другой",
+                "description": "описание",
+                "scenario": "сценарий",
+            },
+            headers={"Origin": ORIGIN},
+        )
+        assert other.status_code == 200
+        opened = _post_message(client, busy["id"], f"открой {ADDRESS}")
+        assert [item["role"] for item in opened.json()["messages"]] == ["user"]
+        assert calls == []
+        held = _post_message(client, busy["id"], "просто текст")
+        assert [item["role"] for item in held.json()["messages"]] == ["user", "user"]
+        assert calls == []
+        immediate = _post_message(client, other.json()["id"], "привет")
+        assert immediate.status_code == 200
+        assert immediate.json()["messages"][-1]["role"] == "assistant"
+        assert immediate.json()["messages"][-1]["text"] == STUB
+        assert calls == [["привет"]]
+        finished = client.post(
+            f"/api/desktops/{computer}/browser-task",
+            json={"text": PAGE},
+            headers={"Origin": ORIGIN},
+        )
+        assert finished.status_code == 200
+        assert [item["role"] for item in finished.json()["messages"]] == [
+            "user",
+            "user",
+            "assistant",
+            "assistant",
+        ]
+        assert finished.json()["messages"][2]["text"] == STUB
+        assert finished.json()["messages"][3]["text"] == STUB
+    assert len(calls) == 3
+    assert calls[1][0] == f"открой {ADDRESS}"
+    assert "просто текст" in calls[1]
+    assert calls[2][-1] == STUB
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 3
+    assert len(charges) == 3
