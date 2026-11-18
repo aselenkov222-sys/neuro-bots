@@ -102,6 +102,7 @@ function claimDesktop() {
 }
 
 function sendPulse() {
+  publishNotices();
   const bridge = window.__neuroDesktop;
   if (!state.me || !bridge || typeof bridge.id !== "string" || typeof bridge.timezone !== "string") return;
   api(`/api/desktops/${bridge.id}/pulse`, {
@@ -136,11 +137,7 @@ function publishNotices() {
 function startPulse() {
   if (pulseTimer !== null) return;
   sendPulse();
-  publishNotices();
-  pulseTimer = setInterval(() => {
-    sendPulse();
-    publishNotices();
-  }, PULSE_INTERVAL_MS);
+  pulseTimer = setInterval(sendPulse, PULSE_INTERVAL_MS);
   if (browserTimer === null) browserTimer = setInterval(finishBrowserTask, 1000);
 }
 
