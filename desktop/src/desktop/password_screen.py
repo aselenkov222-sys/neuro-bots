@@ -395,7 +395,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path not in {"/open", "/sign-in", "/bot-names", "/notify"} or not self._loopback_host():
+        if parsed.path not in {"/open", "/sign-in", "/bot-names", "/notify", "/notify-click"} or not self._loopback_host():
             self._text(404, "")
             return
         if not self._cabinet_origin():
@@ -444,6 +444,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/notify":
             self._notify(body)
+            return
+        if parsed.path == "/notify-click":
+            self._notify_click(body)
             return
         if not self._allowed():
             self._text(403, "")
@@ -717,6 +720,37 @@ class _Handler(BaseHTTPRequestHandler):
         posted = post_local(notices, run=self.server.notify_run)
         encoded = json.dumps({"ids": [item["id"] for item in posted]}).encode("utf-8")
         self._open_bytes(200, encoded)
+
+    def _notify_click(self, body: bytes | None) -> None:
+        if not self._loopback_host() or not self._cabinet_origin():
+            self._text(403, "")
+            return
+        if self.headers.get("X-Desktop-Open") != self.server.open_token:
+            self._open_bytes(403, b"")
+            return
+        if body is None:
+            self._open_bytes(400, b"")
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._open_bytes(400, b"")
+            return
+        if (
+            not isinstance(payload, dict)
+            or "password" in payload
+            or "cookie" in payload
+            or set(payload) != {"bot_id"}
+            or not isinstance(payload.get("bot_id"), str)
+        ):
+            self._open_bytes(400, b"")
+            return
+        from desktop.notify import activate
+
+        if not activate(payload["bot_id"]):
+            self._open_bytes(400, b"")
+            return
+        self._open_bytes(204, b"")
 
     def _save_bot_names(self, body: bytes | None) -> None:
         if not self._loopback_host() or not self._cabinet_origin():

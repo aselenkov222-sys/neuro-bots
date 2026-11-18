@@ -2,9 +2,23 @@ import http.client
 import json
 import subprocess
 import uuid
+from pathlib import Path
 
-from desktop.notify import COMPLETED, FAILED, PHRASES, SKIPPED, post_local
+from desktop.notify import (
+    COMPLETED,
+    FAILED,
+    PHRASES,
+    SKIPPED,
+    activate,
+    bind_cabinet,
+    open_chat_script,
+    post_local,
+    reset_cabinet,
+)
 from desktop.password_screen import LOOPBACK, serve_password_screen
+from desktop.routine_gate import mark_window_hidden, reset, window_hidden
+
+WEB_APP = Path(__file__).resolve().parents[2] / "web" / "app.js"
 
 
 def _run(commands: list[list[str]]):
@@ -39,6 +53,72 @@ def test_local_notification_is_recorded_for_completion_failure_and_skip() -> Non
     assert PHRASES[SKIPPED] == "Запуск пропущен"
 
 
+def test_click_opens_the_main_chat_for_a_hidden_and_a_visible_window() -> None:
+    bot_id = str(uuid.uuid4())
+    script = open_chat_script(bot_id)
+    source = WEB_APP.read_text(encoding="utf-8")
+    assert "neuro-open-chat" in source
+    assert "__neuroOpenChat" in source
+    assert script == (
+        "window.__neuroOpenChat = "
+        + json.dumps(bot_id)
+        + ";window.dispatchEvent(new Event('neuro-open-chat'));"
+    )
+    assert "#chat" in source
+    hidden_script = _activate(bot_id, hidden=True)
+    visible_script = _activate(bot_id, hidden=False)
+    assert hidden_script == [script]
+    assert visible_script == [script]
+
+
+def test_loopback_click_opens_the_hidden_window_on_that_chat() -> None:
+    opened = serve_password_screen()
+    try:
+        cabinet = "http://127.0.0.1:8765"
+        opened.httpd.cabinet_origin = cabinet
+        bot_id = str(uuid.uuid4())
+        shown: list[str] = []
+        scripts: list[str] = []
+        reset()
+        reset_cabinet()
+        mark_window_hidden()
+        bind_cabinet(lambda: shown.append("shown"), scripts.append)
+        status, body = _post_path(opened, "/notify-click", {"bot_id": bot_id}, cabinet)
+        assert status == 204
+        assert body == b""
+        assert shown == ["shown"]
+        assert window_hidden() is False
+        assert scripts == [open_chat_script(bot_id)]
+        leaked, leaked_body = _post_path(
+            opened,
+            "/notify-click",
+            {"bot_id": bot_id, "password": "machine-secret-7", "cookie": "vault-cookie-9"},
+            cabinet,
+        )
+        assert leaked == 400
+        assert b"machine-secret-7" not in leaked_body
+        assert b"vault-cookie-9" not in leaked_body
+        assert shown == ["shown"]
+    finally:
+        reset()
+        reset_cabinet()
+        opened.close()
+
+
+def _activate(bot_id: str, *, hidden: bool) -> list[str]:
+    scripts: list[str] = []
+    shown: list[str] = []
+    reset()
+    reset_cabinet()
+    if hidden:
+        mark_window_hidden()
+    bind_cabinet(lambda: shown.append("shown"), scripts.append)
+    assert activate(bot_id) is True
+    assert shown == (["shown"] if hidden else [])
+    assert window_hidden() is False
+    return scripts
+
+
 def test_loopback_posts_those_notifications_and_refuses_a_password() -> None:
     opened = serve_password_screen()
     try:
@@ -71,12 +151,16 @@ def test_loopback_posts_those_notifications_and_refuses_a_password() -> None:
 
 
 def _post(opened, payload: dict, origin: str) -> tuple[int, bytes]:
+    return _post_path(opened, "/notify", payload, origin)
+
+
+def _post_path(opened, path: str, payload: dict, origin: str) -> tuple[int, bytes]:
     body = json.dumps(payload).encode()
     connection = http.client.HTTPConnection(LOOPBACK, opened.port, timeout=5)
     try:
         connection.request(
             "POST",
-            "/notify",
+            path,
             body=body,
             headers={
                 "Origin": origin,

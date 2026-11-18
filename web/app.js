@@ -1035,4 +1035,11 @@ window.addEventListener("hashchange", () => {
 window.addEventListener("neuro-desktop", () => {
   claimDesktop();
 });
+window.addEventListener("neuro-open-chat", () => {
+  const id = window.__neuroOpenChat;
+  if (typeof id !== "string" || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) return;
+  state.activeId = id;
+  if (location.hash === "#chat") showCurrent();
+  else location.hash = "#chat";
+});
 boot();

@@ -1,6 +1,9 @@
+import json
 import subprocess
 import sys
 import uuid
+
+from desktop.routine_gate import mark_window_shown, window_hidden
 
 COMPLETED = "completed"
 FAILED = "failed"
@@ -19,6 +22,43 @@ def _uuid(value: object) -> str | None:
         return str(uuid.UUID(value))
     except ValueError:
         return None
+
+
+_cabinet: dict[str, object] = {"show": None, "run_script": None}
+
+
+def bind_cabinet(show, run_script) -> None:
+    _cabinet["show"] = show
+    _cabinet["run_script"] = run_script
+
+
+def reset_cabinet() -> None:
+    _cabinet["show"] = None
+    _cabinet["run_script"] = None
+
+
+def open_chat_script(bot_id: str) -> str:
+    parsed = _uuid(bot_id)
+    if parsed is None:
+        raise ValueError(bot_id)
+    return (
+        "window.__neuroOpenChat = "
+        + json.dumps(parsed)
+        + ";window.dispatchEvent(new Event('neuro-open-chat'));"
+    )
+
+
+def activate(bot_id: str) -> bool:
+    parsed = _uuid(bot_id)
+    show = _cabinet["show"]
+    run_script = _cabinet["run_script"]
+    if parsed is None or not callable(show) or not callable(run_script):
+        return False
+    if window_hidden():
+        show()
+        mark_window_shown()
+    run_script(open_chat_script(parsed))
+    return True
 
 
 def post_local(notices: list[dict], run=None) -> list[dict[str, str]]:
