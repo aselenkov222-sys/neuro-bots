@@ -125,6 +125,138 @@ def test_personal_record_shows_the_bot_name_and_not_the_password(screen) -> None
     assert stored[0]["bot_id"] == ANYA
 
 
+def test_cabinet_bot_names_appear_in_the_list_and_the_select(screen) -> None:
+    opened, _security, tmp_path = screen
+    status, body, _headers = _vault_add(
+        opened,
+        SITE,
+        LOGIN,
+        SECRET,
+        personal=True,
+        bot_id=ANYA,
+    )
+    assert status == 303
+    assert SECRET.encode() not in body
+    cabinet = "http://127.0.0.1:8765"
+    opened.httpd.cabinet_origin = cabinet
+    names_path = tmp_path / "vault-bot-names.json"
+    payload = json.dumps(
+        {"bots": [{"id": ANYA, "name": ANYA_NAME}]},
+        ensure_ascii=False,
+    ).encode()
+    leaked = json.dumps(
+        {
+            "bots": [{"id": ANYA, "name": ANYA_NAME}],
+            "password": SECRET,
+            "login": LOGIN,
+            "site": SITE,
+        },
+        ensure_ascii=False,
+    ).encode()
+    foreign, foreign_body, _foreign_headers = _exchange(
+        opened,
+        "POST",
+        "/bot-names",
+        leaked,
+        _json_headers(leaked, "http://evil.example", opened.open_token),
+    )
+    assert foreign == 403
+    assert SECRET.encode() not in foreign_body
+    assert not names_path.exists()
+    options, options_body, options_headers = _exchange(
+        opened,
+        "OPTIONS",
+        "/bot-names",
+        headers={
+            "Origin": cabinet,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type, x-desktop-open",
+        },
+    )
+    assert options == 204
+    assert SECRET.encode() not in options_body
+    assert _header(options_headers, "Access-Control-Allow-Origin") == cabinet
+    assert "X-Desktop-Open" in (_header(options_headers, "Access-Control-Allow-Headers") or "")
+    saved, saved_body, saved_headers = _exchange(
+        opened,
+        "POST",
+        "/bot-names",
+        payload,
+        _json_headers(payload, cabinet, opened.open_token),
+    )
+    assert saved == 204
+    assert SECRET.encode() not in saved_body
+    assert _header(saved_headers, "Access-Control-Allow-Origin") == cabinet
+    written = names_path.read_text(encoding="utf-8")
+    assert json.loads(written) == {ANYA: ANYA_NAME}
+    assert SECRET not in written
+    refused, refused_body, _refused_headers = _exchange(
+        opened,
+        "POST",
+        "/bot-names",
+        leaked,
+        _json_headers(leaked, cabinet, opened.open_token),
+    )
+    assert refused == 400
+    assert SECRET.encode() not in refused_body
+    nested = json.dumps(
+        {"bots": [{"id": ANYA, "name": ANYA_NAME, "password": SECRET}]},
+        ensure_ascii=False,
+    ).encode()
+    nested_status, nested_body, _nested_headers = _exchange(
+        opened,
+        "POST",
+        "/bot-names",
+        nested,
+        _json_headers(nested, cabinet, opened.open_token),
+    )
+    assert nested_status == 400
+    assert SECRET.encode() not in nested_body
+    assert names_path.read_text(encoding="utf-8") == written
+    page_status, page, _page_headers = _exchange(opened, "GET", "/")
+    assert page_status == 200
+    text = page.decode()
+    assert f'class="vault-owner">{ANYA_NAME}<' in text
+    assert f'class="vault-owner">{ANYA}<' not in text
+    add_form = text.split('action="/vault"', 1)[1].split("</form>", 1)[0]
+    assert '<select name="vault_bot"><option value="" selected>общая</option>' in add_form
+    assert f'<option value="{ANYA}">{ANYA_NAME}</option>' in add_form
+    assert f'<option value="{ANYA}" selected>' not in add_form
+    assert f'<option value="{ANYA}" selected>{ANYA_NAME}</option>' in text
+    assert '<input name="vault_bot"' not in text
+    assert SECRET not in text
+    chosen = urlencode(
+        {
+            "vault_site": "другой.example",
+            "vault_login": "Борис",
+            "vault_password": OTHER_SECRET,
+            "vault_bot": ANYA,
+        }
+    ).encode()
+    chosen_status, chosen_body, _chosen_headers = _exchange(
+        opened,
+        "POST",
+        "/vault",
+        chosen,
+        _form_headers(chosen),
+    )
+    assert chosen_status == 303
+    assert SECRET.encode() not in chosen_body
+    assert OTHER_SECRET.encode() not in chosen_body
+    personal = [record for record in records() if record["login"] == "Борис"]
+    assert len(personal) == 1
+    assert personal[0]["shared"] is False
+    assert personal[0]["bot_id"] == ANYA
+    follow_status, follow, _follow_headers = _exchange(opened, "GET", "/?saved=1")
+    assert follow_status == 200
+    follow_text = follow.decode()
+    assert follow_text.count(f'class="vault-owner">{ANYA_NAME}<') == 2
+    assert SECRET not in follow_text
+    assert OTHER_SECRET not in follow_text
+    assert SECRET not in names_path.read_text(encoding="utf-8")
+    assert OTHER_SECRET not in names_path.read_text(encoding="utf-8")
+
+
 def test_missing_bot_name_shows_the_bot_id(screen) -> None:
     opened, _security, _tmp_path = screen
     status, _body, _headers = _vault_add(
@@ -297,6 +429,15 @@ def _vault_add(opened, site, login, password, personal=False, bot_id="", headers
 def _post_password(opened, site, login, password):
     body = urlencode({"site": site, "login": login, "password": password}).encode()
     return _exchange(opened, "POST", "/passwords", body, _form_headers(body))
+
+
+def _json_headers(body: bytes, origin: str, token: str) -> dict[str, str]:
+    return {
+        "Origin": origin,
+        "X-Desktop-Open": token,
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+    }
 
 
 def _form_headers(body: bytes, extra: dict[str, str] | None = None) -> dict[str, str]:

@@ -442,7 +442,28 @@ function render() {
 async function loadBots() {
   const result = await api("/api/bots");
   note(result);
-  if (result.ok && result.data) state.bots = result.data.bots;
+  if (result.ok && result.data && Array.isArray(result.data.bots)) {
+    state.bots = result.data.bots;
+    publishBotNames();
+  }
+}
+
+function publishBotNames() {
+  const bridge = window.__neuroDesktop;
+  if (!bridge || typeof bridge.openUrl !== "string" || typeof bridge.openToken !== "string") return;
+  const bots = [];
+  for (const bot of state.bots) {
+    if (!bot || typeof bot.id !== "string" || typeof bot.name !== "string" || !bot.id || !bot.name) continue;
+    bots.push({ id: bot.id, name: bot.name });
+  }
+  fetch(`${bridge.openUrl.replace(/\/$/, "")}/bot-names`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Desktop-Open": bridge.openToken
+    },
+    body: JSON.stringify({ bots })
+  }).catch(() => {});
 }
 
 async function loadCard() {

@@ -131,7 +131,7 @@ _PAGE = """<!DOCTYPE html>
     .vault .meta, .vault .hint { color: #c5ccd4; font-size: 14px; line-height: 1.45; }
     .vault h1 { color: #f4f6f8; font-size: 30px; line-height: 1.15; letter-spacing: -0.03em; }
     .vault .field { display: grid; gap: 6px; margin: 0; color: #c5ccd4; font-size: 14px; font-weight: 600; }
-    .vault input {
+    .vault input, .vault select {
       width: 100%;
       min-height: 44px;
       padding: 12px 14px;
@@ -139,6 +139,7 @@ _PAGE = """<!DOCTYPE html>
       border: 1px solid rgba(255, 255, 255, 0.16);
       background: rgba(0, 0, 0, 0.32);
       color: #f4f6f8;
+      font: inherit;
     }
     .lock { display: flex; align-items: center; gap: 8px; }
     .lock input { flex: 1; }
@@ -233,13 +234,8 @@ _PAGE = """<!DOCTYPE html>
       <label class="field">Пароль
         <span class="lock"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><input name="vault_password" type="password" autocomplete="off" required></span>
       </label>
-      <label class="switch">
-        <input name="vault_personal" type="checkbox" value="1">
-        <span class="switch-ui" aria-hidden="true"></span>
-        Личная для бота
-      </label>
-      <label class="field">Бот <input name="vault_bot" autocomplete="off"></label>
-      <p class="hint">Пока личная не выбрана, запись общая. Её можно сделать личной для одного бота до сохранения.</p>
+      __BOT_FIELD__
+      <p class="hint">Пока бот не выбран, запись общая. Её можно сделать личной для одного бота до сохранения.</p>
       <div class="actions">
         <button class="btn-orange" type="submit">Добавить запись</button>
       </div>
@@ -381,6 +377,7 @@ def _page(saved: bool) -> bytes:
         .replace("__COPIED_JS__", _js("Пароль скопирован."))
         .replace("__STAYS_JS__", _js("Пароль остаётся на этом компьютере."))
         .replace("__VAULT_LIST__", _vault_list())
+        .replace("__BOT_FIELD__", _bot_select("", _bot_names()))
     )
     return html.encode("utf-8")
 
@@ -397,7 +394,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path not in {"/open", "/sign-in"} or not self._loopback_host():
+        if parsed.path not in {"/open", "/sign-in", "/bot-names"} or not self._loopback_host():
             self._text(404, "")
             return
         if not self._cabinet_origin():
@@ -440,6 +437,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/sign-in":
             self._sign_in(body)
+            return
+        if parsed.path == "/bot-names":
+            self._save_bot_names(body)
             return
         if not self._allowed():
             self._text(403, "")
@@ -673,6 +673,24 @@ class _Handler(BaseHTTPRequestHandler):
         encoded = json.dumps(safe, ensure_ascii=False).encode("utf-8")
         self._open_bytes(200, encoded)
 
+    def _save_bot_names(self, body: bytes | None) -> None:
+        if not self._loopback_host() or not self._cabinet_origin():
+            self._text(403, "")
+            return
+        if self.headers.get("X-Desktop-Open") != self.server.open_token:
+            self._open_bytes(403, b"")
+            return
+        names = _posted_bot_names(body)
+        if names is None:
+            self._open_bytes(400, b"")
+            return
+        try:
+            _write_bot_names(names)
+        except OSError:
+            self._open_bytes(500, b"")
+            return
+        self._open_bytes(204, b"", "text/plain; charset=utf-8")
+
     def _vault_request(self, body: bytes | None) -> None:
         if body is None or not _form(self.headers.get("Content-Type", "")):
             self._text(400, _NEED)
@@ -803,9 +821,7 @@ def _record_html(record: dict, names: dict[str, str]) -> str:
     site = _esc(str(record["site"]))
     login = _esc(str(record["login"]))
     label = _esc(_owner_label(record, names))
-    personal = record["shared"] is False
-    checked = " checked" if personal else ""
-    bot_id = record["bot_id"] if personal and isinstance(record["bot_id"], str) else ""
+    bot_id = record["bot_id"] if record["shared"] is False and isinstance(record["bot_id"], str) else ""
     return (
         '<article class="vault raised">'
         f'<p class="vault-site">{site}</p>'
@@ -816,11 +832,7 @@ def _record_html(record: dict, names: dict[str, str]) -> str:
         f'<label class="field">Сайт <input name="vault_site" value="{site}" autocomplete="off" required></label>'
         f'<label class="field">Логин <input name="vault_login" value="{login}" autocomplete="off" required></label>'
         '<label class="field">Пароль <input name="vault_password" type="password" autocomplete="off" required></label>'
-        '<label class="switch">'
-        f'<input name="vault_personal" type="checkbox" value="1"{checked}>'
-        '<span class="switch-ui" aria-hidden="true"></span>'
-        "Личная для бота</label>"
-        f'<label class="field">Бот <input name="vault_bot" value="{_esc(bot_id)}" autocomplete="off"></label>'
+        f"{_bot_select(bot_id, names)}"
         '<button class="btn-quiet" type="submit">Заменить</button>'
         "</form>"
         f'<form method="post" action="/vault/{record_id}/delete">'
@@ -854,10 +866,73 @@ def _bot_names() -> dict[str, str]:
     return names
 
 
-def _chosen_bot(fields: dict[str, str]) -> str | None:
-    if "vault_personal" not in fields:
+def _bot_select(selected: str, names: dict[str, str]) -> str:
+    options = [
+        '<option value="" selected>общая</option>'
+        if selected == ""
+        else '<option value="">общая</option>'
+    ]
+    seen: set[str] = set()
+    for bot_id, name in names.items():
+        seen.add(bot_id)
+        mark = " selected" if bot_id == selected else ""
+        options.append(f'<option value="{_esc(bot_id)}"{mark}>{_esc(name)}</option>')
+    if selected != "" and selected not in seen:
+        options.append(f'<option value="{_esc(selected)}" selected>{_esc(selected)}</option>')
+    return (
+        '<label class="field">Бот <select name="vault_bot">'
+        + "".join(options)
+        + "</select></label>"
+    )
+
+
+def _posted_bot_names(body: bytes | None) -> dict[str, str] | None:
+    if body is None:
         return None
-    return fields.get("vault_bot", "")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {"bots"}:
+        return None
+    bots = payload["bots"]
+    if not isinstance(bots, list):
+        return None
+    names: dict[str, str] = {}
+    for item in bots:
+        if not isinstance(item, dict) or set(item) != {"id", "name"}:
+            return None
+        bot_id = item["id"]
+        name = item["name"]
+        if (
+            not isinstance(bot_id, str)
+            or not isinstance(name, str)
+            or bot_id == ""
+            or name == ""
+            or "\x00" in bot_id
+            or "\x00" in name
+            or len(bot_id) > 200
+            or len(name) > 200
+        ):
+            return None
+        names[bot_id] = name
+    return names
+
+
+def _write_bot_names(names: dict[str, str]) -> None:
+    path = default_state_dir() / _NAMES
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(names, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _chosen_bot(fields: dict[str, str]) -> str | None:
+    bot_id = fields.get("vault_bot", "")
+    if bot_id == "":
+        return None
+    return bot_id
 
 
 def _vault_target(path: str) -> tuple[str, str | None] | None:
