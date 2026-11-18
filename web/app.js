@@ -1,3 +1,13 @@
+const DAYS = [
+  { id: 1, short: "Пн" },
+  { id: 2, short: "Вт" },
+  { id: 3, short: "Ср" },
+  { id: 4, short: "Чт" },
+  { id: 5, short: "Пт" },
+  { id: 6, short: "Сб" },
+  { id: 7, short: "Вс" }
+];
+
 const COLORS = [
   { value: "#c85a12", name: "Ржавый" },
   { value: "#1f7a4c", name: "Мох" },
@@ -38,6 +48,8 @@ const state = {
   holdTariff: false,
   bots: [],
   card: null,
+  routine: null,
+  routineTime: "09:00",
   messages: []
 };
 
@@ -331,6 +343,38 @@ function botsScreen() {
     ${form}`;
 }
 
+function routineLocked() {
+  const bot = state.card;
+  return !bot || typeof bot.scenario !== "string" || bot.scenario.trim() === "";
+}
+
+function routineBlock() {
+  const locked = routineLocked();
+  const routine = state.routine;
+  const selected = routine && Array.isArray(routine.weekdays) ? routine.weekdays : [];
+  const time = routine && typeof routine.time === "string" ? routine.time : state.routineTime;
+  const paused = routine ? routine.paused === true : false;
+  const days = DAYS.map((day) => `
+    <button type="button" class="day ${selected.includes(day.id) ? "is-on" : ""}" data-action="toggle-day" data-day="${day.id}" aria-pressed="${selected.includes(day.id) ? "true" : "false"}" ${locked ? "disabled" : ""}>${day.short}</button>`).join("");
+  return `
+    <section class="routine sheet">
+      <div>
+        <h2>Рутина</h2>
+        <p class="hint">Дни недели и одно время. Своего текста у рутины нет.</p>
+        ${locked ? '<p class="hint" id="routine-locked">Сначала заполните сценарий.</p>' : ""}
+      </div>
+      <div>
+        <div class="routine-controls">
+          <div class="days" role="group" aria-label="Дни недели">${days}</div>
+          <label class="field" for="routine-time" style="width:auto">Время
+            <input id="routine-time" type="time" value="${esc(time || "09:00")}" ${locked ? "disabled" : ""}>
+          </label>
+          <button type="button" class="btn-green" data-action="toggle-pause" ${locked || !routine ? "disabled" : ""}>${paused ? "Снять паузу" : "Пауза"}</button>
+        </div>
+      </div>
+    </section>`;
+}
+
 function botScreen() {
   const bot = state.card;
   if (!bot) return `${topbar("Карточка бота", "", logoutControl())}${noticeHtml()}`;
@@ -357,7 +401,8 @@ function botScreen() {
       <p class="hint" style="margin:10px 0">Сохранение заменяет прежний сценарий целиком. Написанные сообщения остаются как были.</p>
       ${state.savedFlash ? '<p class="flash" role="status">Сценарий сохранён. Прежний текст заменён целиком.</p>' : ""}
       <button type="button" class="btn-orange" data-action="save-scenario">Сохранить сценарий</button>
-    </section>`;
+    </section>
+    ${routineBlock()}`;
 }
 
 function accessSite(message) {
@@ -473,6 +518,35 @@ async function loadCard() {
   if (!result.ok || !result.data) return;
   state.card = result.data;
   state.draft = result.data.scenario;
+  await loadRoutine();
+}
+
+async function loadRoutine() {
+  if (!state.activeId) return;
+  const result = await api(`/api/bots/${state.activeId}/routines`);
+  if (!result.ok || !Array.isArray(result.data)) {
+    note(result);
+    state.routine = null;
+    return;
+  }
+  state.routine = result.data[0] || null;
+  if (state.routine && typeof state.routine.time === "string") {
+    state.routineTime = state.routine.time;
+  }
+}
+
+async function saveRoutine(body, routineId) {
+  if (!state.activeId) return;
+  const path = routineId
+    ? `/api/bots/${state.activeId}/routines/${routineId}`
+    : `/api/bots/${state.activeId}/routines`;
+  const result = await api(path, {
+    method: routineId ? "PATCH" : "POST",
+    body
+  });
+  note(result);
+  if (result.ok && result.data && result.data.id) state.routine = result.data;
+  render();
 }
 
 async function loadMessages() {
@@ -598,7 +672,7 @@ function restoreFocus(target) {
   if (!target || !target.dataset || !target.dataset.action) return;
   const action = target.dataset.action;
   const match = [...document.querySelectorAll(`[data-action="${action}"]`)].find((el) => {
-    return ["id", "color", "icon", "scope"].every((key) => {
+    return ["id", "color", "icon", "scope", "day"].every((key) => {
       if (target.dataset[key] == null || target.dataset[key] === "") return el.dataset[key] == null || el.dataset[key] === "";
       return el.dataset[key] === target.dataset[key];
     });
@@ -634,6 +708,16 @@ app.addEventListener("change", (event) => {
   }
   if (target.id === "bot-desc" && state.card && target.value !== state.card.description) {
     patchBot({ description: target.value });
+  }
+  if (target.id === "routine-time" && state.card && !routineLocked()) {
+    const next = target.value;
+    if (!next) return;
+    state.routineTime = next;
+    if (!state.routine || next === state.routine.time) return;
+    saveRoutine(
+      { weekdays: state.routine.weekdays, time: next },
+      state.routine.id
+    );
   }
 });
 
@@ -685,6 +769,8 @@ app.addEventListener("click", (event) => {
     state.activeId = target.dataset.id;
     state.savedFlash = false;
     state.card = null;
+    state.routine = null;
+    state.routineTime = "09:00";
     location.hash = "#bot";
     return;
   }
@@ -692,8 +778,38 @@ app.addEventListener("click", (event) => {
     state.savedFlash = true;
     patchBot({ scenario: state.draft });
   }
+  if (action === "toggle-day") toggleDay(Number(target.dataset.day));
+  if (action === "toggle-pause") togglePause();
   restoreFocus(target);
 });
+
+async function toggleDay(day) {
+  if (!state.card || !state.activeId || routineLocked()) return;
+  if (!Number.isInteger(day) || day < 1 || day > 7) return;
+  const routine = state.routine;
+  const selected = routine && Array.isArray(routine.weekdays) ? routine.weekdays.slice() : [];
+  const next = selected.includes(day)
+    ? selected.filter((item) => item !== day)
+    : selected.concat(day).sort((left, right) => left - right);
+  const time = routine && typeof routine.time === "string" ? routine.time : state.routineTime;
+  if (routine && next.length === 0) {
+    const result = await api(`/api/bots/${state.activeId}/routines/${routine.id}`, {
+      method: "DELETE"
+    });
+    note(result);
+    if (result.ok) state.routine = null;
+    render();
+    return;
+  }
+  if (next.length === 0) return;
+  saveRoutine({ weekdays: next, time }, routine ? routine.id : null);
+}
+
+async function togglePause() {
+  const routine = state.routine;
+  if (!state.card || !routine || routineLocked()) return;
+  saveRoutine({ paused: routine.paused !== true }, routine.id);
+}
 
 async function sendConfirmation() {
   const result = await api("/api/confirmation", { method: "POST" });
@@ -714,6 +830,8 @@ async function signOut() {
   state.draft = "";
   state.bots = [];
   state.card = null;
+  state.routine = null;
+  state.routineTime = "09:00";
   state.messages = [];
   if (location.hash !== "#login") location.hash = "#login";
   else render();

@@ -302,3 +302,121 @@ def test_browser_shows_message_and_logout(database: None) -> None:
             browser.close()
     finally:
         _stop(process, journal)
+
+
+def test_browser_shows_routine_days_and_one_time(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"cabinet-{uuid.uuid4()}@example.com"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/")
+            page.wait_for_selector("h1")
+            assert page.locator("h1").inner_text() == "Регистрация"
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Пустой")
+            page.click("#save-bot")
+            page.wait_for_selector(".bot-card")
+            page.click(".bot-card")
+            page.wait_for_selector("#routine-time")
+            assert page.locator("#routine-locked").inner_text() == "Сначала заполните сценарий."
+            assert page.locator(".day").count() == 7
+            assert page.locator(".day").first.is_disabled()
+            assert page.locator("#routine-time").is_disabled()
+            assert page.locator("[data-action='toggle-pause']").is_disabled()
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Искра")
+            page.fill("#create-scenario", "план")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Искра").click()
+            page.wait_for_selector("#routine-time")
+            labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+            days = page.locator(".day")
+            assert days.count() == 7
+            for index, label in enumerate(labels):
+                assert days.nth(index).inner_text() == label
+                assert days.nth(index).is_enabled()
+            assert page.locator("#routine-time").is_enabled()
+            assert page.locator("#routine-time").input_value() == "09:00"
+            assert page.locator("[data-action='toggle-pause']").inner_text() == "Пауза"
+            assert page.locator("#routine-locked").count() == 0
+            assert (
+                page.locator("text=Дни недели и одно время. Своего текста у рутины нет.").count()
+                == 1
+            )
+            assert page.locator("text=Проверить сейчас").count() == 0
+            assert page.locator("text=Кликабельный макет").count() == 0
+            assert page.locator(".proto").count() == 0
+            assert page.locator(".proto-nav").count() == 0
+            assert page.locator("h1").inner_text() == "Искра"
+
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/routines")
+                and response.ok
+            ):
+                page.locator(".day", has_text="Пн").click()
+            assert page.locator(".day.is-on").inner_text() == "Пн"
+            with page.expect_response(
+                lambda response: response.request.method == "PATCH"
+                and "/routines/" in response.url
+                and response.ok
+            ):
+                page.fill("#routine-time", "10:30")
+            assert page.locator("#routine-time").input_value() == "10:30"
+            with page.expect_response(
+                lambda response: response.request.method == "PATCH"
+                and "/routines/" in response.url
+                and response.ok
+            ):
+                page.locator("[data-action='toggle-pause']").click()
+            assert page.locator("[data-action='toggle-pause']").inner_text() == "Снять паузу"
+            with page.expect_response(
+                lambda response: response.request.method == "DELETE"
+                and "/routines/" in response.url
+                and response.ok
+            ):
+                page.locator(".day.is-on").click()
+            assert page.locator(".day.is-on").count() == 0
+            browser.close()
+    finally:
+        _stop(process, journal)

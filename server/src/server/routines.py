@@ -741,15 +741,7 @@ def _lock_account_and_count_routines(
     ).scalar_one()
 
 
-async def read_routine(
-    request: Request,
-) -> tuple[list[int], str] | JSONResponse:
-    try:
-        body = await request.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _invalid_routine()
-    if not isinstance(body, dict):
-        return _invalid_routine()
+def _schedule(body: dict[str, object]) -> tuple[list[int], str] | JSONResponse:
     weekdays = body.get("weekdays")
     clock = body.get("time")
     if not isinstance(weekdays, list) or len(weekdays) == 0:
@@ -766,6 +758,18 @@ async def read_routine(
     if not isinstance(clock, str) or _CLOCK.fullmatch(clock) is None:
         return _invalid_routine()
     return sorted(days), clock
+
+
+async def read_routine(
+    request: Request,
+) -> tuple[list[int], str] | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_routine()
+    if not isinstance(body, dict):
+        return _invalid_routine()
+    return _schedule(body)
 
 
 @router.post("/api/bots/{bot_id}/routines")
@@ -812,6 +816,30 @@ async def create_routine(request: Request, bot_id: str) -> JSONResponse:
         return JSONResponse(routine_document(row))
 
 
+@router.get("/api/bots/{bot_id}/routines")
+def list_routines(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _owned_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        rows = (
+            opened.connection.execute(
+                select(routines)
+                .where(routines.c.bot_id == parsed_id)
+                .order_by(routines.c.id.asc())
+            )
+            .mappings()
+            .all()
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse([routine_document(row) for row in rows])
+
+
 @router.delete("/api/bots/{bot_id}/routines/{routine_id}")
 def delete_routine(
     request: Request, bot_id: str, routine_id: str
@@ -846,17 +874,31 @@ def delete_routine(
         return JSONResponse({})
 
 
-async def read_paused(request: Request) -> bool | JSONResponse:
+async def read_routine_patch(
+    request: Request,
+) -> tuple[bool | None, tuple[list[int], str] | None] | JSONResponse:
     try:
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         return _invalid_pause()
-    if not isinstance(body, dict) or "paused" not in body:
+    if not isinstance(body, dict):
         return _invalid_pause()
-    paused = body["paused"]
-    if not isinstance(paused, bool):
+    has_schedule = "weekdays" in body or "time" in body
+    if "paused" not in body and not has_schedule:
         return _invalid_pause()
-    return paused
+    paused: bool | None = None
+    if "paused" in body:
+        value = body["paused"]
+        if not isinstance(value, bool):
+            return _invalid_pause()
+        paused = value
+    schedule: tuple[list[int], str] | None = None
+    if has_schedule:
+        parsed = _schedule(body)
+        if isinstance(parsed, JSONResponse):
+            return parsed
+        schedule = parsed
+    return paused, schedule
 
 
 def _owned_routine(
@@ -884,9 +926,10 @@ async def update_routine_pause(
         parsed_bot = parse_id(bot_id)
         if parsed_bot is None:
             return not_found()
-        paused = await read_paused(request)
-        if isinstance(paused, JSONResponse):
-            return paused
+        patch = await read_routine_patch(request)
+        if isinstance(patch, JSONResponse):
+            return patch
+        paused, schedule = patch
         bot = _owned_bot(opened.connection, parsed_bot, opened.account["id"])
         if bot is None:
             return not_found()
@@ -896,19 +939,30 @@ async def update_routine_pause(
         existing = _owned_routine(opened.connection, parsed_routine, parsed_bot)
         if existing is None:
             return _routine_not_found()
+        if schedule is not None:
+            scenario = bot["scenario"]
+            if not isinstance(scenario, str) or scenario.strip() == "":
+                return _scenario_required()
+        values: dict[str, object] = {}
+        if paused is not None:
+            values["paused"] = paused
+        if schedule is not None:
+            days, clock = schedule
+            values["weekdays"] = days
+            values["time_of_day"] = _clock(clock)
         opened.connection.execute(
             routines.update()
             .where(
                 routines.c.id == parsed_routine,
                 routines.c.bot_id == parsed_bot,
             )
-            .values(paused=paused)
+            .values(**values)
         )
-        if paused:
+        if paused is True:
             cancel_routine_today(
                 opened.connection, existing, opened.account["id"], opened.now
             )
-        else:
+        elif paused is False:
             release_routine_today(
                 opened.connection, existing, opened.account["id"], opened.now
             )

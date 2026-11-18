@@ -754,6 +754,90 @@ def test_pause_blocks_a_start_and_writes_no_chat_message(
         assert _chat_messages(bot_id) == []
 
 
+def test_list_and_patch_weekdays_and_time(database: None) -> None:
+    cookie, account_id = _open_account("list-routine@example.com", confirmed=True)
+    other, _ = _open_account("list-routine-other@example.com", confirmed=True)
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        empty = client.get(f"/api/bots/{bot['id']}/routines")
+        assert empty.status_code == 200
+        assert empty.json() == []
+        first = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3], "time": "09:00"}
+        )
+        second = _create_routine(
+            client, bot["id"], {"weekdays": [5], "time": "18:00"}
+        )
+        assert first.status_code == second.status_code == 200
+        listed = client.get(f"/api/bots/{bot['id']}/routines")
+        assert listed.status_code == 200
+        rows = listed.json()
+        assert [row["id"] for row in rows] == sorted(row["id"] for row in rows)
+        assert rows == sorted(
+            [first.json(), second.json()], key=lambda row: row["id"]
+        )
+        assert all(tuple(row) == ROUTINE_FIELDS for row in rows)
+        chosen = rows[0]
+        patched = client.patch(
+            f"/api/bots/{bot['id']}/routines/{chosen['id']}",
+            json={"weekdays": [4, 2], "time": "10:30"},
+            headers={"Origin": ORIGIN},
+        )
+        assert patched.status_code == 200
+        assert patched.json()["weekdays"] == [2, 4]
+        assert patched.json()["time"] == "10:30"
+        assert patched.json()["paused"] is False
+        assert patched.json()["id"] == chosen["id"]
+        stored = [
+            row
+            for row in _account_routines(account_id)
+            if str(row["id"]) == chosen["id"]
+        ]
+        assert len(stored) == 1
+        assert list(stored[0]["weekdays"]) == [2, 4]
+        assert stored[0]["time_of_day"] == time(10, 30)
+        assert stored[0]["paused"] is False
+        rejected = client.patch(
+            f"/api/bots/{bot['id']}/routines/{chosen['id']}",
+            json={"weekdays": [1], "time": "25:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert rejected.status_code == 400
+        assert rejected.json() == INVALID_ROUTINE
+        cleared = client.patch(
+            f"/api/bots/{bot['id']}",
+            json={"scenario": "   "},
+            headers={"Origin": ORIGIN},
+        )
+        assert cleared.status_code == 200
+        blocked = client.patch(
+            f"/api/bots/{bot['id']}/routines/{chosen['id']}",
+            json={"weekdays": [1], "time": "08:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert blocked.status_code == 400
+        assert blocked.json() == SCENARIO_REQUIRED
+        unchanged = [
+            row
+            for row in _account_routines(account_id)
+            if str(row["id"]) == chosen["id"]
+        ]
+        assert list(unchanged[0]["weekdays"]) == [2, 4]
+        assert unchanged[0]["time_of_day"] == time(10, 30)
+        assert unchanged[0]["paused"] is False
+        missing = client.get(f"/api/bots/{uuid.uuid4()}/routines")
+        assert missing.status_code == 404
+        assert missing.json() == NOT_FOUND
+    with _client(other) as foreign:
+        hidden = foreign.get(f"/api/bots/{bot['id']}/routines")
+        assert hidden.status_code == 404
+        assert hidden.json() == NOT_FOUND
+    with TestClient(app) as anonymous:
+        denied = anonymous.get(f"/api/bots/{bot['id']}/routines")
+    assert denied.status_code == 401
+    assert denied.json() == UNAUTHENTICATED
+
+
 def _account_desktops(account_id: uuid.UUID) -> list[dict]:
     return [row for row in _rows(desktops) if row["account_id"] == account_id]
 
