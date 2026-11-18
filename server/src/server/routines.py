@@ -130,27 +130,10 @@ def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> Non
     )
 
 
-def _drop_pending(
+def _run_row(
     connection: Connection, routine_id: uuid.UUID, local_date: date
-) -> None:
-    connection.execute(
-        routine_runs.delete().where(
-            routine_runs.c.routine_id == routine_id,
-            routine_runs.c.local_date == local_date,
-            routine_runs.c.status == "pending",
-        )
-    )
-
-
-def _settle_occurrence(
-    connection: Connection,
-    routine_id: uuid.UUID,
-    bot_id: uuid.UUID,
-    local_date: date,
-    due_at: datetime,
-    now: datetime,
-) -> None:
-    existing = (
+) -> RowMapping | None:
+    return (
         connection.execute(
             select(routine_runs).where(
                 routine_runs.c.routine_id == routine_id,
@@ -160,19 +143,169 @@ def _settle_occurrence(
         .mappings()
         .one_or_none()
     )
-    deadline = due_at + CLAIM_WAIT
+
+
+def _occurrence(
+    now: datetime,
+    zone_name: str | None,
+    weekdays: object,
+    clock: time,
+) -> tuple[datetime, date, datetime] | None:
+    if zone_name is None or not timezone_name_accepted(zone_name):
+        return None
+    moment = _aware(now)
+    local = moment.astimezone(ZoneInfo(zone_name))
+    if local.isoweekday() not in {int(day) for day in weekdays}:
+        return None
+    due_at = appointed_utc(clock, zone_name, local.date())
+    return moment, local.date(), due_at
+
+
+def _ensure_cancelled(
+    connection: Connection,
+    routine_id: uuid.UUID,
+    local_date: date,
+    due_at: datetime,
+) -> None:
+    existing = _run_row(connection, routine_id, local_date)
     if existing is None:
-        if now >= deadline:
-            return
         connection.execute(
             routine_runs.insert().values(
                 id=uuid.uuid4(),
                 routine_id=routine_id,
                 local_date=local_date,
                 due_at=due_at,
-                status="pending",
+                status="cancelled",
             )
         )
+        return
+    if existing["status"] != "pending":
+        return
+    connection.execute(
+        routine_runs.update()
+        .where(
+            routine_runs.c.id == existing["id"],
+            routine_runs.c.status == "pending",
+        )
+        .values(status="cancelled")
+    )
+
+
+def _routines_for_account(
+    connection: Connection, account_id: uuid.UUID
+) -> list[RowMapping]:
+    return list(
+        connection.execute(
+            select(
+                routines.c.id,
+                routines.c.weekdays,
+                routines.c.time_of_day,
+            )
+            .join(bots, bots.c.id == routines.c.bot_id)
+            .where(bots.c.account_id == account_id)
+        )
+        .mappings()
+        .all()
+    )
+
+
+def cancel_routine_today(
+    connection: Connection,
+    routine: Mapping[str, object],
+    account_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    found = _occurrence(
+        now,
+        working_desktop_zone(connection, account_id),
+        routine["weekdays"],
+        routine["time_of_day"],
+    )
+    if found is None:
+        return
+    _moment, local_date, due_at = found
+    _ensure_cancelled(connection, routine["id"], local_date, due_at)
+
+
+def cancel_account_routines(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> None:
+    for routine in _routines_for_account(connection, account_id):
+        cancel_routine_today(connection, routine, account_id, now)
+
+
+def release_routine_today(
+    connection: Connection,
+    routine: Mapping[str, object],
+    account_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    found = _occurrence(
+        now,
+        working_desktop_zone(connection, account_id),
+        routine["weekdays"],
+        routine["time_of_day"],
+    )
+    if found is None:
+        return
+    moment, local_date, due_at = found
+    if moment >= due_at:
+        return
+    connection.execute(
+        routine_runs.delete().where(
+            routine_runs.c.routine_id == routine["id"],
+            routine_runs.c.local_date == local_date,
+            routine_runs.c.status == "cancelled",
+        )
+    )
+
+
+def release_account_routines(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> None:
+    for routine in _routines_for_account(connection, account_id):
+        release_routine_today(connection, routine, account_id, now)
+
+
+def _settle_occurrence(
+    connection: Connection,
+    routine_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    local_date: date,
+    due_at: datetime,
+    now: datetime,
+    *,
+    allowed: bool,
+) -> None:
+    if not allowed:
+        if now >= due_at:
+            _ensure_cancelled(connection, routine_id, local_date, due_at)
+        return
+    existing = _run_row(connection, routine_id, local_date)
+    deadline = due_at + CLAIM_WAIT
+    if existing is None:
+        if now >= deadline:
+            connection.execute(
+                routine_runs.insert().values(
+                    id=uuid.uuid4(),
+                    routine_id=routine_id,
+                    local_date=local_date,
+                    due_at=due_at,
+                    status="skipped",
+                )
+            )
+            _write_skip(connection, bot_id, now)
+            return
+        if now >= due_at:
+            connection.execute(
+                routine_runs.insert().values(
+                    id=uuid.uuid4(),
+                    routine_id=routine_id,
+                    local_date=local_date,
+                    due_at=due_at,
+                    status="pending",
+                )
+            )
         return
     if existing["status"] != "pending" or now < deadline:
         return
@@ -216,10 +349,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
         if local.isoweekday() not in {int(day) for day in row["weekdays"]}:
             continue
         due_at = appointed_utc(row["time_of_day"], zone, local.date())
-        if moment < due_at:
-            continue
-        if not allowed:
-            _drop_pending(connection, row["id"], local.date())
+        if moment < due_at and allowed:
             continue
         _settle_occurrence(
             connection,
@@ -228,6 +358,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
             local.date(),
             due_at,
             moment,
+            allowed=allowed,
         )
 
 
@@ -478,6 +609,14 @@ async def update_routine_pause(
             )
             .values(paused=paused)
         )
+        if paused:
+            cancel_routine_today(
+                opened.connection, existing, opened.account["id"], opened.now
+            )
+        else:
+            release_routine_today(
+                opened.connection, existing, opened.account["id"], opened.now
+            )
         row = _owned_routine(opened.connection, parsed_routine, parsed_bot)
         assert row is not None
         touch_session(opened.connection, opened.session["id"], opened.now)

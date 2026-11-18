@@ -1075,7 +1075,9 @@ def test_pause_and_logout_hold_open_neither_a_run_nor_a_skip(
     )
     paused_bot_id = uuid.UUID(paused_bot["id"])
     _settle(SKIP_AT)
-    assert _runs_for(paused["id"]) == []
+    paused_runs = _runs_for(paused["id"])
+    assert len(paused_runs) == 1
+    assert paused_runs[0]["status"] == "cancelled"
     assert _chat_messages(paused_bot_id) == []
     assert _account_routines(paused_account)[0]["paused"] is True
 
@@ -1094,7 +1096,9 @@ def test_pause_and_logout_hold_open_neither_a_run_nor_a_skip(
     assert desktop["timezone"] == "Europe/Moscow"
     _settle(DUE)
     _settle(SKIP_AT)
-    assert _runs_for(held["id"]) == []
+    held_runs = _runs_for(held["id"])
+    assert len(held_runs) == 1
+    assert held_runs[0]["status"] == "cancelled"
     assert _chat_messages(held_bot_id) == []
     assert _account_routines(held_account)[0]["paused"] is False
 
@@ -1112,14 +1116,18 @@ def test_unpause_after_the_minute_does_not_write_a_skip(
         assert paused.status_code == 200
     _settle(DUE - timedelta(seconds=1))
     _settle(SKIP_AT)
-    assert _runs_for(created["id"]) == []
+    marked = _runs_for(created["id"])
+    assert len(marked) == 1
+    assert marked[0]["status"] == "cancelled"
     assert _chat_messages(bot_id) == []
     with _client(cookie) as client:
         resumed = _pause(client, bot["id"], created["id"], False)
         assert resumed.status_code == 200
         assert resumed.json()["paused"] is False
     _settle(SKIP_AT + timedelta(hours=3))
-    assert _runs_for(created["id"]) == []
+    kept = _runs_for(created["id"])
+    assert len(kept) == 1
+    assert kept[0]["status"] == "cancelled"
     assert _chat_messages(bot_id) == []
     assert _account_routines(account_id)[0]["paused"] is False
 
@@ -1136,7 +1144,9 @@ def test_sign_in_after_the_minute_does_not_write_a_skip(
         assert signed_out.status_code == 200
     _settle(DUE)
     _settle(SKIP_AT)
-    assert _runs_for(created["id"]) == []
+    marked = _runs_for(created["id"])
+    assert len(marked) == 1
+    assert marked[0]["status"] == "cancelled"
     assert _chat_messages(bot_id) == []
     with _login(email) as client:
         pulsed = client.post(
@@ -1151,7 +1161,9 @@ def test_sign_in_after_the_minute_does_not_write_a_skip(
     assert desktop["working"] is True
     assert desktop["routines_stopped"] is False
     _settle(SKIP_AT + timedelta(hours=3))
-    assert _runs_for(created["id"]) == []
+    kept = _runs_for(created["id"])
+    assert len(kept) == 1
+    assert kept[0]["status"] == "cancelled"
     assert _chat_messages(bot_id) == []
     assert _account_routines(account_id)[0]["paused"] is False
 
@@ -1225,3 +1237,148 @@ def test_deleting_a_routine_removes_its_run_and_frees_the_slot(
     kept = _chat_messages(bot_id)
     assert len(kept) == 1
     assert kept[0]["text"] == SKIP_TEXT
+
+
+BEFORE_DUE = datetime(2026, 11, 18, 5, 0, tzinfo=timezone.utc)
+STILL_BEFORE = datetime(2026, 11, 18, 5, 30, tzinfo=timezone.utc)
+AFTER_WINDOW = datetime(2026, 11, 18, 7, 0, tzinfo=timezone.utc)
+NEXT_DUE = datetime(2026, 11, 20, 6, 0, tzinfo=timezone.utc)
+
+
+def test_first_settle_after_the_window_writes_one_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    _cookie, _account_id, _computer, bot, created = _prepare_due_routine(
+        "late-first-sight@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _settle(SKIP_AT)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "skipped"
+    assert runs[0]["due_at"] == DUE
+    assert runs[0]["local_date"] == date(2026, 11, 18)
+    messages = _chat_messages(bot_id)
+    assert len(messages) == 1
+    assert messages[0]["role"] == "error"
+    assert messages[0]["code"] == "routine_skipped"
+    assert messages[0]["text"] == SKIP_TEXT
+    _settle(SKIP_AT + timedelta(hours=3))
+    assert _runs_for(created["id"]) == runs
+    assert _chat_messages(bot_id) == messages
+
+
+def test_pause_before_the_minute_and_unpause_after_keeps_cancelled(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, _computer, bot, created = _prepare_due_routine(
+        "cancel-pause@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    monkeypatch.setattr("server.bots.utc_now", lambda: BEFORE_DUE)
+    with _client(cookie) as client:
+        paused = _pause(client, bot["id"], created["id"], True)
+        assert paused.status_code == 200
+    marked = _runs_for(created["id"])
+    assert len(marked) == 1
+    assert marked[0]["status"] == "cancelled"
+    assert marked[0]["local_date"] == date(2026, 11, 18)
+    assert _chat_messages(bot_id) == []
+    monkeypatch.setattr("server.bots.utc_now", lambda: AFTER_WINDOW)
+    with _client(cookie) as client:
+        resumed = _pause(client, bot["id"], created["id"], False)
+        assert resumed.status_code == 200
+        assert resumed.json()["paused"] is False
+    _settle(AFTER_WINDOW)
+    kept = _runs_for(created["id"])
+    assert len(kept) == 1
+    assert kept[0]["status"] == "cancelled"
+    assert _chat_messages(bot_id) == []
+
+
+def test_logout_before_the_minute_and_pulse_after_keeps_cancelled(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    email = "cancel-logout@example.com"
+    cookie, account_id, computer, bot, created = _prepare_due_routine(email)
+    bot_id = uuid.UUID(bot["id"])
+    monkeypatch.setattr("server.auth.utc_now", lambda: BEFORE_DUE)
+    with _client(cookie) as client:
+        signed_out = client.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+    marked = _runs_for(created["id"])
+    assert len(marked) == 1
+    assert marked[0]["status"] == "cancelled"
+    assert _chat_messages(bot_id) == []
+    monkeypatch.setattr("server.auth.utc_now", lambda: AFTER_WINDOW)
+    monkeypatch.setattr("server.desktops.utc_now", lambda: AFTER_WINDOW)
+    with _login(email) as client:
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    desktop = next(
+        row for row in _rows(desktops) if row["account_id"] == account_id
+    )
+    assert desktop["working"] is True
+    assert desktop["routines_stopped"] is False
+    _settle(AFTER_WINDOW)
+    kept = _runs_for(created["id"])
+    assert len(kept) == 1
+    assert kept[0]["status"] == "cancelled"
+    assert _chat_messages(bot_id) == []
+
+
+def test_unpause_before_the_minute_opens_that_minute(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, _computer, bot, created = _prepare_due_routine(
+        "reopen-minute@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    monkeypatch.setattr("server.bots.utc_now", lambda: BEFORE_DUE)
+    with _client(cookie) as client:
+        paused = _pause(client, bot["id"], created["id"], True)
+        assert paused.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "cancelled"
+    monkeypatch.setattr("server.bots.utc_now", lambda: STILL_BEFORE)
+    with _client(cookie) as client:
+        resumed = _pause(client, bot["id"], created["id"], False)
+        assert resumed.status_code == 200
+    assert _runs_for(created["id"]) == []
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    assert opened[0]["due_at"] == DUE
+    assert _chat_messages(bot_id) == []
+
+
+def test_next_local_date_opens_after_a_cancelled_mark(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, _computer, bot, created = _prepare_due_routine(
+        "next-date@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    monkeypatch.setattr("server.bots.utc_now", lambda: BEFORE_DUE)
+    with _client(cookie) as client:
+        paused = _pause(client, bot["id"], created["id"], True)
+        assert paused.status_code == 200
+    monkeypatch.setattr("server.bots.utc_now", lambda: AFTER_WINDOW)
+    with _client(cookie) as client:
+        resumed = _pause(client, bot["id"], created["id"], False)
+        assert resumed.status_code == 200
+    _settle(NEXT_DUE)
+    runs = {row["local_date"]: row for row in _runs_for(created["id"])}
+    assert runs[date(2026, 11, 18)]["status"] == "cancelled"
+    assert runs[date(2026, 11, 20)]["status"] == "pending"
+    assert runs[date(2026, 11, 20)]["due_at"] == NEXT_DUE
+    assert _chat_messages(bot_id) == []

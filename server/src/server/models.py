@@ -171,7 +171,7 @@ routine_runs = Table(
     Column("status", String(16), nullable=False),
     Column("claimed_at", DateTime(timezone=True), nullable=True),
     CheckConstraint(
-        "status IN ('pending', 'claimed', 'skipped')",
+        "status IN ('pending', 'claimed', 'skipped', 'cancelled')",
         name="routine_runs_status_check",
     ),
     UniqueConstraint("routine_id", "local_date"),

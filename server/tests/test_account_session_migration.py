@@ -81,6 +81,7 @@ ROUTINE_REVISION = "b7e2c4a91d58"
 PAUSED_REVISION = "a4f0c8e21b67"
 STOPPED_REVISION = "9e4b1c7a6d20"
 RUN_REVISION = "f7a2c6e81d04"
+CASCADE_REVISION = "a1c4e8b27d60"
 ROUTINE_RUN_COLUMNS = (
     "id",
     "routine_id",
@@ -91,7 +92,8 @@ ROUTINE_RUN_COLUMNS = (
 )
 ROUTINE_RUN_STATUS_CHECK = (
     "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
-    "'claimed'::character varying, 'skipped'::character varying])::text[])))"
+    "'claimed'::character varying, 'skipped'::character varying, "
+    "'cancelled'::character varying])::text[])))"
 )
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
@@ -171,7 +173,8 @@ def _revision_chain() -> list[str]:
     assert links[PAUSED_REVISION] == ROUTINE_REVISION
     assert links[STOPPED_REVISION] == PAUSED_REVISION
     assert links[RUN_REVISION] == STOPPED_REVISION
-    assert links[chain[-1]] == RUN_REVISION
+    assert links[CASCADE_REVISION] == RUN_REVISION
+    assert links[chain[-1]] == CASCADE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
@@ -181,6 +184,7 @@ def _revision_chain() -> list[str]:
     assert chain[-1] != PAUSED_REVISION
     assert chain[-1] != STOPPED_REVISION
     assert chain[-1] != RUN_REVISION
+    assert chain[-1] != CASCADE_REVISION
     return chain
 
 
@@ -755,7 +759,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     ] == [
         (
             "routine_runs_status_check",
-            "status IN ('pending', 'claimed', 'skipped')",
+            "status IN ('pending', 'claimed', 'skipped', 'cancelled')",
         )
     ]
     run_uniques = [
