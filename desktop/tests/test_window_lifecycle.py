@@ -2,7 +2,13 @@ import importlib
 
 import pytest
 
+from desktop.routine_gate import reset
 from desktop.window import PYSIDE6, PYWEBVIEW, open_cabinet
+
+
+@pytest.fixture(autouse=True)
+def _fresh_routine_gate() -> None:
+    reset()
 
 
 class _CloseEvent:
@@ -269,3 +275,203 @@ def test_pyside6_quit_command_stops_process(monkeypatch: pytest.MonkeyPatch) -> 
     assert [action.text for action in menu.actions] == ["Выйти"]
     menu.actions[0].triggered.slots[0]()
     assert codes == [0]
+
+
+def test_pywebview_close_leaves_a_routine_run_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import desktop.window as window_module
+    from desktop.routine_gate import routine_run_allowed
+
+    monkeypatch.setattr(window_module, "window_library", lambda: PYWEBVIEW)
+    _patch_pywebview_start(monkeypatch, lambda *args, **kwargs: None)
+    codes: list[int] = []
+    marks: list[bool] = []
+    hidden: list[str] = []
+    real_mark = window_module.mark_window_hidden
+
+    def marked() -> None:
+        assert hidden
+        marks.append(True)
+        real_mark()
+
+    monkeypatch.setattr(window_module, "mark_window_hidden", marked)
+    monkeypatch.setattr(window_module.os, "_exit", lambda code: codes.append(code))
+    webview = importlib.import_module("webview")
+    before = list(webview.windows)
+    try:
+        open_cabinet("http://cabinet.example")
+        window = webview.windows[-1]
+        window.gui = type("Gui", (), {"hide": lambda self, uid: hidden.append(uid)})()
+        window.events.shown.set()
+        cancelled = window.events.closing.set()
+    finally:
+        webview.windows[:] = before
+
+    assert cancelled is True
+    assert hidden == [window.uid]
+    assert marks == [True]
+    assert codes == []
+    assert routine_run_allowed() is True
+
+
+def test_pyside6_close_leaves_a_routine_run_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import desktop.window as window_module
+    from desktop.routine_gate import routine_run_allowed
+
+    monkeypatch.setattr(window_module, "window_library", lambda: PYSIDE6)
+    holder = _patch_pyside(monkeypatch)
+    codes: list[int] = []
+    marks: list[bool] = []
+    real_mark = window_module.mark_window_hidden
+
+    def marked() -> None:
+        assert holder["view"].hidden is True
+        marks.append(True)
+        real_mark()
+
+    monkeypatch.setattr(window_module, "mark_window_hidden", marked)
+    monkeypatch.setattr(window_module.os, "_exit", lambda code: codes.append(code))
+    open_cabinet("http://127.0.0.1:8766")
+    view = holder["view"]
+    event = _CloseEvent()
+    view.closeEvent(event)
+    assert event.ignored is True
+    assert view.hidden is True
+    assert marks == [True]
+    assert codes == []
+    assert routine_run_allowed() is True
+
+
+def test_quit_command_and_tray_exit_stop_a_routine_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import desktop.window as window_module
+    from desktop.routine_gate import reset, routine_run_allowed
+
+    monkeypatch.setattr(window_module, "window_library", lambda: PYSIDE6)
+    _patch_pyside(monkeypatch)
+    codes: list[int] = []
+    monkeypatch.setattr(window_module.os, "_exit", lambda code: codes.append(code))
+    open_cabinet("http://127.0.0.1:8766")
+    command = window_module.command_quit_action
+    assert routine_run_allowed() is True
+    assert command is not None
+    assert command.triggered.slots[0] is window_module._quit_command
+    command.triggered.slots[0]()
+    assert codes == [0]
+    assert routine_run_allowed() is False
+
+    reset()
+    open_cabinet("http://127.0.0.1:8766")
+    tray = window_module.tray_quit_action
+    assert routine_run_allowed() is True
+    assert tray is not None
+    assert tray.triggered.slots[0] is window_module._quit_from_tray
+    tray.triggered.slots[0]()
+    assert codes == [0, 0]
+    assert routine_run_allowed() is False
+
+
+def test_pywebview_quit_command_and_tray_exit_stop_a_routine_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from desktop.routine_gate import reset, routine_run_allowed
+    from desktop.window import _quit_command
+
+    monkeypatch.setattr("desktop.window.window_library", lambda: PYWEBVIEW)
+    recorded: dict[str, object] = {}
+
+    class NSObject:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+    class MenuItem:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithTitle_action_keyEquivalent_(self, title, action, key):
+            self.title = title
+            self.action = action
+            self.key = key
+            recorded["command"] = self
+            return self
+
+        def setTarget_(self, target) -> None:
+            self.target = target
+
+    class Menu:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            self.items = []
+            return self
+
+        def addItem_(self, item) -> None:
+            self.items.append(item)
+
+    class StatusItem:
+        def __init__(self) -> None:
+            self.menu = None
+
+        def setMenu_(self, menu) -> None:
+            self.menu = menu
+
+        def button(self):
+            return None
+
+    class StatusBar:
+        @staticmethod
+        def systemStatusBar():
+            return StatusBar()
+
+        def statusItemWithLength_(self, length):
+            return StatusItem()
+
+    appkit = importlib.import_module("AppKit")
+    monkeypatch.setattr(appkit, "NSObject", NSObject)
+    monkeypatch.setattr(appkit, "NSMenuItem", MenuItem)
+    monkeypatch.setattr(appkit, "NSMenu", Menu)
+    monkeypatch.setattr(appkit, "NSStatusBar", StatusBar)
+    monkeypatch.setattr(appkit, "NSVariableStatusItemLength", -1)
+
+    def start(func=None, *args, **kwargs) -> None:
+        if func is not None:
+            func()
+
+    _patch_pywebview_start(monkeypatch, start)
+    codes: list[int] = []
+    monkeypatch.setattr("desktop.window.os._exit", lambda code: codes.append(code))
+    webview = importlib.import_module("webview")
+    before = list(webview.windows)
+    try:
+        open_cabinet("http://cabinet.example")
+        window = webview.windows[-1]
+        action = window.menu[0].items[0]
+        assert action.title == "Выйти"
+        assert action.function is _quit_command
+        assert routine_run_allowed() is True
+        action.function()
+        assert codes == [0]
+        assert routine_run_allowed() is False
+
+        reset()
+        open_cabinet("http://cabinet.example")
+        command = recorded["command"]
+        assert command.title == "Выйти"
+        assert routine_run_allowed() is True
+        command.target.quit_(None)
+    finally:
+        webview.windows[:] = before
+
+    assert codes == [0, 0]
+    assert routine_run_allowed() is False

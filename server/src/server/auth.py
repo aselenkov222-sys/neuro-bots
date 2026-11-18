@@ -388,6 +388,11 @@ def logout(request: Request) -> JSONResponse:
         if current is None:
             removed = False
         else:
+            from server.desktops import stop_routines_for_working_logout
+
+            stop_routines_for_working_logout(
+                connection, current[1]["id"], current[0]["id"], now
+            )
             delete_session(connection, current[0]["id"])
             removed = True
     if not removed:

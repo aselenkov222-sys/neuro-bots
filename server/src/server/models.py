@@ -1,7 +1,9 @@
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -9,6 +11,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    Time,
     UniqueConstraint,
     Uuid,
     text,
@@ -127,6 +130,13 @@ desktops = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("timezone", Text(), nullable=True),
     Column("last_pulse_at", DateTime(timezone=True), nullable=True),
+    Column("session_id", Uuid(), nullable=True),
+    Column(
+        "routines_stopped",
+        Boolean(),
+        nullable=False,
+        server_default=text("false"),
+    ),
     UniqueConstraint("account_id", "computer_id"),
     Index(
         "desktops_one_working",
@@ -134,4 +144,35 @@ desktops = Table(
         unique=True,
         postgresql_where=text("working"),
     ),
+)
+
+routines = Table(
+    "routines",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
+    Column("weekdays", ARRAY(Integer()), nullable=False),
+    Column("time_of_day", Time(timezone=False), nullable=False),
+    Column("paused", Boolean(), nullable=False, server_default=text("false")),
+)
+
+routine_runs = Table(
+    "routine_runs",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column(
+        "routine_id",
+        Uuid(),
+        ForeignKey("routines.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("local_date", Date(), nullable=False),
+    Column("due_at", DateTime(timezone=True), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("claimed_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "status IN ('pending', 'claimed', 'skipped', 'cancelled', 'failed')",
+        name="routine_runs_status_check",
+    ),
+    UniqueConstraint("routine_id", "local_date"),
 )

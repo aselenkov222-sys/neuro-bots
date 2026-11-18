@@ -7,8 +7,7 @@ from server.app import app
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 REMOVED = (
-    "рутин",
-    "Рутин",
+    "Проверить сейчас",
     "библиотек",
     "Библиотек",
     "Главный",
@@ -71,17 +70,30 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
         assert "Почта" in login and "Пароль" in login
         assert "Войти" in login and 'href="#register"' in login
 
-        bots = _screen(script, "botsScreen", "function botScreen(")
+        bots = _screen(script, "botsScreen", "function routineLocked(")
         assert 'id="create-name"' in bots
         assert 'id="create-desc"' in bots
         assert 'id="create-scenario"' in bots
         assert 'picker("create"' in bots
 
-        card = _screen(script, "botScreen", "function messageHtml(")
+        card = _screen(script, "routineBlock", "function messageHtml(")
         assert 'id="bot-name"' in card
         assert 'id="bot-desc"' in card
         assert 'id="scenario"' in card
         assert 'picker("card"' in card
+        assert "${routineBlock()}" in card
+        assert "${day.short}" in card
+        days = script.split("const DAYS = [", 1)[1].split("];", 1)[0]
+        shown = days + card
+        for label in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"):
+            assert label in shown
+        assert 'id="routine-time"' in card
+        assert "Пауза" in card
+        assert "Своего текста у рутины нет." in card
+        start = script.index(card)
+        remainder = script[:start] + script[start + len(card):]
+        for piece in ("рутин", "Рутин"):
+            assert piece not in remainder
         assert "pick-color" in script
         assert "pick-icon" in script
         assert "#c85a12" in script
@@ -92,3 +104,7 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
         assert 'id="composer"' in chat
         assert 'data-form="send"' in chat
         assert 'type="text"' in chat
+        for piece in ("рутин", "Рутин"):
+            assert piece not in tariff
+            assert piece not in bots
+            assert piece not in chat

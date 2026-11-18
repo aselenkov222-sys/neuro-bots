@@ -110,6 +110,48 @@ def store_desktop(
     return stored
 
 
+def remember_signed_in_session(
+    connection: Connection,
+    desktop_id: uuid.UUID,
+    session_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    current = (
+        connection.execute(select(desktops).where(desktops.c.id == desktop_id))
+        .mappings()
+        .one()
+    )
+    was_stopped = current["routines_stopped"] is True
+    connection.execute(
+        desktops.update()
+        .where(desktops.c.id == desktop_id)
+        .values(session_id=session_id, routines_stopped=False)
+    )
+    if was_stopped:
+        from server.routines import release_account_routines
+
+        release_account_routines(connection, current["account_id"], now)
+
+
+def stop_routines_for_working_logout(
+    connection: Connection,
+    account_id: uuid.UUID,
+    session_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    desktop = _working_desktop(connection, account_id)
+    if desktop is None or desktop["session_id"] != session_id:
+        return
+    connection.execute(
+        desktops.update()
+        .where(desktops.c.id == desktop["id"])
+        .values(session_id=None, routines_stopped=True)
+    )
+    from server.routines import cancel_account_routines
+
+    cancel_account_routines(connection, account_id, now)
+
+
 async def read_computer_id(request: Request) -> uuid.UUID | JSONResponse:
     try:
         body = await request.json()
@@ -141,6 +183,7 @@ async def post_desktop(request: Request) -> JSONResponse:
             return computer_id
         session, account = current
         row = store_desktop(connection, account["id"], computer_id, now)
+        remember_signed_in_session(connection, row["id"], session["id"], now)
         touch_session(connection, session["id"], now)
         document = {"id": str(row["computer_id"]), "working": row["working"]}
     return JSONResponse(document)
@@ -200,6 +243,7 @@ async def post_pulse(request: Request, computer_id: str) -> JSONResponse:
         timezone_name = await read_timezone(request)
         if isinstance(timezone_name, JSONResponse):
             return timezone_name
+        was_stopped = row["routines_stopped"] is True
         connection.execute(
             desktops.update()
             .where(
@@ -207,7 +251,16 @@ async def post_pulse(request: Request, computer_id: str) -> JSONResponse:
                 desktops.c.account_id == account["id"],
                 desktops.c.working.is_(True),
             )
-            .values(timezone=timezone_name, last_pulse_at=now)
+            .values(
+                timezone=timezone_name,
+                last_pulse_at=now,
+                session_id=session["id"],
+                routines_stopped=False,
+            )
         )
+        if was_stopped:
+            from server.routines import release_account_routines
+
+            release_account_routines(connection, account["id"], now)
         touch_session(connection, session["id"], now)
     return JSONResponse({"timezone": timezone_name})
