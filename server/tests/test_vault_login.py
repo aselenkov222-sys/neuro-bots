@@ -204,6 +204,22 @@ def _database_text() -> str:
     return "\n".join(chunks)
 
 
+def _public_tables() -> list[str]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            return list(
+                connection.execute(
+                    text(
+                        "SELECT tablename FROM pg_tables "
+                        "WHERE schemaname = 'public' ORDER BY tablename"
+                    )
+                ).scalars()
+            )
+    finally:
+        engine.dispose()
+
+
 class _Grab(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
@@ -328,6 +344,7 @@ def test_named_record_is_filled_on_the_desktop_and_stays_off_the_server(
         )
         assert posted.status_code == 200
         assert posted.json()["messages"][-1]["role"] == "user"
+        assert SECRET not in posted.request.content.decode()
         refused = client.post(
             f"/api/desktops/{computer}/browser-task",
             json={"text": PAGE, "login": "entered", "password": SECRET, "cookie": COOKIE},
@@ -363,6 +380,11 @@ def test_named_record_is_filled_on_the_desktop_and_stays_off_the_server(
     assert COOKIE not in stored
     assert PAGE not in stored
     assert STUB in stored
+    tables = _public_tables()
+    assert tables
+    assert all("vault" not in name for name in tables)
+    models = (REPO / "server" / "src" / "server" / "models.py").read_text(encoding="utf-8")
+    assert "vault" not in models
     assert _used(account_id) == 1
     assert len(_rows(quota_charges)) >= 1
 
