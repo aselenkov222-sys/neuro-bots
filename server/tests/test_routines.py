@@ -1364,7 +1364,7 @@ def test_next_local_date_opens_after_a_cancelled_mark(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _refuse_aggregator(monkeypatch)
-    cookie, _account_id, _computer, bot, created = _prepare_due_routine(
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
         "next-date@example.com"
     )
     bot_id = uuid.UUID(bot["id"])
@@ -1376,9 +1376,167 @@ def test_next_local_date_opens_after_a_cancelled_mark(
     with _client(cookie) as client:
         resumed = _pause(client, bot["id"], created["id"], False)
         assert resumed.status_code == 200
+    _pulse_at(cookie, computer, NEXT_DUE, monkeypatch)
     _settle(NEXT_DUE)
     runs = {row["local_date"]: row for row in _runs_for(created["id"])}
     assert runs[date(2026, 11, 18)]["status"] == "cancelled"
     assert runs[date(2026, 11, 20)]["status"] == "pending"
     assert runs[date(2026, 11, 20)]["due_at"] == NEXT_DUE
+    assert _chat_messages(bot_id) == []
+
+
+STALE_PULSE = datetime(2026, 11, 18, 5, 29, tzinfo=timezone.utc)
+
+
+def _pulse_at(
+    cookie: str,
+    computer: uuid.UUID,
+    moment: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("server.desktops.utc_now", lambda: moment)
+    with _client(cookie) as client:
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+
+
+def _set_desktop(account_id: uuid.UUID, **values: object) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                desktops.update()
+                .where(desktops.c.account_id == account_id)
+                .values(**values)
+            )
+    finally:
+        engine.dispose()
+
+
+def test_stale_pulse_skips_at_the_minute_and_claim_returns_nothing(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "stale-pulse@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _pulse_at(cookie, computer, STALE_PULSE, monkeypatch)
+    stored = next(row for row in _rows(desktops) if row["account_id"] == account_id)
+    assert stored["last_pulse_at"] == STALE_PULSE
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "skipped"
+    assert runs[0]["due_at"] == DUE
+    assert runs[0]["local_date"] == date(2026, 11, 18)
+    messages = _chat_messages(bot_id)
+    assert len(messages) == 1
+    assert messages[0]["role"] == "error"
+    assert messages[0]["code"] == "routine_skipped"
+    assert messages[0]["text"] == SKIP_TEXT
+    monkeypatch.setattr("server.routines.utc_now", lambda: DUE)
+    with _client(cookie) as client:
+        claimed = client.post(
+            f"/api/desktops/{computer}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+    assert claimed.status_code == 204
+    assert claimed.content == b""
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"]) == runs
+    assert _chat_messages(bot_id) == messages
+
+
+def test_missing_working_desktop_skips_at_the_minute(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    _cookie, account_id, _computer, bot, created = _prepare_due_routine(
+        "no-working@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_desktop(account_id, working=False)
+    stored = next(row for row in _rows(desktops) if row["account_id"] == account_id)
+    assert stored["working"] is False
+    assert stored["timezone"] == "Europe/Moscow"
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "skipped"
+    assert runs[0]["due_at"] == DUE
+    messages = _chat_messages(bot_id)
+    assert len(messages) == 1
+    assert messages[0]["text"] == SKIP_TEXT
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"]) == runs
+    assert _chat_messages(bot_id) == messages
+
+
+def test_fresh_pulse_opens_the_claim_window(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "fresh-pulse@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    stored = next(row for row in _rows(desktops) if row["account_id"] == account_id)
+    assert stored["last_pulse_at"] == DUE
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    assert opened[0]["due_at"] == DUE
+    assert _chat_messages(bot_id) == []
+    _settle(SKIP_AT)
+    skipped = _runs_for(created["id"])
+    assert len(skipped) == 1
+    assert skipped[0]["status"] == "skipped"
+    messages = _chat_messages(bot_id)
+    assert len(messages) == 1
+    assert messages[0]["text"] == SKIP_TEXT
+
+
+def test_paused_routine_with_a_stale_pulse_writes_no_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "paused-stale@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _pulse_at(cookie, computer, STALE_PULSE, monkeypatch)
+    monkeypatch.setattr("server.bots.utc_now", lambda: STALE_PULSE)
+    with _client(cookie) as client:
+        paused = _pause(client, bot["id"], created["id"], True)
+        assert paused.status_code == 200
+        assert paused.json()["paused"] is True
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "cancelled"
+    assert _chat_messages(bot_id) == []
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "cancelled"
+    assert _chat_messages(bot_id) == []
+
+
+def test_account_without_an_accepted_timezone_writes_no_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    _cookie, account_id, _computer, bot, created = _prepare_due_routine(
+        "no-zone@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_desktop(account_id, working=False, timezone=None)
+    _settle(DUE)
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"]) == []
     assert _chat_messages(bot_id) == []

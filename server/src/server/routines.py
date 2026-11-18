@@ -26,7 +26,15 @@ from server.desktops import (
     parse_path_computer_id,
     timezone_name_accepted,
 )
-from server.models import accounts, bots, chats, messages, routine_runs, routines
+from server.models import (
+    accounts,
+    bots,
+    chats,
+    desktops,
+    messages,
+    routine_runs,
+    routines,
+)
 
 router = APIRouter()
 
@@ -38,6 +46,7 @@ INVALID_PAUSE = "Нужен признак паузы."
 SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
 SKIP_CODE = "routine_skipped"
 CLAIM_WAIT = timedelta(seconds=60)
+PULSE_INTERVAL = timedelta(seconds=30)
 _CLOCK = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
@@ -107,6 +116,39 @@ def _aware(moment: datetime) -> datetime:
     if moment.tzinfo is None:
         return moment.replace(tzinfo=timezone.utc)
     return moment.astimezone(timezone.utc)
+
+
+def _accepted_zone(value: object) -> str | None:
+    if not isinstance(value, str) or not timezone_name_accepted(value):
+        return None
+    return value
+
+
+def _process_alive(last_pulse_at: datetime | None, now: datetime) -> bool:
+    if last_pulse_at is None:
+        return False
+    return _aware(last_pulse_at) >= _aware(now) - PULSE_INTERVAL
+
+
+def _schedule_desktop(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> tuple[str | None, bool]:
+    desktop = find_working_desktop(connection, account_id)
+    if desktop is not None:
+        return (
+            _accepted_zone(desktop["timezone"]),
+            _process_alive(desktop["last_pulse_at"], now),
+        )
+    stored = connection.execute(
+        select(desktops.c.timezone)
+        .where(desktops.c.account_id == account_id)
+        .order_by(desktops.c.id.asc())
+    ).scalars()
+    for zone in stored:
+        accepted = _accepted_zone(zone)
+        if accepted is not None:
+            return accepted, False
+    return None, False
 
 
 def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
@@ -267,6 +309,41 @@ def release_account_routines(
         release_routine_today(connection, routine, account_id, now)
 
 
+def _skip_unclaimed(
+    connection: Connection,
+    routine_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    local_date: date,
+    due_at: datetime,
+    now: datetime,
+    existing: RowMapping | None,
+) -> None:
+    if existing is None:
+        connection.execute(
+            routine_runs.insert().values(
+                id=uuid.uuid4(),
+                routine_id=routine_id,
+                local_date=local_date,
+                due_at=due_at,
+                status="skipped",
+            )
+        )
+        _write_skip(connection, bot_id, now)
+        return
+    if existing["status"] != "pending":
+        return
+    updated = connection.execute(
+        routine_runs.update()
+        .where(
+            routine_runs.c.id == existing["id"],
+            routine_runs.c.status == "pending",
+        )
+        .values(status="skipped")
+    )
+    if updated.rowcount == 1:
+        _write_skip(connection, bot_id, now)
+
+
 def _settle_occurrence(
     connection: Connection,
     routine_id: uuid.UUID,
@@ -276,25 +353,39 @@ def _settle_occurrence(
     now: datetime,
     *,
     allowed: bool,
+    claimable: bool,
 ) -> None:
     if not allowed:
         if now >= due_at:
             _ensure_cancelled(connection, routine_id, local_date, due_at)
         return
     existing = _run_row(connection, routine_id, local_date)
+    if existing is not None and existing["status"] != "pending":
+        return
+    if not claimable:
+        if now >= due_at:
+            _skip_unclaimed(
+                connection,
+                routine_id,
+                bot_id,
+                local_date,
+                due_at,
+                now,
+                existing,
+            )
+        return
     deadline = due_at + CLAIM_WAIT
     if existing is None:
         if now >= deadline:
-            connection.execute(
-                routine_runs.insert().values(
-                    id=uuid.uuid4(),
-                    routine_id=routine_id,
-                    local_date=local_date,
-                    due_at=due_at,
-                    status="skipped",
-                )
+            _skip_unclaimed(
+                connection,
+                routine_id,
+                bot_id,
+                local_date,
+                due_at,
+                now,
+                None,
             )
-            _write_skip(connection, bot_id, now)
             return
         if now >= due_at:
             connection.execute(
@@ -307,18 +398,17 @@ def _settle_occurrence(
                 )
             )
         return
-    if existing["status"] != "pending" or now < deadline:
+    if now < deadline:
         return
-    updated = connection.execute(
-        routine_runs.update()
-        .where(
-            routine_runs.c.id == existing["id"],
-            routine_runs.c.status == "pending",
-        )
-        .values(status="skipped")
+    _skip_unclaimed(
+        connection,
+        routine_id,
+        bot_id,
+        local_date,
+        due_at,
+        now,
+        existing,
     )
-    if updated.rowcount == 1:
-        _write_skip(connection, bot_id, now)
 
 
 def settle_due(connection: Connection, now: datetime) -> None:
@@ -342,8 +432,8 @@ def settle_due(connection: Connection, now: datetime) -> None:
         allowed = routine_may_start(
             row, working_routines_stopped(connection, account_id)
         )
-        zone = working_desktop_zone(connection, account_id)
-        if zone is None or not timezone_name_accepted(zone):
+        zone, claimable = _schedule_desktop(connection, account_id, moment)
+        if zone is None:
             continue
         local = moment.astimezone(ZoneInfo(zone))
         if local.isoweekday() not in {int(day) for day in row["weekdays"]}:
@@ -359,6 +449,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
             due_at,
             moment,
             allowed=allowed,
+            claimable=claimable,
         )
 
 
