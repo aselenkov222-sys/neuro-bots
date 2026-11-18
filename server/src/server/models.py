@@ -129,6 +129,13 @@ desktops = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("timezone", Text(), nullable=True),
     Column("last_pulse_at", DateTime(timezone=True), nullable=True),
+    Column("session_id", Uuid(), nullable=True),
+    Column(
+        "routines_stopped",
+        Boolean(),
+        nullable=False,
+        server_default=text("false"),
+    ),
     UniqueConstraint("account_id", "computer_id"),
     Index(
         "desktops_one_working",

@@ -76,6 +76,19 @@ def starts_when_due(row: Mapping[str, object]) -> bool:
     return row["paused"] is not True
 
 
+def working_routines_stopped(
+    connection: Connection, account_id: uuid.UUID
+) -> bool:
+    desktop = find_working_desktop(connection, account_id)
+    if desktop is None:
+        return False
+    return desktop["routines_stopped"] is True
+
+
+def routine_may_start(row: Mapping[str, object], stopped: bool) -> bool:
+    return starts_when_due(row) and not stopped
+
+
 def routine_document(row: RowMapping) -> dict[str, object]:
     return {
         "id": str(row["id"]),

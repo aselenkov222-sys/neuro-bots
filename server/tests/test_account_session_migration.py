@@ -66,6 +66,8 @@ DESKTOP_COLUMNS = (
     "created_at",
     "timezone",
     "last_pulse_at",
+    "session_id",
+    "routines_stopped",
 )
 ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day", "paused")
 ACCOUNT_REVISION = "3c87a0f84d5e"
@@ -75,6 +77,7 @@ SUBSCRIPTION_REVISION = "c54ff0c6fb42"
 DESKTOP_REVISION = "78372be7d547"
 PULSE_REVISION = "f524099440d0"
 ROUTINE_REVISION = "b7e2c4a91d58"
+PAUSED_REVISION = "a4f0c8e21b67"
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
@@ -150,13 +153,15 @@ def _revision_chain() -> list[str]:
     assert links[DESKTOP_REVISION] == SUBSCRIPTION_REVISION
     assert links[PULSE_REVISION] == DESKTOP_REVISION
     assert links[ROUTINE_REVISION] == PULSE_REVISION
-    assert links[chain[-1]] == ROUTINE_REVISION
+    assert links[PAUSED_REVISION] == ROUTINE_REVISION
+    assert links[chain[-1]] == PAUSED_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
     assert chain[-1] != DESKTOP_REVISION
     assert chain[-1] != PULSE_REVISION
     assert chain[-1] != ROUTINE_REVISION
+    assert chain[-1] != PAUSED_REVISION
     return chain
 
 
@@ -647,6 +652,12 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=True,
         timezone=True,
     )
+    _assert_model_column(desktops.c.session_id, Uuid, nullable=True)
+    assert isinstance(desktops.c.routines_stopped.type, Boolean)
+    assert desktops.c.routines_stopped.nullable is False
+    assert desktops.c.routines_stopped.default is None
+    assert desktops.c.routines_stopped.server_default.arg.text == "false"
+    assert list(desktops.c.routines_stopped.foreign_keys) == []
     unique_constraints = [
         constraint
         for constraint in desktops.constraints
@@ -1048,6 +1059,13 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "timestamp with time zone",
                     not_null=False,
                 )
+                _assert_catalog_column(
+                    desktop_columns, "session_id", "uuid", "uuid", not_null=False
+                )
+                assert desktop_columns["routines_stopped"]["type_name"] == "bool"
+                assert desktop_columns["routines_stopped"]["format_type"] == "boolean"
+                assert desktop_columns["routines_stopped"]["not_null"] is True
+                assert desktop_columns["routines_stopped"]["column_default"] == "false"
                 assert _constraints(connection, "desktops") == {
                     ("p", "PRIMARY KEY (id)"),
                     ("u", "UNIQUE (account_id, computer_id)"),

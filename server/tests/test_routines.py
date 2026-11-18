@@ -13,7 +13,13 @@ from server.app import app
 from server.config import development_tariff
 from server.db import create_db_engine, metadata
 from server.models import accounts, bots, chats, desktops, messages, routines, sessions
-from server.routines import appointed_utc, starts_when_due, working_desktop_zone
+from server.routines import (
+    appointed_utc,
+    routine_may_start,
+    starts_when_due,
+    working_desktop_zone,
+    working_routines_stopped,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -719,3 +725,154 @@ def test_pause_blocks_a_start_and_writes_no_chat_message(
         assert starts_when_due(released) is True
         assert released["time_of_day"] == time(9, 0)
         assert _chat_messages(bot_id) == []
+
+
+def _account_desktops(account_id: uuid.UUID) -> list[dict]:
+    return [row for row in _rows(desktops) if row["account_id"] == account_id]
+
+
+def _stopped(account_id: uuid.UUID) -> bool:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            return working_routines_stopped(connection, account_id)
+    finally:
+        engine.dispose()
+
+
+def _login(email: str) -> TestClient:
+    client = TestClient(app)
+    logged = client.post(
+        "/api/login",
+        json={"email": email, "password": ACCEPTED},
+        headers={"Origin": ORIGIN},
+    )
+    assert logged.status_code == 200
+    return client
+
+
+def test_working_desktop_logout_stops_routines_and_keeps_the_role(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_complete(*args: object, **kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", fail_complete)
+    email = "working-logout@example.com"
+    cookie, account_id = _open_account(email, confirmed=True)
+    assert _stopped(account_id) is False
+    working_computer = uuid.uuid4()
+    other_computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        live = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3], "time": "09:00"}
+        )
+        held = _create_routine(
+            client, bot["id"], {"weekdays": [2], "time": "10:00"}
+        )
+        assert live.status_code == 200
+        assert held.status_code == 200
+        paused = _pause(client, bot["id"], held.json()["id"], True)
+        assert paused.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(working_computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        assert posted.json() == {"id": str(working_computer), "working": True}
+    bot_id = uuid.UUID(bot["id"])
+    assert _chat_messages(bot_id) == []
+
+    with _login(email) as other:
+        second = other.post(
+            "/api/desktops",
+            json={"id": str(other_computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert second.status_code == 200
+        assert second.json() == {"id": str(other_computer), "working": False}
+        signed_out = other.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+
+    rows = {row["computer_id"]: row for row in _account_desktops(account_id)}
+    assert rows[working_computer]["working"] is True
+    assert rows[working_computer]["routines_stopped"] is False
+    assert rows[working_computer]["session_id"] == uuid.UUID(cookie)
+    assert rows[other_computer]["working"] is False
+    assert rows[other_computer]["routines_stopped"] is False
+    assert _stopped(account_id) is False
+
+    with _client(cookie) as client:
+        signed_out = client.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+    stopped_rows = {
+        row["computer_id"]: row for row in _account_desktops(account_id)
+    }
+    assert len(stopped_rows) == 2
+    working = stopped_rows[working_computer]
+    assert working["working"] is True
+    assert working["routines_stopped"] is True
+    assert working["session_id"] is None
+    assert stopped_rows[other_computer]["working"] is False
+    assert stopped_rows[other_computer]["routines_stopped"] is False
+    stored = {row["time_of_day"]: row for row in _account_routines(account_id)}
+    assert stored[time(9, 0)]["paused"] is False
+    assert stored[time(10, 0)]["paused"] is True
+    assert starts_when_due(stored[time(9, 0)]) is True
+    assert starts_when_due(stored[time(10, 0)]) is False
+    stopped = _stopped(account_id)
+    assert stopped is True
+    assert routine_may_start(stored[time(9, 0)], stopped) is False
+    assert routine_may_start(stored[time(10, 0)], stopped) is False
+    assert _chat_messages(bot_id) == []
+
+    with _login(email) as resumed:
+        pulsed = resumed.post(
+            f"/api/desktops/{working_computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+        resumed_rows = {
+            row["computer_id"]: row for row in _account_desktops(account_id)
+        }
+        assert resumed_rows[working_computer]["working"] is True
+        assert resumed_rows[working_computer]["routines_stopped"] is False
+        pulse_session = resumed.cookies.get("session")
+        assert isinstance(pulse_session, str)
+        assert resumed_rows[working_computer]["session_id"] == uuid.UUID(pulse_session)
+        after_pulse = {
+            row["time_of_day"]: row for row in _account_routines(account_id)
+        }
+        assert after_pulse[time(9, 0)]["paused"] is False
+        assert after_pulse[time(10, 0)]["paused"] is True
+        running = _stopped(account_id)
+        assert running is False
+        assert routine_may_start(after_pulse[time(9, 0)], running) is True
+        assert routine_may_start(after_pulse[time(10, 0)], running) is False
+        assert _chat_messages(bot_id) == []
+        signed_out = resumed.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+    assert _stopped(account_id) is True
+    with _login(email) as returned:
+        posted = returned.post(
+            "/api/desktops",
+            json={"id": str(working_computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        assert posted.json() == {"id": str(working_computer), "working": True}
+    restored = {
+        row["computer_id"]: row for row in _account_desktops(account_id)
+    }
+    assert restored[working_computer]["working"] is True
+    assert restored[working_computer]["routines_stopped"] is False
+    finished = {row["time_of_day"]: row for row in _account_routines(account_id)}
+    assert finished[time(10, 0)]["paused"] is True
+    allowed = _stopped(account_id)
+    assert allowed is False
+    assert routine_may_start(finished[time(9, 0)], allowed) is True
+    assert routine_may_start(finished[time(10, 0)], allowed) is False
+    assert _chat_messages(bot_id) == []
