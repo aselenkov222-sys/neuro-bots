@@ -361,7 +361,9 @@ function routineBlock() {
     : routine && typeof routine.time === "string" ? routine.time : state.routineTime;
   const paused = routine ? routine.paused === true : false;
   const warn = hold
-    ? `<p class="warn" id="routine-warn" role="status">В это время уже стоит рутина бота «${esc(hold.name)}». Она создана раньше и пойдёт первой. Эта выполнит весь сценарий после неё.</p>
+    ? `<p class="warn" id="routine-warn" role="status">${hold.otherGoesFirst
+      ? `В это время уже стоит рутина бота «${esc(hold.name)}». Она создана раньше и пойдёт первой. Эта выполнит весь сценарий после неё.`
+      : `В это время уже стоит рутина бота «${esc(hold.name)}». Раньше создана эта рутина, и она пойдёт первой. Рутина бота «${esc(hold.name)}» выполнит весь сценарий после неё.`}</p>
        <button type="button" class="btn-green" data-action="keep-routine-time">Оставить это время</button>`
     : "";
   const days = DAYS.map((day) => `
@@ -566,11 +568,13 @@ async function accountRoutines() {
     if (!routines.ok || !Array.isArray(routines.data)) return null;
     for (const routine of routines.data) {
       if (!routine || typeof routine.id !== "string") continue;
+      if (typeof routine.created_at !== "string") continue;
       found.push({
         id: routine.id,
         name: bot.name,
         weekdays: routine.weekdays,
-        time: routine.time
+        time: routine.time,
+        created_at: routine.created_at
       });
     }
   }
@@ -583,12 +587,24 @@ async function proposeRoutine(body, routineId) {
     render();
     return;
   }
-  const clash = others.find((item) => {
+  const overlaps = others.filter((item) => {
     if (routineId && item.id === routineId) return false;
     return schedulesOverlap(body.weekdays, body.time, item.weekdays, item.time);
   });
-  if (clash) {
-    state.routineHold = { body, routineId: routineId || null, name: clash.name };
+  if (overlaps.length > 0) {
+    const earliest = overlaps.reduce((best, item) => (
+      Date.parse(item.created_at) < Date.parse(best.created_at) ? item : best
+    ));
+    const saved = routineId
+      ? others.find((item) => item.id === routineId)
+      : null;
+    const savedAt = saved ? Date.parse(saved.created_at) : Number.POSITIVE_INFINITY;
+    state.routineHold = {
+      body,
+      routineId: routineId || null,
+      name: earliest.name,
+      otherGoesFirst: savedAt > Date.parse(earliest.created_at)
+    };
     render();
     return;
   }

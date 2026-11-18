@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
-from server.accounts import touch_session, utc_now
+from server.accounts import format_utc, touch_session, utc_now
 from server.auth import (
     begin,
     current_account,
@@ -232,6 +232,24 @@ def queue_text(name: str) -> str:
     return f"Ждёт бота «{name}»."
 
 
+def _queue_note_since(
+    connection: Connection, bot_id: uuid.UUID, due_at: datetime
+) -> bool:
+    return (
+        connection.execute(
+            select(messages.c.id)
+            .join(chats, chats.c.id == messages.c.chat_id)
+            .where(
+                chats.c.bot_id == bot_id,
+                messages.c.code == QUEUE_CODE,
+                messages.c.updated_at >= _aware(due_at),
+            )
+            .limit(1)
+        ).first()
+        is not None
+    )
+
+
 def _note_queue(
     connection: Connection,
     account_id: uuid.UUID,
@@ -242,7 +260,10 @@ def _note_queue(
         select(bots.c.name).where(bots.c.id == holder_bot_id)
     ).scalar_one()
     waiting = connection.execute(
-        select(routines.c.bot_id)
+        select(
+            routines.c.bot_id,
+            func.min(routine_runs.c.due_at).label("due_at"),
+        )
         .join(routine_runs, routine_runs.c.routine_id == routines.c.id)
         .join(bots, bots.c.id == routines.c.bot_id)
         .where(
@@ -251,9 +272,12 @@ def _note_queue(
             routine_runs.c.status == "pending",
             routine_runs.c.due_at > _aware(now) - CLAIM_WAIT,
         )
-    ).scalars()
+        .group_by(routines.c.bot_id)
+    ).all()
     text = queue_text(str(name))
-    for bot_id in waiting:
+    for bot_id, due_at in waiting:
+        if _queue_note_since(connection, bot_id, due_at):
+            continue
         _write_chat_error(connection, bot_id, now, QUEUE_CODE, text)
 
 
@@ -831,6 +855,7 @@ def routine_document(row: RowMapping) -> dict[str, object]:
         "weekdays": sorted(int(day) for day in row["weekdays"]),
         "time": format_clock(row["time_of_day"]),
         "paused": row["paused"] is True,
+        "created_at": format_utc(row["created_at"]),
     }
 
 

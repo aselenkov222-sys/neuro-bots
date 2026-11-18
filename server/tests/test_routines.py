@@ -57,7 +57,7 @@ ROUTINE_COLUMNS = (
     "paused",
     "created_at",
 )
-ROUTINE_FIELDS = ("id", "weekdays", "time", "paused")
+ROUTINE_FIELDS = ("id", "weekdays", "time", "paused", "created_at")
 INVALID_PAUSE = {"code": "invalid_request", "message": "Нужен признак паузы."}
 INVALID_ROUTINE = {
     "code": "invalid_routine",
@@ -2292,6 +2292,68 @@ def test_waiting_bot_is_told_once_who_holds_the_browser(
         STUB_TEXT,
     ]
     assert sum(row["code"] == "routine_queue" for row in after) == 1
+
+
+def test_two_runs_of_one_bot_get_one_queue_message(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("queue-same-bot@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Один", "сценарий")
+        first = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        second = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+    _desktop(cookie, computer)
+    claimed = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert claimed.status_code == 200
+    spoken = _chat_messages(uuid.UUID(bot["id"]))
+    assert sum(row["code"] == "routine_queue" for row in spoken) == 1
+    assert sum(row["role"] == "assistant" for row in spoken) == 1
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 200
+    after = _chat_messages(uuid.UUID(bot["id"]))
+    assert sum(row["code"] == "routine_queue" for row in after) == 1
+    assert [row["text"] for row in after if row["code"] == "routine_queue"] == [
+        "Ждёт бота «Один»."
+    ]
+
+
+def test_a_later_claim_does_not_repeat_the_queue_message(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("queue-three@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        second = _create_bot(client, "Второй", "сценарий второго")
+        third = _create_bot(client, "Третий", "сценарий третьего")
+        for bot in (first, second, third):
+            created = _create_routine(
+                client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+            )
+            assert created.status_code == 200
+    _desktop(cookie, computer)
+    opened = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert opened.status_code == 200
+    assert opened.json()["bot_id"] == first["id"]
+    for bot_id in (second["id"], third["id"]):
+        waiting = _chat_messages(uuid.UUID(bot_id))
+        assert [row["text"] for row in waiting] == ["Ждёт бота «Первый»."]
+        assert [row["code"] for row in waiting] == ["routine_queue"]
+    middle = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert middle.status_code == 200
+    assert middle.json()["bot_id"] == second["id"]
+    still = _chat_messages(uuid.UUID(third["id"]))
+    assert [row["text"] for row in still] == ["Ждёт бота «Первый»."]
+    assert sum(row["code"] == "routine_queue" for row in still) == 1
 
 
 def _checks(bot_id: uuid.UUID) -> list[dict]:

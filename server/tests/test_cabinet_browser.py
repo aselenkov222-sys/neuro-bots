@@ -525,6 +525,52 @@ def test_browser_warns_before_saving_a_taken_time(database: None) -> None:
             assert page.locator("#routine-warn").count() == 0
             assert page.locator(".day.is-on").inner_text() == "Пн"
             assert page.locator("[data-action='toggle-pause']").is_enabled()
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.locator(".bot-card", has_text="Ранний").click()
+            page.wait_for_selector("#bot-name")
+            name = page.locator("#bot-name")
+            name.fill("Ранний-2")
+            name.blur()
+            page.wait_for_selector("h1:has-text('Ранний-2')")
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Третий")
+            page.fill("#create-scenario", "ещё план")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Третий").click()
+            page.wait_for_selector("#routine-time")
+            page.locator(".day", has_text="Пн").click()
+            page.wait_for_selector("#routine-warn")
+            assert (
+                page.locator("#routine-warn").inner_text()
+                == "В это время уже стоит рутина бота «Ранний-2». Она создана раньше и пойдёт первой. Эта выполнит весь сценарий после неё."
+            )
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.locator(".bot-card", has_text="Поздний").click()
+            page.wait_for_selector("#routine-time")
+            with page.expect_response(
+                lambda response: response.request.method == "PATCH"
+                and "/routines/" in response.url
+                and response.ok
+            ):
+                page.locator("#routine-time").fill("11:00")
+                page.locator("#routine-time").blur()
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.locator(".bot-card", has_text="Ранний-2").click()
+            page.wait_for_selector("#routine-time")
+            page.locator("#routine-time").fill("11:00")
+            page.locator("#routine-time").blur()
+            page.wait_for_selector("#routine-warn")
+            assert (
+                page.locator("#routine-warn").inner_text()
+                == "В это время уже стоит рутина бота «Поздний». Раньше создана эта рутина, и она пойдёт первой. Рутина бота «Поздний» выполнит весь сценарий после неё."
+            )
             browser.close()
     finally:
         _stop(process, journal)
