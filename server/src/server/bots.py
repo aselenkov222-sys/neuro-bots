@@ -20,6 +20,7 @@ from server.auth import (
     unauthenticated,
 )
 from server.config import development_tariff
+from server.desktops import find_working_desktop
 from server.models import (
     bots,
     chats,
@@ -60,6 +61,7 @@ INVALID_MESSAGE = "Сообщение — от 1 до 8 000 символов."
 EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
+COMPUTER_UNAVAILABLE_TEXT = "компьютер недоступен"
 
 
 class Opened(NamedTuple):
@@ -503,6 +505,10 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
             opened.now,
         )
         follow_at = opened.now + timedelta(microseconds=1)
+        desktop = find_working_desktop(opened.connection, opened.account["id"])
+        desktop_available = (
+            desktop is not None and desktop["last_pulse_at"] is not None
+        )
         if counter["used"] >= development_tariff.model_requests:
             _insert_message(
                 opened.connection,
@@ -512,12 +518,21 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
                 None,
                 follow_at,
             )
+        elif desktop is not None and not desktop_available:
+            _insert_message(
+                opened.connection,
+                chat["id"],
+                "error",
+                COMPUTER_UNAVAILABLE_TEXT,
+                None,
+                follow_at,
+            )
         else:
             reply = aggregator.complete(
                 description=bot["description"],
                 scenario=bot["scenario"],
                 messages=_adapter_messages(opened.connection, chat["id"]),
-                desktop_available=False,
+                desktop_available=desktop_available,
             )
             if reply == "":
                 _insert_message(
