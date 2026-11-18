@@ -34,6 +34,7 @@ from server.models import (
     messages,
     routine_runs,
     routines,
+    subscription_periods,
 )
 
 router = APIRouter()
@@ -110,6 +111,16 @@ def working_routines_stopped(
 
 def routine_may_start(row: Mapping[str, object], stopped: bool) -> bool:
     return starts_when_due(row) and not stopped
+
+
+def period_is_active(connection: Connection, account_id: uuid.UUID) -> bool:
+    period = connection.execute(
+        select(subscription_periods.c.id).where(
+            subscription_periods.c.account_id == account_id,
+            subscription_periods.c.active.is_(True),
+        )
+    ).first()
+    return period is not None
 
 
 def _aware(moment: datetime) -> datetime:
@@ -431,7 +442,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
         account_id = row["account_id"]
         allowed = routine_may_start(
             row, working_routines_stopped(connection, account_id)
-        )
+        ) and period_is_active(connection, account_id)
         zone, claimable = _schedule_desktop(connection, account_id, moment)
         if zone is None:
             continue

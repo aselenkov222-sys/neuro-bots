@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import ARRAY, Boolean, Integer, Text, Time, Uuid, select, text
 
-from server.accounts import create_account, create_session
+from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
 from server.config import development_tariff
 from server.db import create_db_engine, metadata
@@ -18,9 +18,11 @@ from server.models import (
     chats,
     desktops,
     messages,
+    quota_counters,
     routine_runs,
     routines,
     sessions,
+    subscription_periods,
 )
 from server.routines import (
     appointed_utc,
@@ -119,13 +121,27 @@ def _open_account(email: str, *, confirmed: bool) -> tuple[str, uuid.UUID]:
             account_id = create_account(connection, email, ACCEPTED)
             session_id = create_session(connection, account_id)
             if confirmed:
+                confirmed_at = datetime(2026, 11, 16, tzinfo=timezone.utc)
                 connection.execute(
                     accounts.update()
                     .where(accounts.c.id == account_id)
-                    .values(
-                        email_confirmed_at=datetime(
-                            2026, 11, 16, tzinfo=timezone.utc
-                        )
+                    .values(email_confirmed_at=confirmed_at)
+                )
+                period_id = uuid.uuid4()
+                connection.execute(
+                    subscription_periods.insert().values(
+                        id=period_id,
+                        account_id=account_id,
+                        started_at=confirmed_at,
+                        ends_at=calendar_month_end(confirmed_at),
+                        active=True,
+                    )
+                )
+                connection.execute(
+                    quota_counters.insert().values(
+                        id=uuid.uuid4(),
+                        period_id=period_id,
+                        used=0,
                     )
                 )
     finally:
@@ -1539,4 +1555,70 @@ def test_account_without_an_accepted_timezone_writes_no_skip(
     _settle(DUE)
     _settle(SKIP_AT)
     assert _runs_for(created["id"]) == []
+    assert _chat_messages(bot_id) == []
+
+
+def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                subscription_periods.update()
+                .where(subscription_periods.c.account_id == account_id)
+                .values(active=active)
+            )
+    finally:
+        engine.dispose()
+
+
+def test_inactive_period_cancels_the_minute_and_writes_no_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "inactive-period@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    periods = [
+        row
+        for row in _rows(subscription_periods)
+        if row["account_id"] == account_id
+    ]
+    assert len(periods) == 1
+    assert periods[0]["active"] is True
+    _set_period_active(account_id, False)
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "cancelled"
+    assert runs[0]["due_at"] == DUE
+    assert runs[0]["local_date"] == date(2026, 11, 18)
+    assert _chat_messages(bot_id) == []
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "cancelled"
+    assert _chat_messages(bot_id) == []
+
+
+def test_active_period_from_confirmation_still_opens_the_minute(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "active-period@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    periods = [
+        row
+        for row in _rows(subscription_periods)
+        if row["account_id"] == account_id
+    ]
+    assert len(periods) == 1
+    assert periods[0]["active"] is True
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    assert opened[0]["due_at"] == DUE
     assert _chat_messages(bot_id) == []
