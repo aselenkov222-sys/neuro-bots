@@ -4,7 +4,9 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from desktop.identity import default_state_dir
 from desktop.keychain import KeychainError, RecordRejected, read_password, store_password
+from desktop.vault import read_record_password, records, user_add_from_profile, user_delete, user_replace
 
 LOOPBACK = "127.0.0.1"
 _MAX_BODY = 64 * 1024
@@ -14,6 +16,8 @@ _WRITE_FAILED = "Ключница не записала пароль."
 _MISSING = "Такой записи нет."
 _READ_FAILED = "Ключница не отдала пароль."
 _LEAD = "Запись остаётся на этом компьютере."
+_DELETE_FAILED = "Запись не удалена."
+_NAMES = "vault-bot-names.json"
 
 _PAGE = """<!DOCTYPE html>
 <html lang="ru">
@@ -77,6 +81,118 @@ _PAGE = """<!DOCTYPE html>
       font: inherit;
     }
     button:focus, input:focus { outline: 2px solid var(--orange); outline-offset: 2px; }
+    .vault-screen {
+      width: min(460px, calc(100% - 2rem));
+      margin: 0 auto 8vh;
+      display: grid;
+      gap: 16px;
+    }
+    .vault {
+      width: 100%;
+      padding: 22px;
+      border-radius: 24px;
+      display: grid;
+      gap: 12px;
+      color: #f4f6f8;
+      background: linear-gradient(180deg, #454c56 0%, #2c333c 46%, #1c2229 100%);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.32),
+        inset 0 -12px 18px rgba(0, 0, 0, 0.22),
+        0 16px 30px rgba(20, 16, 12, 0.22);
+    }
+    .shield {
+      width: 48px;
+      height: 48px;
+      border-radius: 16px;
+      display: grid;
+      place-items: center;
+      color: #f3fff8;
+      background: linear-gradient(180deg, #2f9a62, #146b3f 58%, #0e4e2e);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 8px 16px rgba(0, 0, 0, 0.28);
+    }
+    .shield svg, .lock svg {
+      width: 22px;
+      height: 22px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.6;
+      stroke-linejoin: round;
+      stroke-linecap: round;
+    }
+    .vault .meta, .vault .hint { color: #c5ccd4; font-size: 14px; line-height: 1.45; }
+    .vault h1 { color: #f4f6f8; font-size: 30px; line-height: 1.15; letter-spacing: -0.03em; }
+    .vault .field { display: grid; gap: 6px; margin: 0; color: #c5ccd4; font-size: 14px; font-weight: 600; }
+    .vault input {
+      width: 100%;
+      min-height: 44px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      background: rgba(0, 0, 0, 0.32);
+      color: #f4f6f8;
+    }
+    .lock { display: flex; align-items: center; gap: 8px; }
+    .lock input { flex: 1; }
+    .vault .switch {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 44px;
+      margin: 0;
+      font-weight: 600;
+    }
+    .vault .switch input {
+      position: absolute;
+      opacity: 0;
+      width: 44px;
+      height: 26px;
+      min-height: 0;
+      margin: 0;
+      padding: 0;
+    }
+    .switch-ui {
+      width: 44px;
+      height: 26px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.14);
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      position: relative;
+      flex: 0 0 auto;
+    }
+    .switch-ui::after {
+      content: "";
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #f4f6f8;
+      position: absolute;
+      top: 2px;
+      left: 2px;
+    }
+    .switch input:checked + .switch-ui { background: #146b3f; border-color: #b7ebc9; }
+    .switch input:checked + .switch-ui::after { left: 20px; }
+    .vault .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .vault button {
+      margin: 0;
+      min-height: 44px;
+      padding: 0 18px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .vault .btn-orange {
+      color: #fff7f3;
+      background: #c2410c;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+    }
+    .vault .btn-quiet {
+      color: #f4f6f8;
+      background: rgba(0, 0, 0, 0.28);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+    }
+    .vault-owner { font-weight: 600; }
+    #vault-copy-status:empty { display: none; }
   </style>
 </head>
 <body>
@@ -97,6 +213,32 @@ _PAGE = """<!DOCTYPE html>
       <p id="copy-status"></p>
     </form>
   </main>
+  <section class="vault-screen">
+    <form class="vault raised" method="post" action="/vault" autocomplete="off">
+      <span class="shield" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v6c0 4.2-2.8 7-7 9-4.2-2-7-4.8-7-9V6z"/></svg></span>
+      <div>
+        <p class="meta">Хранилище</p>
+        <h1>Записи на этом компьютере</h1>
+      </div>
+      <label class="field">Сайт <input name="vault_site" autocomplete="off" required></label>
+      <label class="field">Логин <input name="vault_login" autocomplete="off" required></label>
+      <label class="field">Пароль
+        <span class="lock"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg><input name="vault_password" type="password" autocomplete="off" required></span>
+      </label>
+      <label class="switch">
+        <input name="vault_personal" type="checkbox" value="1">
+        <span class="switch-ui" aria-hidden="true"></span>
+        Личная для бота
+      </label>
+      <label class="field">Бот <input name="vault_bot" autocomplete="off"></label>
+      <p class="hint">Пока личная не выбрана, запись общая. Её можно сделать личной для одного бота до сохранения.</p>
+      <div class="actions">
+        <button class="btn-orange" type="submit">Добавить запись</button>
+      </div>
+    </form>
+    __VAULT_LIST__
+    <p id="vault-copy-status"></p>
+  </section>
   <script>
     document.getElementById("copy").addEventListener("click", function () {
       var site = document.getElementById("copy-site").value;
@@ -123,6 +265,29 @@ _PAGE = """<!DOCTYPE html>
           status.textContent = __COPIED_JS__;
         }, function () {
           status.textContent = __STAYS_JS__;
+        });
+      });
+    });
+  </script>
+  <script>
+    document.querySelectorAll("[data-vault-copy]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        var status = document.getElementById("vault-copy-status");
+        var id = button.getAttribute("data-vault-copy");
+        if (!status || !id) return;
+        fetch("/vault/" + encodeURIComponent(id)).then(function (response) {
+          if (!response.ok) {
+            status.textContent = __READ_FAILED_JS__;
+            return null;
+          }
+          return response.text();
+        }).then(function (secret) {
+          if (!secret) return;
+          navigator.clipboard.writeText(secret).then(function () {
+            status.textContent = __COPIED_JS__;
+          }, function () {
+            status.textContent = __STAYS_JS__;
+          });
         });
       });
     });
@@ -207,6 +372,7 @@ def _page(saved: bool) -> bytes:
         .replace("__READ_FAILED_JS__", _js(_READ_FAILED))
         .replace("__COPIED_JS__", _js("Пароль скопирован."))
         .replace("__STAYS_JS__", _js("Пароль остаётся на этом компьютере."))
+        .replace("__VAULT_LIST__", _vault_list())
     )
     return html.encode("utf-8")
 
@@ -243,6 +409,10 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/passwords":
             self._read(parsed.query)
             return
+        target = _vault_target(parsed.path)
+        if target is not None and target[0] == "item" and target[1] is not None:
+            self._vault_copy(target[1])
+            return
         self._text(404, "")
 
     def do_POST(self) -> None:
@@ -254,10 +424,28 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._allowed():
             self._text(403, "")
             return
-        if parsed.path != "/passwords" or body is None:
+        if parsed.path == "/passwords":
+            self._store_password(body)
+            return
+        target = _vault_target(parsed.path)
+        if target is None or body is None or not _form(self.headers.get("Content-Type", "")):
             self._text(400, _NEED)
             return
-        if not _form(self.headers.get("Content-Type", "")):
+        kind, record_id = target
+        fields = _fields(body)
+        if kind == "add":
+            self._vault_add(fields)
+            return
+        if kind == "delete" and record_id is not None:
+            self._vault_delete(record_id)
+            return
+        if kind == "item" and record_id is not None:
+            self._vault_replace(record_id, fields)
+            return
+        self._text(400, _NEED)
+
+    def _store_password(self, body: bytes | None) -> None:
+        if body is None or not _form(self.headers.get("Content-Type", "")):
             self._text(400, _NEED)
             return
         fields = _fields(body)
@@ -274,6 +462,82 @@ class _Handler(BaseHTTPRequestHandler):
         except (KeychainError, OSError):
             self._text(500, _WRITE_FAILED)
             return
+        self._see_other()
+
+    def _vault_add(self, fields: dict[str, str]) -> None:
+        bot_id = _chosen_bot(fields)
+        try:
+            if bot_id is None:
+                user_add_from_profile(
+                    fields.get("vault_site", ""),
+                    fields.get("vault_login", ""),
+                    fields.get("vault_password", ""),
+                    run=self.server.run,
+                )
+            else:
+                user_add_from_profile(
+                    fields.get("vault_site", ""),
+                    fields.get("vault_login", ""),
+                    fields.get("vault_password", ""),
+                    bot_id=bot_id,
+                    run=self.server.run,
+                )
+        except RecordRejected:
+            self._text(400, _NEED)
+            return
+        except (KeychainError, OSError):
+            self._text(500, _WRITE_FAILED)
+            return
+        self._see_other()
+
+    def _vault_replace(self, record_id: str, fields: dict[str, str]) -> None:
+        bot_id = _chosen_bot(fields)
+        try:
+            user_replace(
+                record_id,
+                fields.get("vault_site", ""),
+                fields.get("vault_login", ""),
+                fields.get("vault_password", ""),
+                shared=bot_id is None,
+                bot_id=bot_id,
+                run=self.server.run,
+            )
+        except RecordRejected:
+            self._text(400, _NEED)
+            return
+        except (KeychainError, OSError):
+            self._text(500, _WRITE_FAILED)
+            return
+        self._see_other()
+
+    def _vault_delete(self, record_id: str) -> None:
+        try:
+            user_delete(record_id, run=self.server.run)
+        except RecordRejected:
+            self._text(404, _MISSING)
+            return
+        except (KeychainError, OSError):
+            self._text(500, _DELETE_FAILED)
+            return
+        self._see_other()
+
+    def _vault_copy(self, record_id: str) -> None:
+        found = next((item for item in records() if item["id"] == record_id), None)
+        if found is None:
+            self._text(404, _MISSING)
+            return
+        bot_id = found["bot_id"] if isinstance(found["bot_id"], str) and found["bot_id"] else "screen"
+        try:
+            password = read_record_password(record_id, bot_id, run=self.server.run)
+        except (KeychainError, OSError):
+            self._text(500, _READ_FAILED)
+            return
+        if password is None:
+            self._text(404, _MISSING)
+            return
+        self._text(200, password)
+
+    def _see_other(self) -> None:
         self._bytes(303, b"", "text/plain; charset=utf-8", {"Location": "/?saved=1"})
 
     def _read(self, query: str) -> None:
@@ -403,6 +667,107 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+
+def _vault_list() -> str:
+    names = _bot_names()
+    return "".join(_record_html(record, names) for record in records())
+
+
+def _record_html(record: dict, names: dict[str, str]) -> str:
+    record_id = _esc(str(record["id"]))
+    site = _esc(str(record["site"]))
+    login = _esc(str(record["login"]))
+    label = _esc(_owner_label(record, names))
+    personal = record["shared"] is False
+    checked = " checked" if personal else ""
+    bot_id = record["bot_id"] if personal and isinstance(record["bot_id"], str) else ""
+    return (
+        '<article class="vault raised">'
+        f'<p class="vault-site">{site}</p>'
+        f'<p class="vault-login">{login}</p>'
+        f'<p class="vault-owner">{label}</p>'
+        f'<button type="button" data-vault-copy="{record_id}">Скопировать</button>'
+        f'<form method="post" action="/vault/{record_id}" autocomplete="off">'
+        f'<label class="field">Сайт <input name="vault_site" value="{site}" autocomplete="off" required></label>'
+        f'<label class="field">Логин <input name="vault_login" value="{login}" autocomplete="off" required></label>'
+        '<label class="field">Пароль <input name="vault_password" type="password" autocomplete="off" required></label>'
+        '<label class="switch">'
+        f'<input name="vault_personal" type="checkbox" value="1"{checked}>'
+        '<span class="switch-ui" aria-hidden="true"></span>'
+        "Личная для бота</label>"
+        f'<label class="field">Бот <input name="vault_bot" value="{_esc(bot_id)}" autocomplete="off"></label>'
+        '<button class="btn-quiet" type="submit">Заменить</button>'
+        "</form>"
+        f'<form method="post" action="/vault/{record_id}/delete">'
+        '<button class="btn-quiet" type="submit">Удалить</button>'
+        "</form>"
+        "</article>"
+    )
+
+
+def _owner_label(record: dict, names: dict[str, str]) -> str:
+    if record["shared"] is not False:
+        return "общая"
+    bot_id = record["bot_id"]
+    if not isinstance(bot_id, str) or bot_id == "":
+        return "общая"
+    return names.get(bot_id, bot_id)
+
+
+def _bot_names() -> dict[str, str]:
+    path = default_state_dir() / _NAMES
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    names: dict[str, str] = {}
+    for key, value in loaded.items():
+        if isinstance(key, str) and key != "" and isinstance(value, str):
+            names[key] = value
+    return names
+
+
+def _chosen_bot(fields: dict[str, str]) -> str | None:
+    if "vault_personal" not in fields:
+        return None
+    return fields.get("vault_bot", "")
+
+
+def _vault_target(path: str) -> tuple[str, str | None] | None:
+    parts = path.split("/")
+    if parts == ["", "vault"]:
+        return ("add", None)
+    if len(parts) == 3 and parts[0] == "" and parts[1] == "vault":
+        record_id = _safe_id(parts[2])
+        if record_id is None:
+            return None
+        return ("item", record_id)
+    if len(parts) == 4 and parts[:2] == ["", "vault"] and parts[3] == "delete":
+        record_id = _safe_id(parts[2])
+        if record_id is None:
+            return None
+        return ("delete", record_id)
+    return None
+
+
+def _safe_id(segment: str) -> str | None:
+    if segment == "" or len(segment) > 80:
+        return None
+    if any(char not in "0123456789abcdefABCDEF-" for char in segment):
+        return None
+    return segment
+
+
+def _esc(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def _form(content_type: str) -> bool:

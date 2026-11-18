@@ -109,6 +109,10 @@ def records_for_bot(bot_id: str) -> list[dict[str, str | bool | None]]:
     return [_view(record) for record in _load() if _visible(record, bot_id)]
 
 
+def records() -> list[dict[str, str | bool | None]]:
+    return [_view(record) for record in _load()]
+
+
 def read_record_password(record_id: str, bot_id: str, run=None) -> str | None:
     record = next((item for item in _load() if item["id"] == record_id), None)
     if record is None or not _visible(record, bot_id):
