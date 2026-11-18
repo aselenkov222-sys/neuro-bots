@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.sync_api import BrowserContext, sync_playwright
 
@@ -78,6 +79,36 @@ def _chromium_executable() -> Path | None:
         if path.is_file():
             return path
     return None
+
+
+def http_address(url: str) -> str | None:
+    parts = urlsplit(url.strip())
+    if parts.scheme not in {"http", "https"} or parts.hostname is None:
+        return None
+    if parts.username or parts.password:
+        return None
+    return url.strip()
+
+
+def open_address(url: str) -> str:
+    address = http_address(url)
+    if address is None:
+        raise ValueError("address")
+    context = _open_context()
+    if context is None:
+        raise RuntimeError("browser")
+    page = context.new_page()
+    try:
+        page.goto(address)
+        return page.inner_text("body")
+    finally:
+        page.close()
+
+
+def _open_context() -> BrowserContext | None:
+    if _held:
+        return _held[-1][1]
+    return open_browser()
 
 
 def open_browser() -> BrowserContext | None:

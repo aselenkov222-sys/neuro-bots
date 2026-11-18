@@ -91,10 +91,19 @@ def local_timezone_name() -> str:
     return "UTC"
 
 
-def bridge_script(computer: uuid.UUID, timezone_name: str) -> str:
-    payload = json.dumps({"id": str(computer), "timezone": timezone_name})
+def bridge_script(
+    computer: uuid.UUID,
+    timezone_name: str,
+    *,
+    open_url: str | None = None,
+    open_token: str | None = None,
+) -> str:
+    payload = {"id": str(computer), "timezone": timezone_name}
+    if open_url is not None and open_token is not None:
+        payload["openUrl"] = open_url
+        payload["openToken"] = open_token
     return (
         "window.__neuroDesktop = "
-        + payload
+        + json.dumps(payload)
         + ";window.dispatchEvent(new Event('neuro-desktop'));"
     )

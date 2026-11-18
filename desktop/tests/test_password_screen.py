@@ -1,4 +1,5 @@
 import http.client
+import json
 import subprocess
 from urllib.parse import quote, urlencode
 
@@ -6,8 +7,8 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from desktop.keychain import SECURITY_PATH, read_password
-from desktop.password_screen import LOOPBACK, serve_password_screen
-from desktop.window import main
+from desktop.password_screen import LOOPBACK, serve_password_screen, start_password_screen, stop_password_screen
+from desktop.window import main, _inject_desktop_bridge
 
 SITE = "почта.example"
 LOGIN = "Аня"
@@ -198,6 +199,125 @@ def test_null_origin_is_refused(screen) -> None:
     assert status == 403
     assert SECRET.encode() not in body
     assert read_password(SITE, LOGIN, run=security) is None
+
+
+def test_loopback_open_returns_page_text_and_refuses_a_password(
+    screen, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened, security = screen
+    cabinet = "http://127.0.0.1:8765"
+    opened.httpd.cabinet_origin = cabinet
+    calls: list[str] = []
+
+    def open_address(url: str) -> str:
+        calls.append(url)
+        return "Текст страницы"
+
+    monkeypatch.setattr("desktop.browser.open_address", open_address)
+    leaked = json.dumps(
+        {
+            "url": "https://example.com/inbox",
+            "password": SECRET,
+            "cookie": "vault-cookie-9",
+            "login": LOGIN,
+            "site": SITE,
+        }
+    ).encode()
+    status, body, _headers = _exchange(
+        opened,
+        "POST",
+        "/open",
+        leaked,
+        {
+            "Origin": cabinet,
+            "X-Desktop-Open": opened.open_token,
+            "Content-Type": "application/json",
+            "Content-Length": str(len(leaked)),
+        },
+    )
+    assert status == 400
+    assert calls == []
+    assert SECRET.encode() not in body
+    assert b"vault-cookie-9" not in body
+    foreign, foreign_body, _foreign_headers = _exchange(
+        opened,
+        "POST",
+        "/open",
+        json.dumps({"url": "https://example.com/inbox"}).encode(),
+        {
+            "Origin": "http://evil.example",
+            "X-Desktop-Open": opened.open_token,
+            "Content-Type": "application/json",
+            "Content-Length": str(len(json.dumps({"url": "https://example.com/inbox"}))),
+        },
+    )
+    assert foreign == 403
+    assert calls == []
+    assert SECRET.encode() not in foreign_body
+    saved, saved_body, _saved_headers = _post(
+        opened,
+        SITE,
+        LOGIN,
+        SECRET,
+        headers={"Origin": cabinet},
+    )
+    assert saved == 403
+    assert SECRET.encode() not in saved_body
+    assert read_password(SITE, LOGIN, run=security) is None
+    payload = json.dumps({"url": "https://example.com/inbox"}).encode()
+    opened_status, opened_body, opened_headers = _exchange(
+        opened,
+        "POST",
+        "/open",
+        payload,
+        {
+            "Origin": cabinet,
+            "X-Desktop-Open": opened.open_token,
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
+    )
+    assert opened_status == 200
+    assert json.loads(opened_body.decode()) == {"text": "Текст страницы"}
+    assert calls == ["https://example.com/inbox"]
+    assert _header(opened_headers, "Access-Control-Allow-Origin") == cabinet
+    assert SECRET.encode() not in opened_body
+    assert b"vault-cookie-9" not in opened_body
+    missing_token, missing_body, _missing_headers = _exchange(
+        opened,
+        "POST",
+        "/open",
+        payload,
+        {
+            "Origin": cabinet,
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
+    )
+    assert missing_token == 403
+    assert calls == ["https://example.com/inbox"]
+    assert SECRET.encode() not in missing_body
+
+
+def test_running_screen_puts_the_open_endpoint_on_the_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    try:
+        url = start_password_screen()
+        scripts: list[str] = []
+        _inject_desktop_bridge(scripts.append)
+        payload = json.loads(
+            scripts[0].split("window.__neuroDesktop = ", 1)[1].split(
+                ";window.dispatchEvent", 1
+            )[0]
+        )
+        assert payload["openUrl"] == url
+        assert isinstance(payload["openToken"], str) and payload["openToken"]
+        assert SECRET not in scripts[0]
+        assert "vault-cookie-9" not in scripts[0]
+    finally:
+        stop_password_screen()
 
 
 def test_desktop_process_opens_the_password_screen_before_the_cabinet(

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from desktop.browser import browser_profile_dir, open_browser
+from desktop.browser import browser_profile_dir, open_address, open_browser
 from desktop.identity import default_state_dir
 
 _MARKER_NAME = "launch-marker"
@@ -177,3 +177,62 @@ if seen != [(profile, {"channel": "chrome"})]:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert (first / _MARKER_NAME).read_text(encoding="utf-8") == _MARKER_TEXT
+
+
+def test_open_address_reads_the_page_and_does_not_click_or_read_cookies() -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class _Page:
+        def goto(self, url: str, *args: object, **kwargs: object) -> None:
+            calls.append(("goto", url, args, kwargs))
+
+        def inner_text(self, selector: str) -> str:
+            calls.append(("inner_text", selector))
+            return "Текст страницы"
+
+        def click(self, *args: object, **kwargs: object) -> None:
+            calls.append(("click", args))
+
+        def fill(self, *args: object, **kwargs: object) -> None:
+            calls.append(("fill", args))
+
+        def type(self, *args: object, **kwargs: object) -> None:
+            calls.append(("type", args))
+
+        def press(self, *args: object, **kwargs: object) -> None:
+            calls.append(("press", args))
+
+        def input_value(self, *args: object, **kwargs: object) -> str:
+            calls.append(("input_value", args))
+            return "vault-pass-9"
+
+        def close(self) -> None:
+            calls.append(("close",))
+
+    class _Context:
+        def new_page(self) -> _Page:
+            return _Page()
+
+        def cookies(self, *args: object, **kwargs: object) -> list[dict[str, str]]:
+            calls.append(("cookies",))
+            return [{"name": "session", "value": "vault-cookie-9"}]
+
+    import desktop.browser as browser
+
+    held = list(browser._held)
+    browser._held[:] = [(None, _Context())]
+    try:
+        assert open_address("https://example.com/inbox") == "Текст страницы"
+        with pytest.raises(ValueError, match="^address$"):
+            open_address("https://user:vault-pass-9@example.com/secret")
+        with pytest.raises(ValueError, match="^address$"):
+            open_address("file:///tmp/vault-cookie-9")
+    finally:
+        browser._held[:] = held
+    assert calls == [
+        ("goto", "https://example.com/inbox", (), {}),
+        ("inner_text", "body"),
+        ("close",),
+    ]
+    assert "vault-pass-9" not in str(calls)
+    assert "vault-cookie-9" not in str(calls)
