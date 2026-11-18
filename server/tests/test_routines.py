@@ -2582,3 +2582,138 @@ def test_check_waits_behind_a_pending_routine(
         "проверка поздняя",
     ]
     assert _used(account_id) == 4
+
+
+def _notices(cookie: str, computer: uuid.UUID):
+    with _client(cookie) as client:
+        return client.get(f"/api/desktops/{computer}/notices")
+
+
+def _ack_notices(cookie: str, computer: uuid.UUID, notice_ids: list[str]):
+    with _client(cookie) as client:
+        return client.post(
+            f"/api/desktops/{computer}/notices",
+            json={"ids": notice_ids},
+            headers={"Origin": ORIGIN},
+        )
+
+
+def test_a_completed_run_records_one_completed_notice(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "notice-done@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    spoken = _chat_messages(bot_id)
+    assert [row["text"] for row in spoken] == [STUB_TEXT]
+    listed = _notices(cookie, computer)
+    assert listed.status_code == 200
+    notices = listed.json()["notices"]
+    assert [item["kind"] for item in notices] == ["completed"]
+    assert notices[0]["bot_id"] == bot["id"]
+    assert "password" not in listed.text
+    acked = _ack_notices(cookie, computer, [notices[0]["id"]])
+    assert acked.status_code == 204
+    assert acked.content == b""
+    assert _notices(cookie, computer).json() == {"notices": []}
+    assert _chat_messages(bot_id) == spoken
+
+
+def test_a_failed_run_records_one_failed_notice(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "notice-fail@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_scenario(cookie, bot["id"], " ")
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    messages = _chat_messages(bot_id)
+    assert [row["code"] for row in messages] == ["scenario_insufficient"]
+    listed = _notices(cookie, computer)
+    notices = listed.json()["notices"]
+    assert [item["kind"] for item in notices] == ["failed"]
+    assert notices[0]["bot_id"] == bot["id"]
+    _settle(SKIP_AT)
+    assert _notices(cookie, computer).json()["notices"] == notices
+    assert _chat_messages(bot_id) == messages
+
+
+def test_a_skipped_run_records_one_skipped_notice(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "notice-skip@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "skipped"
+    messages = _chat_messages(bot_id)
+    assert [row["code"] for row in messages] == ["routine_skipped"]
+    listed = _notices(cookie, computer)
+    notices = listed.json()["notices"]
+    assert [item["kind"] for item in notices] == ["skipped"]
+    assert notices[0]["bot_id"] == bot["id"]
+    _settle(SKIP_AT + timedelta(hours=3))
+    assert _notices(cookie, computer).json()["notices"] == notices
+    assert _chat_messages(bot_id) == messages
+
+
+def test_an_ordinary_reply_records_no_notice(
+    database: None,
+) -> None:
+    cookie, _account_id = _open_account("notice-reply@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "привет"},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        assert [row["role"] for row in posted.json()["messages"]] == [
+            "user",
+            "assistant",
+        ]
+        assert posted.json()["messages"][1]["text"] == STUB_TEXT
+    _desktop(cookie, computer)
+    assert _notices(cookie, computer).json() == {"notices": []}
+
+
+def test_a_queue_message_records_no_notice(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("notice-queue@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        second = _create_bot(client, "Второй", "сценарий второго")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        assert later.status_code == 200
+    _desktop(cookie, computer)
+    claimed = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert claimed.status_code == 200
+    assert claimed.json()["bot_id"] == first["id"]
+    waiting = _chat_messages(uuid.UUID(second["id"]))
+    assert [row["code"] for row in waiting] == ["routine_queue"]
+    notices = _notices(cookie, computer).json()["notices"]
+    assert [item["bot_id"] for item in notices] == [first["id"]]
+    assert [item["kind"] for item in notices] == ["completed"]
+    assert all(item["bot_id"] != second["id"] for item in notices)

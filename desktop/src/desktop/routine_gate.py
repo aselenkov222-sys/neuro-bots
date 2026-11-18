@@ -13,6 +13,15 @@ def mark_window_hidden() -> None:
     _window_hidden = True
 
 
+def mark_window_shown() -> None:
+    global _window_hidden
+    _window_hidden = False
+
+
+def window_hidden() -> bool:
+    return _window_hidden
+
+
 def mark_process_stopping() -> None:
     global _process_stopping
     _process_stopping = True

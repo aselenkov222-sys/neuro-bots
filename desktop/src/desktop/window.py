@@ -62,6 +62,9 @@ def main(argv: list[str] | None = None) -> None:
 
 def open_cabinet(origin: str, on_ready=None) -> None:
     reset()
+    from desktop.notify import reset_cabinet
+
+    reset_cabinet()
     from desktop.password_screen import allow_cabinet_origin
 
     allow_cabinet_origin(origin)
@@ -84,6 +87,7 @@ def _open_pywebview(origin: str, on_ready) -> None:
         menu=[menu_module.Menu("Кабинет", [menu_module.MenuAction(_QUIT_COMMAND, _quit_command)])],
     )
     _hide_pywebview_on_close(window)
+    _bind_pywebview(window)
     _install_cocoa_quit_tray()
     sent = {"done": False}
 
@@ -98,6 +102,16 @@ def _open_pywebview(origin: str, on_ready) -> None:
     webview.start(
         localization={"cocoa.menu.quit": _QUIT_COMMAND, "global.quit": _QUIT_COMMAND},
     )
+
+
+def _bind_pywebview(window) -> None:
+    from desktop.notify import bind_cabinet
+
+    show = getattr(window, "show", None)
+    evaluate = getattr(window, "evaluate_js", None)
+    if show is None or evaluate is None:
+        return
+    bind_cabinet(show, evaluate)
 
 
 def _hide_pywebview_on_close(window) -> None:
@@ -165,6 +179,7 @@ def _open_pyside6(origin: str, on_ready) -> None:
     if type(application).__module__.startswith("PySide6"):
         application.setQuitOnLastWindowClosed(False)
     view = _cabinet_view(webengine.QWebEngineView)()
+    _bind_pyside(view)
     command_quit_action = _pyside_quit_command(widgets, gui, view)
     tray_quit_action = _install_pyside_quit_tray(widgets, gui, application)
     sent = {"done": False}
@@ -185,6 +200,18 @@ def _open_pyside6(origin: str, on_ready) -> None:
     view.load(qt_core.QUrl(origin))
     view.show()
     application.exec()
+
+
+def _bind_pyside(view) -> None:
+    from desktop.notify import bind_cabinet
+
+    def run_script(script: str) -> None:
+        page = getattr(view, "page", None)
+        if page is None:
+            return
+        page().runJavaScript(script)
+
+    bind_cabinet(view.show, run_script)
 
 
 def _cabinet_view(base):

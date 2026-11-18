@@ -51,6 +51,7 @@ from server.models import (
     routines,
     subscription_periods,
 )
+from server.notices import COMPLETED, FAILED, SKIPPED, record_notice
 
 router = APIRouter()
 
@@ -226,6 +227,7 @@ def _write_chat_error(
 
 def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
     _write_chat_error(connection, bot_id, now, SKIP_CODE, SKIP_TEXT)
+    record_notice(connection, bot_id, SKIPPED, now)
 
 
 def queue_text(name: str) -> str:
@@ -305,6 +307,7 @@ def _insert_failed(
         )
     )
     _write_chat_error(connection, bot_id, now, code, text)
+    record_notice(connection, bot_id, FAILED, now)
 
 
 def _mark_failed(
@@ -327,6 +330,7 @@ def _mark_failed(
     if updated.rowcount != 1:
         return False
     _write_chat_error(connection, bot_id, now, code, text)
+    record_notice(connection, bot_id, FAILED, now)
     return True
 
 
@@ -748,6 +752,7 @@ def _claim_earliest_check(
             SCENARIO_INSUFFICIENT,
             SCENARIO_INSUFFICIENT_TEXT,
         )
+        record_notice(connection, pending["bot_id"], FAILED, now)
         return
     _speak_scenario(
         connection,
@@ -807,6 +812,7 @@ def _speak_scenario(
         connection.execute(
             chats.update().where(chats.c.id == chat["id"]).values(updated_at=now)
         )
+        record_notice(connection, bot_id, FAILED, now)
         return
     reply = aggregator.complete(
         description=bot["description"],
@@ -823,6 +829,7 @@ def _speak_scenario(
             EMPTY_MODEL_CODE,
             now,
         )
+        record_notice(connection, bot_id, FAILED, now)
     else:
         _insert_message(
             connection,
@@ -832,6 +839,7 @@ def _speak_scenario(
             None,
             now,
         )
+        record_notice(connection, bot_id, COMPLETED, now)
         connection.execute(
             quota_charges.insert().values(
                 id=uuid.uuid4(),

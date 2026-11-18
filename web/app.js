@@ -102,11 +102,35 @@ function claimDesktop() {
 }
 
 function sendPulse() {
+  publishNotices();
   const bridge = window.__neuroDesktop;
   if (!state.me || !bridge || typeof bridge.id !== "string" || typeof bridge.timezone !== "string") return;
   api(`/api/desktops/${bridge.id}/pulse`, {
     method: "POST",
     body: { timezone: bridge.timezone }
+  }).catch(() => {});
+}
+
+function publishNotices() {
+  const bridge = window.__neuroDesktop;
+  if (!state.me || !bridge || typeof bridge.id !== "string") return;
+  if (typeof bridge.openUrl !== "string" || typeof bridge.openToken !== "string") return;
+  api(`/api/desktops/${bridge.id}/notices`).then((result) => {
+    if (!result.ok || !result.data || !Array.isArray(result.data.notices) || !result.data.notices.length) return null;
+    return fetch(`${bridge.openUrl.replace(/\/$/, "")}/notify`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Desktop-Open": bridge.openToken
+      },
+      body: JSON.stringify({ notices: result.data.notices })
+    }).then((response) => response.ok ? response.json() : null).then((posted) => {
+      if (!posted || !Array.isArray(posted.ids) || !posted.ids.length) return null;
+      return api(`/api/desktops/${bridge.id}/notices`, {
+        method: "POST",
+        body: { ids: posted.ids }
+      });
+    });
   }).catch(() => {});
 }
 
@@ -1007,5 +1031,12 @@ window.addEventListener("hashchange", () => {
 });
 window.addEventListener("neuro-desktop", () => {
   claimDesktop();
+});
+window.addEventListener("neuro-open-chat", () => {
+  const id = window.__neuroOpenChat;
+  if (typeof id !== "string" || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) return;
+  state.activeId = id;
+  if (location.hash === "#chat") showCurrent();
+  else location.hash = "#chat";
 });
 boot();

@@ -93,6 +93,19 @@ CANCELLED_REVISION = "d4f1b8e06c32"
 FAILED_REVISION = "b8e5c2a94f17"
 ORDER_REVISION = "c4d8e2a71b06"
 CHECK_REVISION = "e6b1a9c34f28"
+NOTICE_REVISION = "f3a8c1d27e05"
+NOTICE_COLUMNS = (
+    "id",
+    "account_id",
+    "bot_id",
+    "kind",
+    "created_at",
+    "delivered_at",
+)
+NOTICE_KIND_CHECK = (
+    "CHECK (((kind)::text = ANY ((ARRAY['completed'::character varying, "
+    "'failed'::character varying, 'skipped'::character varying])::text[])))"
+)
 ROUTINE_CHECK_COLUMNS = ("id", "bot_id", "status", "created_at")
 ROUTINE_CHECK_STATUS_CHECK = (
     "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
@@ -194,8 +207,9 @@ def _revision_chain() -> list[str]:
     assert links[FAILED_REVISION] == CANCELLED_REVISION
     assert links[ORDER_REVISION] == FAILED_REVISION
     assert links[CHECK_REVISION] == ORDER_REVISION
-    assert links[chain[-1]] == ORDER_REVISION
-    assert chain[-1] == CHECK_REVISION
+    assert links[NOTICE_REVISION] == CHECK_REVISION
+    assert links[chain[-1]] == CHECK_REVISION
+    assert chain[-1] == NOTICE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
@@ -209,6 +223,7 @@ def _revision_chain() -> list[str]:
     assert chain[-1] != CANCELLED_REVISION
     assert chain[-1] != FAILED_REVISION
     assert chain[-1] != ORDER_REVISION
+    assert chain[-1] != CHECK_REVISION
     return chain
 
 
@@ -460,6 +475,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     routines = metadata.tables["routines"]
     routine_runs = metadata.tables["routine_runs"]
     routine_checks = metadata.tables["routine_checks"]
+    desktop_notices = metadata.tables["desktop_notices"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -474,6 +490,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "routines",
         "routine_runs",
         "routine_checks",
+        "desktop_notices",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -488,6 +505,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert routines is server.models.routines
     assert routine_runs is server.models.routine_runs
     assert routine_checks is server.models.routine_checks
+    assert desktop_notices is server.models.desktop_notices
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -501,6 +519,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(routines.columns.keys()) == ROUTINE_COLUMNS
     assert tuple(routine_runs.columns.keys()) == ROUTINE_RUN_COLUMNS
     assert tuple(routine_checks.columns.keys()) == ROUTINE_CHECK_COLUMNS
+    assert tuple(desktop_notices.columns.keys()) == NOTICE_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -838,6 +857,46 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     for column in routine_checks.columns:
         assert not isinstance(column.type, Text)
 
+    assert [column.name for column in desktop_notices.primary_key] == ["id"]
+    _assert_model_column(desktop_notices.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        desktop_notices.c.account_id,
+        Uuid,
+        nullable=False,
+        foreign_table="accounts",
+    )
+    _assert_model_column(
+        desktop_notices.c.bot_id,
+        Uuid,
+        nullable=False,
+        foreign_table="bots",
+    )
+    _assert_model_column(desktop_notices.c.kind, String, nullable=False, length=16)
+    _assert_model_column(
+        desktop_notices.c.created_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    _assert_model_column(
+        desktop_notices.c.delivered_at,
+        DateTime,
+        nullable=True,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in desktop_notices.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == [
+        (
+            "desktop_notices_kind_check",
+            "kind IN ('completed', 'failed', 'skipped')",
+        )
+    ]
+    for column in desktop_notices.columns:
+        assert not isinstance(column.type, Text)
+
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
     assert down.returncode == 0, down.stderr
@@ -881,6 +940,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "routines",
                     "routine_runs",
                     "routine_checks",
+                    "desktop_notices",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1334,6 +1394,50 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     ),
                     ("c", ROUTINE_CHECK_STATUS_CHECK),
                 }
+                notice_columns = _columns(connection, "desktop_notices")
+                assert tuple(notice_columns) == NOTICE_COLUMNS
+                _assert_catalog_column(
+                    notice_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    notice_columns, "account_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    notice_columns, "bot_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    notice_columns,
+                    "kind",
+                    "varchar",
+                    "character varying(16)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    notice_columns,
+                    "created_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    notice_columns,
+                    "delivered_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=False,
+                )
+                assert _constraints(connection, "desktop_notices") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (account_id) REFERENCES accounts(id)",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (bot_id) REFERENCES bots(id)",
+                    ),
+                    ("c", NOTICE_KIND_CHECK),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1352,6 +1456,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "routines",
                     "routine_runs",
                     "routine_checks",
+                    "desktop_notices",
                 ):
                     assert (
                         connection.execute(
