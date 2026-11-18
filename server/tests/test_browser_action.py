@@ -665,3 +665,169 @@ def test_cabinet_opens_the_named_address(database: None) -> None:
             process.kill()
             process.wait(timeout=5)
         journal.join()
+
+
+def test_creating_or_renaming_a_bot_sends_its_name(database: None) -> None:
+    port = _free_port()
+    origin = f"http://{LOOPBACK}:{port}"
+    email = f"cabinet-names-{uuid.uuid4()}@example.com"
+    kept = "Склад"
+    created_name = "Маяк"
+    renamed = "Буй"
+    note = "заметка-карточки"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            LOOPBACK,
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = _Journal(process)
+    screen = serve_password_screen()
+    screen.httpd.cabinet_origin = origin
+    try:
+        deadline = time.monotonic() + 20
+        with httpx.Client(timeout=5) as client:
+            while time.monotonic() < deadline:
+                if "Application startup complete." in journal.text():
+                    try:
+                        if client.get(f"{origin}/health").status_code == 200:
+                            break
+                    except httpx.HTTPError:
+                        pass
+                time.sleep(0.05)
+            assert "Application startup complete." in journal.text()
+            registered = client.post(
+                f"{origin}/api/register",
+                json={"email": email, "password": ACCEPTED},
+                headers={"Origin": origin},
+            )
+            assert registered.status_code == 200
+            link_deadline = time.monotonic() + 10
+            link = ""
+            while time.monotonic() < link_deadline and not link:
+                for line in journal.text().splitlines():
+                    if email in line and "/api/confirm-email?token=" in line:
+                        link = line.split()[0]
+                time.sleep(0.05)
+            assert link
+            confirmed = client.get(link, headers={"Accept": "application/json"})
+            assert confirmed.status_code == 200
+            existing = client.post(
+                f"{origin}/api/bots",
+                json={"name": kept, "description": "старое описание", "scenario": "сценарий"},
+                headers={"Origin": origin},
+            )
+            assert existing.status_code == 200
+            kept_id = existing.json()["id"]
+            session = client.cookies.get("session")
+            assert session
+            computer = str(uuid.uuid4())
+            bridge = (
+                "window.__neuroDesktop = "
+                + json.dumps(
+                    {
+                        "id": computer,
+                        "timezone": "Europe/Moscow",
+                        "openUrl": screen.url,
+                        "openToken": screen.open_token,
+                    }
+                )
+                + ";"
+            )
+            list_loads: list[str] = []
+            with sync_playwright() as playwright:
+                chrome = playwright.chromium.launch(
+                    channel="chrome",
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                context = chrome.new_context()
+                context.add_cookies(
+                    [
+                        {
+                            "name": "session",
+                            "value": session,
+                            "url": origin,
+                        }
+                    ]
+                )
+                context.add_init_script(bridge)
+                page = context.new_page()
+
+                def remember_list(request) -> None:
+                    path = request.url.split("?", 1)[0].rstrip("/")
+                    if request.method == "GET" and path.endswith("/api/bots"):
+                        list_loads.append(request.url)
+
+                page.on("request", remember_list)
+
+                def bot_names(request) -> bool:
+                    return request.method == "POST" and request.url.endswith("/bot-names")
+
+                with page.expect_response("**/api/desktops/*/pulse"):
+                    with page.expect_request(bot_names):
+                        page.goto(f"{origin}/#bots")
+                page.wait_for_selector(".bot-card")
+                page.get_by_role("button", name="Создать бота").click()
+                page.wait_for_selector("#create-name")
+                page.fill("#create-name", created_name)
+                page.fill("#create-desc", note)
+                page.locator("#save-bot:not([disabled])").wait_for()
+                with page.expect_request(bot_names) as created_post:
+                    page.click("#save-bot")
+                page.locator(".bot-card").filter(has_text=created_name).wait_for()
+                assert page.url.endswith("#bots")
+                created_body = created_post.value.post_data or ""
+                created_bots = _bot_name_posts(created_body)
+                assert {bot["name"] for bot in created_bots} == {kept, created_name}
+                assert any(bot["id"] == kept_id for bot in created_bots)
+                assert note not in created_body
+                assert "старое описание" not in created_body
+                assert "сценарий" not in created_body
+                page.locator(".bot-card").filter(has_text=created_name).click()
+                page.wait_for_selector("#bot-name")
+                assert page.url.endswith("#bot")
+                with page.expect_request(bot_names) as renamed_post:
+                    page.fill("#bot-name", renamed)
+                    page.locator("#bot-name").blur()
+                page.wait_for_selector(f"text={renamed}")
+                assert page.url.endswith("#bot")
+                renamed_body = renamed_post.value.post_data or ""
+                renamed_bots = _bot_name_posts(renamed_body)
+                assert {bot["name"] for bot in renamed_bots} == {kept, renamed}
+                assert any(bot["id"] == kept_id for bot in renamed_bots)
+                assert created_name not in renamed_body
+                assert note not in renamed_body
+                chrome.close()
+        assert list_loads == [f"{origin}/api/bots"]
+    finally:
+        screen.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        journal.join()
+
+
+def _bot_name_posts(body: str) -> list[dict[str, str]]:
+    assert ACCEPTED not in body
+    assert "password" not in body
+    payload = json.loads(body)
+    assert set(payload) == {"bots"}
+    bots = payload["bots"]
+    assert isinstance(bots, list)
+    assert all(set(bot) == {"id", "name"} for bot in bots)
+    return bots

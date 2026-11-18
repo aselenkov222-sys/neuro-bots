@@ -507,6 +507,8 @@ async function patchBot(changes) {
   if (Object.prototype.hasOwnProperty.call(changes, "scenario")) state.draft = result.data.scenario;
   const index = state.bots.findIndex((item) => item.id === result.data.id);
   if (index >= 0) state.bots[index] = result.data;
+  else if (Object.prototype.hasOwnProperty.call(changes, "name")) state.bots.push(result.data);
+  if (Object.prototype.hasOwnProperty.call(changes, "name")) publishBotNames();
   render();
 }
 
@@ -558,6 +560,7 @@ async function submitCreate() {
     return;
   }
   state.bots.push(result.data);
+  publishBotNames();
   state.creating = null;
   render();
 }
