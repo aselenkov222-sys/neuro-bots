@@ -50,6 +50,7 @@ const state = {
   card: null,
   routine: null,
   routineTime: "09:00",
+  routineHold: null,
   messages: []
 };
 
@@ -351,9 +352,18 @@ function routineLocked() {
 function routineBlock() {
   const locked = routineLocked();
   const routine = state.routine;
-  const selected = routine && Array.isArray(routine.weekdays) ? routine.weekdays : [];
-  const time = routine && typeof routine.time === "string" ? routine.time : state.routineTime;
+  const hold = state.routineHold;
+  const selected = hold
+    ? hold.body.weekdays
+    : routine && Array.isArray(routine.weekdays) ? routine.weekdays : [];
+  const time = hold
+    ? hold.body.time
+    : routine && typeof routine.time === "string" ? routine.time : state.routineTime;
   const paused = routine ? routine.paused === true : false;
+  const warn = hold
+    ? `<p class="warn" id="routine-warn" role="status">В это время уже стоит рутина бота «${esc(hold.name)}». Она создана раньше и пойдёт первой. Эта выполнит весь сценарий после неё.</p>
+       <button type="button" class="btn-green" data-action="keep-routine-time">Оставить это время</button>`
+    : "";
   const days = DAYS.map((day) => `
     <button type="button" class="day ${selected.includes(day.id) ? "is-on" : ""}" data-action="toggle-day" data-day="${day.id}" aria-pressed="${selected.includes(day.id) ? "true" : "false"}" ${locked ? "disabled" : ""}>${day.short}</button>`).join("");
   return `
@@ -371,6 +381,7 @@ function routineBlock() {
           </label>
           <button type="button" class="btn-green" data-action="toggle-pause" ${locked || !routine ? "disabled" : ""}>${paused ? "Снять паузу" : "Пауза"}</button>
         </div>
+        ${warn}
       </div>
     </section>`;
 }
@@ -533,6 +544,62 @@ async function loadRoutine() {
   if (state.routine && typeof state.routine.time === "string") {
     state.routineTime = state.routine.time;
   }
+}
+
+function schedulesOverlap(leftDays, leftTime, rightDays, rightTime) {
+  if (leftTime !== rightTime) return false;
+  if (!Array.isArray(leftDays) || !Array.isArray(rightDays)) return false;
+  return leftDays.some((day) => rightDays.includes(day));
+}
+
+async function accountRoutines() {
+  const listed = await api("/api/bots");
+  const bots = listed.ok && listed.data && Array.isArray(listed.data.bots)
+    ? listed.data.bots
+    : null;
+  if (!bots) return null;
+  const found = [];
+  for (const bot of bots) {
+    if (!bot || typeof bot.id !== "string" || typeof bot.name !== "string") continue;
+    const routines = await api(`/api/bots/${bot.id}/routines`);
+    if (!routines.ok || !Array.isArray(routines.data)) return null;
+    for (const routine of routines.data) {
+      if (!routine || typeof routine.id !== "string") continue;
+      found.push({
+        id: routine.id,
+        name: bot.name,
+        weekdays: routine.weekdays,
+        time: routine.time
+      });
+    }
+  }
+  return found;
+}
+
+async function proposeRoutine(body, routineId) {
+  const others = await accountRoutines();
+  if (!others) {
+    render();
+    return;
+  }
+  const clash = others.find((item) => {
+    if (routineId && item.id === routineId) return false;
+    return schedulesOverlap(body.weekdays, body.time, item.weekdays, item.time);
+  });
+  if (clash) {
+    state.routineHold = { body, routineId: routineId || null, name: clash.name };
+    render();
+    return;
+  }
+  state.routineHold = null;
+  await saveRoutine(body, routineId);
+}
+
+async function keepHeldRoutine() {
+  const hold = state.routineHold;
+  if (!hold) return;
+  state.routineHold = null;
+  await saveRoutine(hold.body, hold.routineId);
 }
 
 async function saveRoutine(body, routineId) {
@@ -713,11 +780,15 @@ app.addEventListener("change", (event) => {
     const next = target.value;
     if (!next) return;
     state.routineTime = next;
-    if (!state.routine || next === state.routine.time) return;
-    saveRoutine(
-      { weekdays: state.routine.weekdays, time: next },
-      state.routine.id
-    );
+    const hold = state.routineHold;
+    const routine = state.routine;
+    const weekdays = hold
+      ? hold.body.weekdays
+      : routine && Array.isArray(routine.weekdays) ? routine.weekdays : [];
+    if (weekdays.length === 0) return;
+    const routineId = hold ? hold.routineId : routine && routine.id;
+    if (!hold && routine && next === routine.time) return;
+    proposeRoutine({ weekdays, time: next }, routineId);
   }
 });
 
@@ -771,6 +842,7 @@ app.addEventListener("click", (event) => {
     state.card = null;
     state.routine = null;
     state.routineTime = "09:00";
+    state.routineHold = null;
     location.hash = "#bot";
     return;
   }
@@ -780,6 +852,7 @@ app.addEventListener("click", (event) => {
   }
   if (action === "toggle-day") toggleDay(Number(target.dataset.day));
   if (action === "toggle-pause") togglePause();
+  if (action === "keep-routine-time") keepHeldRoutine();
   restoreFocus(target);
 });
 
@@ -787,13 +860,20 @@ async function toggleDay(day) {
   if (!state.card || !state.activeId || routineLocked()) return;
   if (!Number.isInteger(day) || day < 1 || day > 7) return;
   const routine = state.routine;
-  const selected = routine && Array.isArray(routine.weekdays) ? routine.weekdays.slice() : [];
+  const hold = state.routineHold;
+  const selected = hold
+    ? hold.body.weekdays.slice()
+    : routine && Array.isArray(routine.weekdays) ? routine.weekdays.slice() : [];
   const next = selected.includes(day)
     ? selected.filter((item) => item !== day)
     : selected.concat(day).sort((left, right) => left - right);
-  const time = routine && typeof routine.time === "string" ? routine.time : state.routineTime;
-  if (routine && next.length === 0) {
-    const result = await api(`/api/bots/${state.activeId}/routines/${routine.id}`, {
+  const time = hold
+    ? hold.body.time
+    : routine && typeof routine.time === "string" ? routine.time : state.routineTime;
+  const routineId = hold ? hold.routineId : routine ? routine.id : null;
+  if (routineId && next.length === 0) {
+    state.routineHold = null;
+    const result = await api(`/api/bots/${state.activeId}/routines/${routineId}`, {
       method: "DELETE"
     });
     note(result);
@@ -801,8 +881,12 @@ async function toggleDay(day) {
     render();
     return;
   }
-  if (next.length === 0) return;
-  saveRoutine({ weekdays: next, time }, routine ? routine.id : null);
+  if (next.length === 0) {
+    state.routineHold = null;
+    render();
+    return;
+  }
+  proposeRoutine({ weekdays: next, time }, routineId);
 }
 
 async function togglePause() {
@@ -832,6 +916,7 @@ async function signOut() {
   state.card = null;
   state.routine = null;
   state.routineTime = "09:00";
+  state.routineHold = null;
   state.messages = [];
   if (location.hash !== "#login") location.hash = "#login";
   else render();
