@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError
@@ -18,12 +18,14 @@ from server.auth import (
     unauthenticated,
 )
 from server.models import desktops
+from server.notices import mark_delivered, pending_notices
 
 router = APIRouter()
 
 INVALID_DESKTOP = "Нужен идентификатор десктопа."
 NOT_FOUND_DESKTOP = "Десктоп не найден."
 INVALID_TIMEZONE = "Неизвестная временная зона."
+INVALID_NOTICES = "Нужны идентификаторы уведомлений."
 
 
 def _find_desktop(
@@ -264,3 +266,75 @@ async def post_pulse(request: Request, computer_id: str) -> JSONResponse:
             release_account_routines(connection, account["id"], now)
         touch_session(connection, session["id"], now)
     return JSONResponse({"timezone": timezone_name})
+
+
+def _working_match(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> RowMapping | None:
+    row = find_working_desktop(connection, account_id)
+    if row is None or row["computer_id"] != computer_id:
+        return None
+    return row
+
+
+@router.get("/api/desktops/{computer_id}/notices")
+def get_notices(request: Request, computer_id: str) -> JSONResponse:
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            return unauthenticated()
+        parsed = parse_path_computer_id(computer_id)
+        if parsed is None:
+            return desktop_not_found()
+        session, account = current
+        if _working_match(connection, account["id"], parsed) is None:
+            return desktop_not_found()
+        notices = pending_notices(connection, account["id"])
+        touch_session(connection, session["id"], now)
+    return JSONResponse({"notices": notices})
+
+
+async def _read_notice_ids(request: Request) -> list[uuid.UUID] | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(400, "invalid_request", INVALID_NOTICES)
+    if not isinstance(body, dict):
+        return error_response(400, "invalid_request", INVALID_NOTICES)
+    raw = body.get("ids")
+    if not isinstance(raw, list):
+        return error_response(400, "invalid_request", INVALID_NOTICES)
+    parsed: list[uuid.UUID] = []
+    for item in raw:
+        if not isinstance(item, str):
+            return error_response(400, "invalid_request", INVALID_NOTICES)
+        try:
+            parsed.append(uuid.UUID(item))
+        except ValueError:
+            return error_response(400, "invalid_request", INVALID_NOTICES)
+    return parsed
+
+
+@router.post("/api/desktops/{computer_id}/notices")
+async def post_notices(request: Request, computer_id: str) -> Response:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    notice_ids = await _read_notice_ids(request)
+    if isinstance(notice_ids, JSONResponse):
+        return notice_ids
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            return unauthenticated()
+        parsed = parse_path_computer_id(computer_id)
+        if parsed is None:
+            return desktop_not_found()
+        session, account = current
+        if _working_match(connection, account["id"], parsed) is None:
+            return desktop_not_found()
+        mark_delivered(connection, account["id"], notice_ids, now)
+        touch_session(connection, session["id"], now)
+    return Response(status_code=204)

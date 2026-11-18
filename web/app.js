@@ -110,10 +110,37 @@ function sendPulse() {
   }).catch(() => {});
 }
 
+function publishNotices() {
+  const bridge = window.__neuroDesktop;
+  if (!state.me || !bridge || typeof bridge.id !== "string") return;
+  if (typeof bridge.openUrl !== "string" || typeof bridge.openToken !== "string") return;
+  api(`/api/desktops/${bridge.id}/notices`).then((result) => {
+    if (!result.ok || !result.data || !Array.isArray(result.data.notices) || !result.data.notices.length) return null;
+    return fetch(`${bridge.openUrl.replace(/\/$/, "")}/notify`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Desktop-Open": bridge.openToken
+      },
+      body: JSON.stringify({ notices: result.data.notices })
+    }).then((response) => response.ok ? response.json() : null).then((posted) => {
+      if (!posted || !Array.isArray(posted.ids) || !posted.ids.length) return null;
+      return api(`/api/desktops/${bridge.id}/notices`, {
+        method: "POST",
+        body: { ids: posted.ids }
+      });
+    });
+  }).catch(() => {});
+}
+
 function startPulse() {
   if (pulseTimer !== null) return;
   sendPulse();
-  pulseTimer = setInterval(sendPulse, PULSE_INTERVAL_MS);
+  publishNotices();
+  pulseTimer = setInterval(() => {
+    sendPulse();
+    publishNotices();
+  }, PULSE_INTERVAL_MS);
   if (browserTimer === null) browserTimer = setInterval(finishBrowserTask, 1000);
 }
 

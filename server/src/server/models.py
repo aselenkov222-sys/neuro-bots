@@ -195,3 +195,18 @@ routine_checks = Table(
         name="routine_checks_status_check",
     ),
 )
+
+desktop_notices = Table(
+    "desktop_notices",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("account_id", Uuid(), ForeignKey("accounts.id"), nullable=False),
+    Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
+    Column("kind", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("delivered_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "kind IN ('completed', 'failed', 'skipped')",
+        name="desktop_notices_kind_check",
+    ),
+)
