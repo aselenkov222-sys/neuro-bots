@@ -59,6 +59,7 @@ ROUTINE_NOT_FOUND = "Рутина не найдена."
 INVALID_PAUSE = "Нужен признак паузы."
 SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
 SKIP_CODE = "routine_skipped"
+QUEUE_CODE = "routine_queue"
 SCENARIO_INSUFFICIENT = "scenario_insufficient"
 SCENARIO_INSUFFICIENT_TEXT = "Запуск завершён: сценария недостаточно."
 SITE_NOT_OPENED = "site_not_opened"
@@ -223,6 +224,35 @@ def _write_chat_error(
 
 def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
     _write_chat_error(connection, bot_id, now, SKIP_CODE, SKIP_TEXT)
+
+
+def queue_text(name: str) -> str:
+    return f"Ждёт бота «{name}»."
+
+
+def _note_queue(
+    connection: Connection,
+    account_id: uuid.UUID,
+    holder_bot_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    name = connection.execute(
+        select(bots.c.name).where(bots.c.id == holder_bot_id)
+    ).scalar_one()
+    waiting = connection.execute(
+        select(routines.c.bot_id)
+        .join(routine_runs, routine_runs.c.routine_id == routines.c.id)
+        .join(bots, bots.c.id == routines.c.bot_id)
+        .where(
+            bots.c.account_id == account_id,
+            routines.c.paused.is_(False),
+            routine_runs.c.status == "pending",
+            routine_runs.c.due_at > _aware(now) - CLAIM_WAIT,
+        )
+    ).scalars()
+    text = queue_text(str(name))
+    for bot_id in waiting:
+        _write_chat_error(connection, bot_id, now, QUEUE_CODE, text)
 
 
 def scenario_insufficient(value: object) -> bool:
@@ -626,6 +656,7 @@ def claim_earliest_pending(
     )
     if updated.rowcount != 1:
         return None
+    _note_queue(connection, account_id, pending["bot_id"], moment)
     _complete_claimed_run(connection, account_id, pending["bot_id"], moment)
     return pending
 

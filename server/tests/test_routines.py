@@ -2221,7 +2221,9 @@ def test_two_routines_at_one_time_run_in_creation_order(
     earlier_chat = _chat_messages(uuid.UUID(first["id"]))
     assert [row["role"] for row in earlier_chat] == ["assistant"]
     assert earlier_chat[0]["text"] == STUB_TEXT
-    assert _chat_messages(uuid.UUID(second["id"])) == []
+    waiting = _chat_messages(uuid.UUID(second["id"]))
+    assert [row["role"] for row in waiting] == ["error"]
+    assert all(row["role"] != "assistant" for row in waiting)
     assert seen == ["сценарий первого"]
     second_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
     assert second_claim.status_code == 200
@@ -2229,6 +2231,63 @@ def test_two_routines_at_one_time_run_in_creation_order(
     assert second_claim.json()["routine_id"] == later.json()["id"]
     assert _runs_for(later.json()["id"])[0]["status"] == "claimed"
     later_chat = _chat_messages(uuid.UUID(second["id"]))
-    assert [row["role"] for row in later_chat] == ["assistant"]
-    assert later_chat[0]["text"] == STUB_TEXT
+    assert any(
+        row["role"] == "assistant" and row["text"] == STUB_TEXT for row in later_chat
+    )
     assert seen == ["сценарий первого", "сценарий второго"]
+
+
+def test_waiting_bot_is_told_once_who_holds_the_browser(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("queue-note@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        second = _create_bot(client, "Второй", "сценарий второго")
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert later.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    claimed = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert claimed.status_code == 200
+    assert set(claimed.json()) == {"id", "routine_id", "bot_id"}
+    waiting = _chat_messages(uuid.UUID(second["id"]))
+    assert len(waiting) == 1
+    assert waiting[0]["role"] == "error"
+    assert waiting[0]["code"] == "routine_queue"
+    assert waiting[0]["text"] == "Ждёт бота «Первый»."
+    holder = _chat_messages(uuid.UUID(first["id"]))
+    assert [row["code"] for row in holder] == [None]
+    assert all(row["code"] != "routine_queue" for row in holder)
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 200
+    assert again.json()["routine_id"] == later.json()["id"]
+    after = sorted(
+        _chat_messages(uuid.UUID(second["id"])),
+        key=lambda row: (row["updated_at"], row["role"] != "error", str(row["id"])),
+    )
+    assert [row["code"] for row in after] == ["routine_queue", None]
+    assert [row["text"] for row in after] == [
+        "Ждёт бота «Первый».",
+        STUB_TEXT,
+    ]
+    assert sum(row["code"] == "routine_queue" for row in after) == 1
