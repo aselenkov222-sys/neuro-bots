@@ -1,3 +1,4 @@
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,20 @@ def test_zoneinfo_path_reads_europe_moscow(tmp_path: Path) -> None:
     zone.write_bytes(b"")
     link = tmp_path / "localtime"
     link.symlink_to(zone)
+    assert timezone_name_from_zoneinfo_path(link) == "Europe/Moscow"
+
+
+def test_var_db_zoneinfo_link_is_kept_when_realpath_drops_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link = tmp_path / "localtime"
+    link.symlink_to("/var/db/timezone/zoneinfo/Europe/Moscow")
+
+    def realpath(path: str) -> str:
+        assert path == str(link)
+        return "/usr/share/zoneinfo.default/Europe/Moscow"
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
     assert timezone_name_from_zoneinfo_path(link) == "Europe/Moscow"
 
 
