@@ -70,7 +70,14 @@ DESKTOP_COLUMNS = (
     "session_id",
     "routines_stopped",
 )
-ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day", "paused")
+ROUTINE_COLUMNS = (
+    "id",
+    "bot_id",
+    "weekdays",
+    "time_of_day",
+    "paused",
+    "created_at",
+)
 ACCOUNT_REVISION = "3c87a0f84d5e"
 CONFIRMATION_REVISION = "ff582d8bc7fb"
 EMAIL_CONFIRMED_REVISION = "048ee727aa3e"
@@ -83,6 +90,8 @@ STOPPED_REVISION = "9e4b1c7a6d20"
 RUN_REVISION = "f7a2c6e81d04"
 CASCADE_REVISION = "a1c4e8b27d60"
 CANCELLED_REVISION = "d4f1b8e06c32"
+FAILED_REVISION = "b8e5c2a94f17"
+ORDER_REVISION = "c4d8e2a71b06"
 ROUTINE_RUN_COLUMNS = (
     "id",
     "routine_id",
@@ -176,7 +185,10 @@ def _revision_chain() -> list[str]:
     assert links[RUN_REVISION] == STOPPED_REVISION
     assert links[CASCADE_REVISION] == RUN_REVISION
     assert links[CANCELLED_REVISION] == CASCADE_REVISION
-    assert links[chain[-1]] == CANCELLED_REVISION
+    assert links[FAILED_REVISION] == CANCELLED_REVISION
+    assert links[ORDER_REVISION] == FAILED_REVISION
+    assert links[chain[-1]] == FAILED_REVISION
+    assert chain[-1] == ORDER_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
@@ -188,6 +200,7 @@ def _revision_chain() -> list[str]:
     assert chain[-1] != RUN_REVISION
     assert chain[-1] != CASCADE_REVISION
     assert chain[-1] != CANCELLED_REVISION
+    assert chain[-1] != FAILED_REVISION
     return chain
 
 
@@ -726,6 +739,11 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert routines.c.paused.nullable is False
     assert routines.c.paused.default is None
     assert routines.c.paused.server_default.arg.text == "false"
+    assert isinstance(routines.c.created_at.type, DateTime)
+    assert routines.c.created_at.type.timezone is True
+    assert routines.c.created_at.nullable is False
+    assert routines.c.created_at.default is None
+    assert routines.c.created_at.server_default.arg.text == "now()"
     assert [
         constraint
         for constraint in routines.constraints
@@ -1188,6 +1206,13 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                 assert routine_columns["paused"]["format_type"] == "boolean"
                 assert routine_columns["paused"]["not_null"] is True
                 assert routine_columns["paused"]["column_default"] == "false"
+                assert routine_columns["created_at"]["type_name"] == "timestamptz"
+                assert (
+                    routine_columns["created_at"]["format_type"]
+                    == "timestamp with time zone"
+                )
+                assert routine_columns["created_at"]["not_null"] is True
+                assert "now()" in str(routine_columns["created_at"]["column_default"])
                 assert _constraints(connection, "routines") == {
                     ("p", "PRIMARY KEY (id)"),
                     (

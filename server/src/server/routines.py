@@ -593,7 +593,11 @@ def claim_earliest_pending(
                 routine_runs.c.status == "pending",
                 routine_runs.c.due_at > moment - CLAIM_WAIT,
             )
-            .order_by(routine_runs.c.due_at.asc(), routine_runs.c.id.asc())
+            .order_by(
+                routine_runs.c.due_at.asc(),
+                routines.c.created_at.asc(),
+                routine_runs.c.id.asc(),
+            )
             .limit(1)
         )
         .mappings()
@@ -803,6 +807,7 @@ async def create_routine(request: Request, bot_id: str) -> JSONResponse:
                 weekdays=days,
                 time_of_day=_clock(clock),
                 paused=False,
+                created_at=opened.now,
             )
         )
         row = (

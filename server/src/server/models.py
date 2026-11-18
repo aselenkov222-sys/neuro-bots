@@ -154,6 +154,12 @@ routines = Table(
     Column("weekdays", ARRAY(Integer()), nullable=False),
     Column("time_of_day", Time(timezone=False), nullable=False),
     Column("paused", Boolean(), nullable=False, server_default=text("false")),
+    Column(
+        "created_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
 )
 
 routine_runs = Table(

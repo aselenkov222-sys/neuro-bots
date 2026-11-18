@@ -6,7 +6,17 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import ARRAY, Boolean, Integer, Text, Time, Uuid, select, text
+from sqlalchemy import (
+    ARRAY,
+    Boolean,
+    DateTime,
+    Integer,
+    Text,
+    Time,
+    Uuid,
+    select,
+    text,
+)
 
 from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
@@ -38,7 +48,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 ORIGIN = "http://testserver"
 ACCEPTED = "abcdef1!"
-ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day", "paused")
+ROUTINE_COLUMNS = (
+    "id",
+    "bot_id",
+    "weekdays",
+    "time_of_day",
+    "paused",
+    "created_at",
+)
 ROUTINE_FIELDS = ("id", "weekdays", "time", "paused")
 INVALID_PAUSE = {"code": "invalid_request", "message": "Нужен признак паузы."}
 INVALID_ROUTINE = {
@@ -249,10 +266,14 @@ def test_routine_model_and_table_have_schedule_columns_only(database: None) -> N
     assert routines.c.time_of_day.nullable is False
     for column in routines.columns:
         assert not isinstance(column.type, Text)
-        assert column.name not in {"scenario", "text", "title", "created_at"}
+        assert column.name not in {"scenario", "text", "title"}
     assert isinstance(routines.c.paused.type, Boolean)
     assert routines.c.paused.nullable is False
     assert routines.c.paused.server_default.arg.text == "false"
+    assert isinstance(routines.c.created_at.type, DateTime)
+    assert routines.c.created_at.type.timezone is True
+    assert routines.c.created_at.nullable is False
+    assert routines.c.created_at.server_default.arg.text == "now()"
 
     engine = create_db_engine()
     try:
@@ -302,6 +323,7 @@ def test_routine_model_and_table_have_schedule_columns_only(database: None) -> N
         "integer[]",
         "time without time zone",
         "boolean",
+        "timestamp with time zone",
     ]
     assert all(row["not_null"] is True for row in columns)
     assert set(constraints) == {
@@ -2146,3 +2168,67 @@ def test_active_period_from_confirmation_still_opens_the_minute(
     assert opened[0]["status"] == "pending"
     assert opened[0]["due_at"] == DUE
     assert _chat_messages(bot_id) == []
+
+
+def test_two_routines_at_one_time_run_in_creation_order(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    def spy(**kwargs: object) -> str:
+        scenario = kwargs["scenario"]
+        assert isinstance(scenario, str)
+        seen.append(scenario)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id = _open_account("queue-order@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        second = _create_bot(client, "Второй", "сценарий второго")
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert later.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    stored = {row["bot_id"]: row for row in _account_routines(account_id)}
+    assert (
+        stored[uuid.UUID(first["id"])]["created_at"]
+        < stored[uuid.UUID(second["id"])]["created_at"]
+    )
+    first_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert first_claim.status_code == 200
+    assert first_claim.json()["bot_id"] == first["id"]
+    assert first_claim.json()["routine_id"] == earlier.json()["id"]
+    assert _runs_for(earlier.json()["id"])[0]["status"] == "claimed"
+    assert _runs_for(later.json()["id"])[0]["status"] == "pending"
+    earlier_chat = _chat_messages(uuid.UUID(first["id"]))
+    assert [row["role"] for row in earlier_chat] == ["assistant"]
+    assert earlier_chat[0]["text"] == STUB_TEXT
+    assert _chat_messages(uuid.UUID(second["id"])) == []
+    assert seen == ["сценарий первого"]
+    second_claim = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert second_claim.status_code == 200
+    assert second_claim.json()["bot_id"] == second["id"]
+    assert second_claim.json()["routine_id"] == later.json()["id"]
+    assert _runs_for(later.json()["id"])[0]["status"] == "claimed"
+    later_chat = _chat_messages(uuid.UUID(second["id"]))
+    assert [row["role"] for row in later_chat] == ["assistant"]
+    assert later_chat[0]["text"] == STUB_TEXT
+    assert seen == ["сценарий первого", "сценарий второго"]
