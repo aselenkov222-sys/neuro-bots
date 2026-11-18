@@ -9,6 +9,11 @@ from desktop.identity import (
     default_state_dir,
     local_timezone_name,
 )
+from desktop.routine_gate import (
+    mark_process_stopping,
+    mark_window_hidden,
+    reset,
+)
 
 PYWEBVIEW = "pywebview"
 PYSIDE6 = "pyside6"
@@ -56,6 +61,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def open_cabinet(origin: str, on_ready=None) -> None:
+    reset()
     from desktop.password_screen import allow_cabinet_origin
 
     allow_cabinet_origin(origin)
@@ -97,6 +103,7 @@ def _open_pywebview(origin: str, on_ready) -> None:
 def _hide_pywebview_on_close(window) -> None:
     def on_closing() -> bool:
         window.hide()
+        mark_window_hidden()
         return False
 
     window.events.closing += on_closing
@@ -185,6 +192,7 @@ def _cabinet_view(base):
         def closeEvent(self, event) -> None:
             event.ignore()
             self.hide()
+            mark_window_hidden()
 
     CabinetView._qt_base = base
     return CabinetView
@@ -263,4 +271,5 @@ def _inject_desktop_bridge(run_script) -> None:
 
 
 def _stop_process() -> None:
+    mark_process_stopping()
     os._exit(0)
