@@ -26,6 +26,7 @@ from server.bots import (
     _adapter_messages,
     _insert_message,
     _lock_quota_counter,
+    _messages_document,
     not_found,
     open_confirmed,
     parse_id,
@@ -45,6 +46,7 @@ from server.models import (
     messages,
     quota_charges,
     quota_counters,
+    routine_checks,
     routine_runs,
     routines,
     subscription_periods,
@@ -600,14 +602,10 @@ def settle_due(connection: Connection, now: datetime) -> None:
         )
 
 
-def claim_earliest_pending(
-    connection: Connection, account_id: uuid.UUID, now: datetime
+def _earliest_claimable_run(
+    connection: Connection, account_id: uuid.UUID, moment: datetime
 ) -> RowMapping | None:
-    moment = _aware(now)
-    settle_due(connection, moment)
-    if working_routines_stopped(connection, account_id):
-        return None
-    pending = (
+    return (
         connection.execute(
             select(
                 routine_runs.c.id,
@@ -633,7 +631,18 @@ def claim_earliest_pending(
         .mappings()
         .one_or_none()
     )
+
+
+def claim_earliest_pending(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> RowMapping | None:
+    moment = _aware(now)
+    settle_due(connection, moment)
+    if working_routines_stopped(connection, account_id):
+        return None
+    pending = _earliest_claimable_run(connection, account_id, moment)
     if pending is None:
+        _claim_earliest_check(connection, account_id, moment)
         return None
     if scenario_insufficient(pending["scenario"]):
         _mark_failed(
@@ -661,11 +670,92 @@ def claim_earliest_pending(
     return pending
 
 
+def _desktop_live(connection: Connection, account_id: uuid.UUID) -> bool:
+    desktop = find_working_desktop(connection, account_id)
+    return desktop is not None and desktop["last_pulse_at"] is not None
+
+
+def _claim_earliest_check(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> None:
+    if working_routines_stopped(connection, account_id):
+        return
+    if _earliest_claimable_run(connection, account_id, now) is not None:
+        return
+    pending = (
+        connection.execute(
+            select(routine_checks.c.id, routine_checks.c.bot_id)
+            .join(bots, bots.c.id == routine_checks.c.bot_id)
+            .where(
+                bots.c.account_id == account_id,
+                routine_checks.c.status == "pending",
+            )
+            .order_by(
+                routine_checks.c.created_at.asc(),
+                routine_checks.c.id.asc(),
+            )
+            .limit(1)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if pending is None:
+        return
+    updated = connection.execute(
+        routine_checks.update()
+        .where(
+            routine_checks.c.id == pending["id"],
+            routine_checks.c.status == "pending",
+        )
+        .values(status="claimed")
+    )
+    if updated.rowcount != 1:
+        return
+    bot = (
+        connection.execute(select(bots).where(bots.c.id == pending["bot_id"]))
+        .mappings()
+        .one()
+    )
+    if scenario_insufficient(bot["scenario"]):
+        _write_chat_error(
+            connection,
+            pending["bot_id"],
+            now,
+            SCENARIO_INSUFFICIENT,
+            SCENARIO_INSUFFICIENT_TEXT,
+        )
+        return
+    _speak_scenario(
+        connection,
+        account_id,
+        pending["bot_id"],
+        now,
+        desktop_available=True,
+    )
+
+
 def _complete_claimed_run(
     connection: Connection,
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
     now: datetime,
+) -> None:
+    _speak_scenario(
+        connection,
+        account_id,
+        bot_id,
+        now,
+        desktop_available=True,
+    )
+
+
+def _speak_scenario(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    now: datetime,
+    *,
+    desktop_available: bool,
 ) -> None:
     bot = (
         connection.execute(select(bots).where(bots.c.id == bot_id))
@@ -698,7 +788,7 @@ def _complete_claimed_run(
         description=bot["description"],
         scenario=scenario,
         messages=_adapter_messages(connection, chat["id"]),
-        desktop_available=True,
+        desktop_available=desktop_available,
     )
     if reply == "":
         _insert_message(
@@ -874,6 +964,56 @@ def list_routines(request: Request, bot_id: str) -> JSONResponse:
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse([routine_document(row) for row in rows])
+
+
+@router.post("/api/bots/{bot_id}/check")
+def check_now(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _owned_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        if scenario_insufficient(bot["scenario"]):
+            return _scenario_required()
+        chat = (
+            opened.connection.execute(
+                select(chats).where(chats.c.bot_id == parsed_id)
+            )
+            .mappings()
+            .one()
+        )
+        queued = (
+            _earliest_claimable_run(
+                opened.connection, opened.account["id"], opened.now
+            )
+            is not None
+        )
+        opened.connection.execute(
+            routine_checks.insert().values(
+                id=uuid.uuid4(),
+                bot_id=parsed_id,
+                status="pending" if queued else "claimed",
+                created_at=opened.now,
+            )
+        )
+        if not queued:
+            _speak_scenario(
+                opened.connection,
+                opened.account["id"],
+                parsed_id,
+                opened.now,
+                desktop_available=_desktop_live(
+                    opened.connection, opened.account["id"]
+                ),
+            )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        document = _messages_document(opened.connection, chat["id"])
+        document["queued"] = queued
+        return JSONResponse(document)
 
 
 @router.delete("/api/bots/{bot_id}/routines/{routine_id}")

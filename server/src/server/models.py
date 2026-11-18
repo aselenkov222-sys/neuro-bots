@@ -182,3 +182,16 @@ routine_runs = Table(
     ),
     UniqueConstraint("routine_id", "local_date"),
 )
+
+routine_checks = Table(
+    "routine_checks",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "status IN ('pending', 'claimed')",
+        name="routine_checks_status_check",
+    ),
+)

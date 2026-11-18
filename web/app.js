@@ -380,6 +380,7 @@ function routineBlock() {
             <input id="routine-time" type="time" value="${esc(time || "09:00")}" ${locked ? "disabled" : ""}>
           </label>
           <button type="button" class="btn-green" data-action="toggle-pause" ${locked || !routine ? "disabled" : ""}>${paused ? "Снять паузу" : "Пауза"}</button>
+          <button type="button" class="btn-green" data-action="check-now" ${locked ? "disabled" : ""}>Проверить сейчас</button>
         </div>
         ${warn}
       </div>
@@ -852,9 +853,22 @@ app.addEventListener("click", (event) => {
   }
   if (action === "toggle-day") toggleDay(Number(target.dataset.day));
   if (action === "toggle-pause") togglePause();
+  if (action === "check-now") checkNow();
   if (action === "keep-routine-time") keepHeldRoutine();
   restoreFocus(target);
 });
+
+async function checkNow() {
+  if (!state.activeId || routineLocked()) return;
+  const result = await api(`/api/bots/${state.activeId}/check`, { method: "POST" });
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
+  if (location.hash !== "#chat") location.hash = "#chat";
+  else showCurrent();
+}
 
 async function toggleDay(day) {
   if (!state.card || !state.activeId || routineLocked()) return;

@@ -360,6 +360,7 @@ def test_browser_shows_routine_days_and_one_time(database: None) -> None:
             assert page.locator(".day").first.is_disabled()
             assert page.locator("#routine-time").is_disabled()
             assert page.locator("[data-action='toggle-pause']").is_disabled()
+            assert page.locator("[data-action='check-now']").is_disabled()
 
             page.goto(f"{origin}/#bots")
             page.wait_for_selector("text=Создать бота")
@@ -383,7 +384,15 @@ def test_browser_shows_routine_days_and_one_time(database: None) -> None:
                 page.locator("text=Дни недели и одно время. Своего текста у рутины нет.").count()
                 == 1
             )
-            assert page.locator("text=Проверить сейчас").count() == 0
+            check_now = page.locator("[data-action='check-now']")
+            assert check_now.inner_text() == "Проверить сейчас"
+            assert check_now.is_enabled()
+            check_now.click()
+            page.wait_for_selector(f"text={STUB}")
+            assert page.locator(".bubble").filter(has_text=STUB).count() == 1
+            page.locator("a", has_text="Карточка").click()
+            page.wait_for_selector("#routine-time")
+            assert page.locator("h1").inner_text() == "Искра"
             assert page.locator("text=Кликабельный макет").count() == 0
             assert page.locator(".proto").count() == 0
             assert page.locator(".proto-nav").count() == 0
