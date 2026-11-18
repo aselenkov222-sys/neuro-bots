@@ -9,8 +9,9 @@ from desktop.notify import (
     FAILED,
     PHRASES,
     SKIPPED,
-    activate,
     bind_cabinet,
+    click_command,
+    notification_command,
     open_chat_script,
     post_local,
     reset_cabinet,
@@ -44,9 +45,9 @@ def test_local_notification_is_recorded_for_completion_failure_and_skip() -> Non
     posted = post_local(notices, run=_run(commands))
     assert posted == notices
     assert commands == [
-        ["osascript", "-e", f'display notification "{PHRASES[COMPLETED]}"'],
-        ["osascript", "-e", f'display notification "{PHRASES[FAILED]}"'],
-        ["osascript", "-e", f'display notification "{PHRASES[SKIPPED]}"'],
+        notification_command(PHRASES[COMPLETED], bot_id),
+        notification_command(PHRASES[FAILED], bot_id),
+        notification_command(PHRASES[SKIPPED], bot_id),
     ]
     assert PHRASES[COMPLETED] == "Запуск завершился"
     assert PHRASES[FAILED] == "Запуск сорвался"
@@ -67,59 +68,28 @@ def test_an_ordinary_reply_and_a_queue_note_are_not_posted() -> None:
     assert commands == []
 
 
-def test_click_opens_the_main_chat_for_a_hidden_and_a_visible_window() -> None:
-    bot_id = str(uuid.uuid4())
-    script = open_chat_script(bot_id)
+def test_clicking_the_posted_notification_opens_that_main_chat() -> None:
     source = WEB_APP.read_text(encoding="utf-8")
-    assert "neuro-open-chat" in source
+    assert 'addEventListener("neuro-open-chat"' in source
     assert "__neuroOpenChat" in source
-    assert script == (
-        "window.__neuroOpenChat = "
-        + json.dumps(bot_id)
-        + ";window.dispatchEvent(new Event('neuro-open-chat'));"
+    assert 'location.hash = "#chat"' in source
+    bot_id = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    commands: list[list[str]] = []
+    posted = post_local(
+        [_notice(COMPLETED, bot_id), _notice(FAILED, other)],
+        run=_run(commands),
     )
-    assert "#chat" in source
-    hidden_script = _activate(bot_id, hidden=True)
-    visible_script = _activate(bot_id, hidden=False)
-    assert hidden_script == [script]
-    assert visible_script == [script]
+    assert [item["bot_id"] for item in posted] == [bot_id, other]
+    assert bot_id in commands[0][2]
+    assert other not in commands[0][2]
+    hidden = _click_recorded(commands[0], hidden=True)
+    visible = _click_recorded(commands[1], hidden=False)
+    assert hidden == [open_chat_script(bot_id)]
+    assert visible == [open_chat_script(other)]
 
 
-def test_loopback_click_opens_the_hidden_window_on_that_chat() -> None:
-    opened = serve_password_screen()
-    try:
-        cabinet = "http://127.0.0.1:8765"
-        opened.httpd.cabinet_origin = cabinet
-        bot_id = str(uuid.uuid4())
-        shown: list[str] = []
-        scripts: list[str] = []
-        reset()
-        reset_cabinet()
-        mark_window_hidden()
-        bind_cabinet(lambda: shown.append("shown"), scripts.append)
-        status, body = _post_path(opened, "/notify-click", {"bot_id": bot_id}, cabinet)
-        assert status == 204
-        assert body == b""
-        assert shown == ["shown"]
-        assert window_hidden() is False
-        assert scripts == [open_chat_script(bot_id)]
-        leaked, leaked_body = _post_path(
-            opened,
-            "/notify-click",
-            {"bot_id": bot_id, "password": "machine-secret-7", "cookie": "vault-cookie-9"},
-            cabinet,
-        )
-        assert leaked == 400
-        assert b"machine-secret-7" not in leaked_body
-        assert b"vault-cookie-9" not in leaked_body
-        assert shown == ["shown"]
-    finally:
-        reset()
-        reset_cabinet()
-        opened.close()
-
-
-def _activate(bot_id: str, *, hidden: bool) -> list[str]:
+def _click_recorded(command: list[str], *, hidden: bool) -> list[str]:
     scripts: list[str] = []
     shown: list[str] = []
     reset()
@@ -127,7 +97,7 @@ def _activate(bot_id: str, *, hidden: bool) -> list[str]:
     if hidden:
         mark_window_hidden()
     bind_cabinet(lambda: shown.append("shown"), scripts.append)
-    assert activate(bot_id) is True
+    assert click_command(command) is True
     assert shown == (["shown"] if hidden else [])
     assert window_hidden() is False
     return scripts
@@ -150,6 +120,16 @@ def test_loopback_posts_those_notifications_and_refuses_a_password() -> None:
         assert status == 200
         assert json.loads(body.decode()) == {"ids": [item["id"] for item in notices]}
         assert [command[0] for command in commands] == ["osascript", "osascript", "osascript"]
+        shown: list[str] = []
+        scripts: list[str] = []
+        reset()
+        reset_cabinet()
+        mark_window_hidden()
+        bind_cabinet(lambda: shown.append("shown"), scripts.append)
+        assert click_command(commands[0]) is True
+        assert shown == ["shown"]
+        assert window_hidden() is False
+        assert scripts == [open_chat_script(bot_id)]
         leaked = {
             "notices": notices,
             "password": "machine-secret-7",
