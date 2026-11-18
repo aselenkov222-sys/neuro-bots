@@ -90,6 +90,10 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
         assert 'id="routine-time"' in card
         assert "Пауза" in card
         assert "Своего текста у рутины нет." in card
+        start = script.index(card)
+        remainder = script[:start] + script[start + len(card):]
+        for piece in ("рутин", "Рутин"):
+            assert piece not in remainder
         assert "pick-color" in script
         assert "pick-icon" in script
         assert "#c85a12" in script
