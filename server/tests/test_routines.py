@@ -1558,6 +1558,205 @@ def test_account_without_an_accepted_timezone_writes_no_skip(
     assert _chat_messages(bot_id) == []
 
 
+SCENARIO_FAILURE = "Запуск завершён: сценария недостаточно."
+SITE_FAILURE = "Запуск завершён: сайт не открылся."
+LOGIN_FAILURE = "Запуск завершён: вход не удался."
+UNKNOWN_RUN_REASON = {
+    "code": "invalid_request",
+    "message": "Неизвестная причина запуска.",
+}
+
+
+def _set_scenario(cookie: str, bot_id: str, scenario: str) -> None:
+    with _client(cookie) as client:
+        updated = client.patch(
+            f"/api/bots/{bot_id}",
+            json={"scenario": scenario},
+            headers={"Origin": ORIGIN},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["scenario"] == scenario
+
+
+def _claim(
+    cookie: str,
+    computer: uuid.UUID,
+    moment: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("server.routines.utc_now", lambda: moment)
+    with _client(cookie) as client:
+        return client.post(
+            f"/api/desktops/{computer}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+
+
+def _report(
+    cookie: str,
+    computer: uuid.UUID,
+    run_id: uuid.UUID,
+    reason: str,
+    moment: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr("server.routines.utc_now", lambda: moment)
+    with _client(cookie) as client:
+        return client.post(
+            f"/api/desktops/{computer}/routine-run",
+            json={"id": str(run_id), "reason": reason},
+            headers={"Origin": ORIGIN},
+        )
+
+
+def _one_failure(bot_id: uuid.UUID, code: str, text: str) -> list[dict]:
+    messages = _chat_messages(bot_id)
+    assert len(messages) == 1
+    assert messages[0]["role"] == "error"
+    assert messages[0]["code"] == code
+    assert messages[0]["text"] == text
+    return messages
+
+
+def test_blank_scenario_fails_once_and_the_next_date_can_open(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "blank-run@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_scenario(cookie, bot["id"], " \n ")
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert runs[0]["due_at"] == DUE
+    assert runs[0]["local_date"] == date(2026, 11, 18)
+    messages = _one_failure(bot_id, "scenario_insufficient", SCENARIO_FAILURE)
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 204
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"]) == runs
+    assert _chat_messages(bot_id) == messages
+    _set_scenario(cookie, bot["id"], "план")
+    _pulse_at(cookie, computer, NEXT_DUE, monkeypatch)
+    _settle(NEXT_DUE)
+    later = {row["local_date"]: row for row in _runs_for(created["id"])}
+    assert later[date(2026, 11, 18)]["status"] == "failed"
+    assert later[date(2026, 11, 20)]["status"] == "pending"
+    assert later[date(2026, 11, 20)]["due_at"] == NEXT_DUE
+    assert _chat_messages(bot_id) == messages
+
+
+def test_claim_of_a_blank_scenario_fails_instead_of_claiming(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "blank-claim@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    assert _runs_for(created["id"])[0]["status"] == "pending"
+    _set_scenario(cookie, bot["id"], "")
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 204
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    messages = _one_failure(bot_id, "scenario_insufficient", SCENARIO_FAILURE)
+    again = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert again.status_code == 204
+    assert _runs_for(created["id"]) == runs
+    assert _chat_messages(bot_id) == messages
+
+
+def _open_and_claim(
+    email: str, monkeypatch: pytest.MonkeyPatch
+) -> tuple[str, uuid.UUID, dict, dict]:
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(email)
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 200
+    assert claimed.json()["routine_id"] == created["id"]
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    return cookie, computer, bot, created
+
+
+def test_site_not_opened_fails_the_claimed_run_once(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "site-failed@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    run_id = opened[0]["id"]
+    early = _report(cookie, computer, run_id, "site_not_opened", DUE, monkeypatch)
+    assert early.status_code == 204
+    assert _runs_for(created["id"])[0]["status"] == "pending"
+    assert _chat_messages(bot_id) == []
+    claimed = _claim(cookie, computer, DUE, monkeypatch)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    unknown = _report(cookie, computer, run_id, "dropped", DUE, monkeypatch)
+    assert unknown.status_code == 400
+    assert unknown.json() == UNKNOWN_RUN_REASON
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert _chat_messages(bot_id) == []
+    reported = _report(
+        cookie, computer, run_id, "site_not_opened", DUE, monkeypatch
+    )
+    assert reported.status_code == 204
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    messages = _one_failure(bot_id, "site_not_opened", SITE_FAILURE)
+    repeated = _report(
+        cookie, computer, run_id, "site_not_opened", SKIP_AT, monkeypatch
+    )
+    assert repeated.status_code == 204
+    again = _claim(cookie, computer, SKIP_AT, monkeypatch)
+    assert again.status_code == 204
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    assert _chat_messages(bot_id) == messages
+
+
+def test_login_failed_fails_the_claimed_run_once(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, computer, bot, created = _open_and_claim(
+        "login-failed@example.com", monkeypatch
+    )
+    bot_id = uuid.UUID(bot["id"])
+    run_id = _runs_for(created["id"])[0]["id"]
+    reported = _report(cookie, computer, run_id, "login_failed", DUE, monkeypatch)
+    assert reported.status_code == 204
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    messages = _one_failure(bot_id, "login_failed", LOGIN_FAILURE)
+    repeated = _report(
+        cookie, computer, run_id, "login_failed", SKIP_AT, monkeypatch
+    )
+    assert repeated.status_code == 204
+    again = _claim(cookie, computer, SKIP_AT, monkeypatch)
+    assert again.status_code == 204
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    assert _chat_messages(bot_id) == messages
+
+
 def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
     engine = create_db_engine()
     try:

@@ -46,6 +46,17 @@ ROUTINE_NOT_FOUND = "Рутина не найдена."
 INVALID_PAUSE = "Нужен признак паузы."
 SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
 SKIP_CODE = "routine_skipped"
+SCENARIO_INSUFFICIENT = "scenario_insufficient"
+SCENARIO_INSUFFICIENT_TEXT = "Запуск завершён: сценария недостаточно."
+SITE_NOT_OPENED = "site_not_opened"
+SITE_NOT_OPENED_TEXT = "Запуск завершён: сайт не открылся."
+LOGIN_FAILED = "login_failed"
+LOGIN_FAILED_TEXT = "Запуск завершён: вход не удался."
+UNKNOWN_RUN_REASON = "Неизвестная причина запуска."
+RUN_FAILURES = {
+    SITE_NOT_OPENED: SITE_NOT_OPENED_TEXT,
+    LOGIN_FAILED: LOGIN_FAILED_TEXT,
+}
 CLAIM_WAIT = timedelta(seconds=60)
 PULSE_INTERVAL = timedelta(seconds=30)
 _CLOCK = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
@@ -69,6 +80,10 @@ def _routine_not_found() -> JSONResponse:
 
 def _invalid_pause() -> JSONResponse:
     return error_response(400, "invalid_request", INVALID_PAUSE)
+
+
+def _unknown_run_reason() -> JSONResponse:
+    return error_response(400, "invalid_request", UNKNOWN_RUN_REASON)
 
 
 def _clock(value: str) -> time:
@@ -162,7 +177,13 @@ def _schedule_desktop(
     return None, False
 
 
-def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
+def _write_chat_error(
+    connection: Connection,
+    bot_id: uuid.UUID,
+    now: datetime,
+    code: str,
+    text: str,
+) -> None:
     chat = (
         connection.execute(select(chats).where(chats.c.bot_id == bot_id))
         .mappings()
@@ -173,14 +194,67 @@ def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> Non
             id=uuid.uuid4(),
             chat_id=chat["id"],
             role="error",
-            text=SKIP_TEXT,
-            code=SKIP_CODE,
+            text=text,
+            code=code,
             updated_at=now,
         )
     )
     connection.execute(
         chats.update().where(chats.c.id == chat["id"]).values(updated_at=now)
     )
+
+
+def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
+    _write_chat_error(connection, bot_id, now, SKIP_CODE, SKIP_TEXT)
+
+
+def scenario_insufficient(value: object) -> bool:
+    return not isinstance(value, str) or value.strip() == ""
+
+
+def _insert_failed(
+    connection: Connection,
+    routine_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    local_date: date,
+    due_at: datetime,
+    now: datetime,
+    code: str,
+    text: str,
+) -> None:
+    connection.execute(
+        routine_runs.insert().values(
+            id=uuid.uuid4(),
+            routine_id=routine_id,
+            local_date=local_date,
+            due_at=due_at,
+            status="failed",
+        )
+    )
+    _write_chat_error(connection, bot_id, now, code, text)
+
+
+def _mark_failed(
+    connection: Connection,
+    run_id: uuid.UUID,
+    from_status: str,
+    bot_id: uuid.UUID,
+    now: datetime,
+    code: str,
+    text: str,
+) -> bool:
+    updated = connection.execute(
+        routine_runs.update()
+        .where(
+            routine_runs.c.id == run_id,
+            routine_runs.c.status == from_status,
+        )
+        .values(status="failed")
+    )
+    if updated.rowcount != 1:
+        return False
+    _write_chat_error(connection, bot_id, now, code, text)
+    return True
 
 
 def _run_row(
@@ -365,6 +439,7 @@ def _settle_occurrence(
     *,
     allowed: bool,
     claimable: bool,
+    scenario: object,
 ) -> None:
     if not allowed:
         if now >= due_at:
@@ -399,6 +474,18 @@ def _settle_occurrence(
             )
             return
         if now >= due_at:
+            if scenario_insufficient(scenario):
+                _insert_failed(
+                    connection,
+                    routine_id,
+                    bot_id,
+                    local_date,
+                    due_at,
+                    now,
+                    SCENARIO_INSUFFICIENT,
+                    SCENARIO_INSUFFICIENT_TEXT,
+                )
+                return
             connection.execute(
                 routine_runs.insert().values(
                     id=uuid.uuid4(),
@@ -433,6 +520,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
                 routines.c.time_of_day,
                 routines.c.paused,
                 bots.c.account_id,
+                bots.c.scenario,
             ).join(bots, bots.c.id == routines.c.bot_id)
         )
         .mappings()
@@ -461,6 +549,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
             moment,
             allowed=allowed,
             claimable=claimable,
+            scenario=row["scenario"],
         )
 
 
@@ -477,6 +566,7 @@ def claim_earliest_pending(
                 routine_runs.c.id,
                 routine_runs.c.routine_id,
                 routines.c.bot_id,
+                bots.c.scenario,
             )
             .join(routines, routines.c.id == routine_runs.c.routine_id)
             .join(bots, bots.c.id == routines.c.bot_id)
@@ -493,6 +583,17 @@ def claim_earliest_pending(
         .one_or_none()
     )
     if pending is None:
+        return None
+    if scenario_insufficient(pending["scenario"]):
+        _mark_failed(
+            connection,
+            pending["id"],
+            "pending",
+            pending["bot_id"],
+            moment,
+            SCENARIO_INSUFFICIENT,
+            SCENARIO_INSUFFICIENT_TEXT,
+        )
         return None
     updated = connection.execute(
         routine_runs.update()
@@ -725,11 +826,78 @@ async def update_routine_pause(
         return JSONResponse(routine_document(row))
 
 
+def report_run_failure(
+    connection: Connection,
+    account_id: uuid.UUID,
+    run_id: uuid.UUID | None,
+    reason: str,
+    now: datetime,
+) -> None:
+    if run_id is None:
+        return
+    text = RUN_FAILURES.get(reason)
+    if text is None:
+        return
+    row = (
+        connection.execute(
+            select(
+                routine_runs.c.id,
+                routine_runs.c.status,
+                routines.c.bot_id,
+            )
+            .join(routines, routines.c.id == routine_runs.c.routine_id)
+            .join(bots, bots.c.id == routines.c.bot_id)
+            .where(
+                routine_runs.c.id == run_id,
+                bots.c.account_id == account_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None or row["status"] != "claimed":
+        return
+    _mark_failed(
+        connection,
+        row["id"],
+        "claimed",
+        row["bot_id"],
+        _aware(now),
+        reason,
+        text,
+    )
+
+
+async def _read_failure_report(
+    request: Request,
+) -> tuple[uuid.UUID | None, str] | None | JSONResponse:
+    raw = await request.body()
+    if raw.strip() == b"":
+        return None
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(body, dict) or "reason" not in body:
+        return None
+    reason = body.get("reason")
+    if not isinstance(reason, str) or reason not in RUN_FAILURES:
+        return _unknown_run_reason()
+    raw_id = body.get("id")
+    if not isinstance(raw_id, str):
+        return None, reason
+    try:
+        return uuid.UUID(raw_id), reason
+    except ValueError:
+        return None, reason
+
+
 @router.post("/api/desktops/{computer_id}/routine-run")
-def post_routine_run(request: Request, computer_id: str) -> Response:
+async def post_routine_run(request: Request, computer_id: str) -> Response:
     rejected = origin_rejected(request)
     if rejected is not None:
         return rejected
+    report = await _read_failure_report(request)
     now = utc_now()
     with begin() as connection:
         current = current_account(connection, request, now)
@@ -742,6 +910,13 @@ def post_routine_run(request: Request, computer_id: str) -> Response:
         desktop = find_working_desktop(connection, account["id"])
         if desktop is None or desktop["computer_id"] != parsed:
             return desktop_not_found()
+        if isinstance(report, JSONResponse):
+            return report
+        if report is not None:
+            run_id, reason = report
+            report_run_failure(connection, account["id"], run_id, reason, now)
+            touch_session(connection, session["id"], now)
+            return Response(status_code=204)
         claimed = claim_earliest_pending(connection, account["id"], now)
         touch_session(connection, session["id"], now)
         if claimed is None:
