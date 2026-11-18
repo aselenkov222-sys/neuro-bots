@@ -3,6 +3,7 @@ import subprocess
 from urllib.parse import quote, urlencode
 
 import pytest
+from playwright.sync_api import sync_playwright
 
 from desktop.keychain import SECURITY_PATH, read_password
 from desktop.password_screen import LOOPBACK, serve_password_screen
@@ -155,6 +156,48 @@ def test_missing_record_does_not_echo_a_query_password(screen) -> None:
     assert status == 404
     assert body.decode() == _MISSING
     assert SECRET.encode() not in body
+
+
+def test_browser_form_saves_on_the_loopback_screen_and_hides_the_password(screen) -> None:
+    opened, security = screen
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        page.goto(opened.url + "/")
+        page.locator('input[name="site"]').fill(SITE)
+        page.locator('input[name="login"]').fill(LOGIN)
+        page.locator('input[name="password"]').fill(SECRET)
+        page.get_by_role("button", name="Сохранить").click()
+        page.wait_for_url("**/?saved=1")
+        saved = page.locator("body").inner_text()
+        assert _SAVED in saved
+        assert SECRET not in saved
+        page.locator("#copy-site").fill(SITE)
+        page.locator("#copy-login").fill(LOGIN)
+        page.locator("#copy").click()
+        page.locator("#copy-status").wait_for(state="visible")
+        copied = page.locator("body").inner_text()
+        assert SECRET not in copied
+        assert (
+            "Пароль скопирован." in copied
+            or "Пароль остаётся на этом компьютере." in copied
+        )
+        browser.close()
+    assert read_password(SITE, LOGIN, run=security) == SECRET
+
+
+def test_null_origin_is_refused(screen) -> None:
+    opened, security = screen
+    status, body, _headers = _post(
+        opened,
+        SITE,
+        LOGIN,
+        SECRET,
+        headers={"Origin": "null"},
+    )
+    assert status == 403
+    assert SECRET.encode() not in body
+    assert read_password(SITE, LOGIN, run=security) is None
 
 
 def test_desktop_process_opens_the_password_screen_before_the_cabinet(
