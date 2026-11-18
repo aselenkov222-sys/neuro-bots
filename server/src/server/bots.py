@@ -19,6 +19,7 @@ from server.auth import (
     origin_rejected,
     unauthenticated,
 )
+from server.browser_action import enqueue_open, named_address
 from server.config import development_tariff
 from server.desktops import find_working_desktop
 from server.models import (
@@ -509,6 +510,7 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
         desktop_available = (
             desktop is not None and desktop["last_pulse_at"] is not None
         )
+        address = named_address(text)
         if counter["used"] >= development_tariff.model_requests:
             _insert_message(
                 opened.connection,
@@ -518,6 +520,25 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
                 None,
                 follow_at,
             )
+        elif address is not None and not desktop_available:
+            _insert_message(
+                opened.connection,
+                chat["id"],
+                "error",
+                COMPUTER_UNAVAILABLE_TEXT,
+                None,
+                follow_at,
+            )
+        elif address is not None:
+            assert desktop is not None
+            enqueue_open(
+                account_id=opened.account["id"],
+                computer_id=desktop["computer_id"],
+                url=address,
+                bot_id=parsed_id,
+                chat_id=chat["id"],
+            )
+            follow_at = opened.now
         elif desktop is not None and not desktop_available:
             _insert_message(
                 opened.connection,
