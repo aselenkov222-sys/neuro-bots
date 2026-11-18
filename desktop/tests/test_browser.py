@@ -75,12 +75,37 @@ def test_other_chromium_is_selected_when_chrome_and_edge_are_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr("desktop.browser.sys.platform", "darwin")
     _installed(monkeypatch, chrome=False, edge=False)
+    chromium = Path("/Applications/Chromium.app/Contents/MacOS/Chromium")
+    monkeypatch.setattr("desktop.browser._chromium_executable", lambda: chromium)
     calls = _record_persistent_launch(monkeypatch)
     open_browser()
     profile = browser_profile_dir()
-    assert calls == [(profile, {})]
+    assert calls == [(profile, {"executable_path": chromium})]
     assert [path.name for path in tmp_path.iterdir()] == ["browser-profile"]
+
+
+def test_macos_chromium_executable_is_the_installed_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("desktop.browser.sys.platform", "darwin")
+    from desktop.browser import _chromium_executables
+
+    assert _chromium_executables() == (
+        Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+    )
+
+
+def test_launch_is_skipped_when_no_chromium_browser_is_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    _installed(monkeypatch, chrome=False, edge=False)
+    monkeypatch.setattr("desktop.browser._chromium_executable", lambda: None)
+    calls = _record_persistent_launch(monkeypatch)
+    assert open_browser() is None
+    assert calls == []
 
 
 def test_second_launch_sees_the_same_profile_directory(

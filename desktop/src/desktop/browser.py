@@ -50,6 +50,17 @@ def _edge_executables() -> tuple[Path, ...]:
     return (Path("/opt/microsoft/msedge/msedge"),)
 
 
+def _chromium_executables() -> tuple[Path, ...]:
+    if sys.platform == "darwin":
+        return (Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),)
+    if sys.platform == "win32":
+        return tuple(
+            root / "Chromium" / "Application" / "chrome.exe"
+            for root in _windows_roots()
+        )
+    return (Path("/usr/lib/chromium/chromium"),)
+
+
 def _executable_installed(paths: tuple[Path, ...]) -> bool:
     return any(path.is_file() for path in paths)
 
@@ -62,22 +73,26 @@ def _edge_installed() -> bool:
     return _executable_installed(_edge_executables())
 
 
-def browser_channel() -> str | None:
-    if _chrome_installed():
-        return "chrome"
-    if _edge_installed():
-        return "msedge"
+def _chromium_executable() -> Path | None:
+    for path in _chromium_executables():
+        if path.is_file():
+            return path
     return None
 
 
-def open_browser() -> BrowserContext:
+def open_browser() -> BrowserContext | None:
+    if _chrome_installed():
+        launch: dict[str, str | Path] = {"channel": "chrome"}
+    elif _edge_installed():
+        launch = {"channel": "msedge"}
+    else:
+        executable = _chromium_executable()
+        if executable is None:
+            return None
+        launch = {"executable_path": executable}
     profile = browser_profile_dir()
     profile.mkdir(parents=True, exist_ok=True)
     playwright = sync_playwright().start()
-    channel = browser_channel()
-    options: dict[str, str] = {}
-    if channel is not None:
-        options["channel"] = channel
-    context = playwright.chromium.launch_persistent_context(profile, **options)
+    context = playwright.chromium.launch_persistent_context(profile, **launch)
     _held.append((playwright, context))
     return context
