@@ -41,6 +41,12 @@ def _find_desktop(
     )
 
 
+def find_working_desktop(
+    connection: Connection, account_id: uuid.UUID
+) -> RowMapping | None:
+    return _working_desktop(connection, account_id)
+
+
 def _working_desktop(
     connection: Connection, account_id: uuid.UUID
 ) -> RowMapping | None:

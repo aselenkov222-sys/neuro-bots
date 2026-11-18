@@ -29,6 +29,7 @@ ACCEPTED = "abcdef1!"
 STUB = "Сейчас я на заглушке агрегатора и не вызываю модель."
 EMPTY_TEXT = "Ответ модели не пришёл."
 QUOTA_TEXT = "Квота на период закончилась."
+COMPUTER_UNAVAILABLE = "компьютер недоступен"
 INVALID_MESSAGE = {
     "code": "invalid_message",
     "message": "Сообщение — от 1 до 8 000 символов.",
@@ -414,3 +415,89 @@ def test_invalid_message_writes_nothing_and_skips_the_adapter(
     assert counter["used"] == 0
     assert charges == []
     assert _rows(sessions) == seen
+
+
+def test_silent_working_desktop_tells_the_chat_and_a_pulse_opens_the_adapter(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, account_id = _open_ready("silent-desktop@example.com")
+    seen: list[dict] = []
+
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+        seen.append(
+            {
+                "description": description,
+                "scenario": scenario,
+                "messages": messages,
+                "desktop_available": desktop_available,
+            }
+        )
+        return "ответ"
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    working = uuid.uuid4()
+    idle = uuid.uuid4()
+    with _client(cookie) as client:
+        claimed = client.post(
+            "/api/desktops",
+            json={"id": str(working)},
+            headers={"Origin": ORIGIN},
+        )
+        assert claimed.status_code == 200
+        assert claimed.json() == {"id": str(working), "working": True}
+        other = client.post(
+            "/api/desktops",
+            json={"id": str(idle)},
+            headers={"Origin": ORIGIN},
+        )
+        assert other.status_code == 200
+        assert other.json()["working"] is False
+        bot = _bot(client, description="описание", scenario="сценарий")
+        silent = _post_message(client, bot["id"], {"text": "открой сайт"})
+        missed = client.post(
+            f"/api/desktops/{idle}/pulse",
+            json={"timezone": "Asia/Tokyo"},
+            headers={"Origin": ORIGIN},
+        )
+        assert missed.status_code == 404
+        still = _post_message(client, bot["id"], {"text": "ещё раз"})
+        pulsed = client.post(
+            f"/api/desktops/{working}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+        opened = _post_message(
+            client,
+            bot["id"],
+            {"text": "теперь", "desktop_available": False},
+        )
+        me = client.get("/api/me")
+    assert silent.status_code == still.status_code == opened.status_code == 200
+    assert [message["role"] for message in silent.json()["messages"]] == [
+        "user",
+        "error",
+    ]
+    assert silent.json()["messages"][1]["text"] == COMPUTER_UNAVAILABLE
+    assert silent.json()["messages"][1]["code"] is None
+    assert still.json()["messages"][3]["text"] == COMPUTER_UNAVAILABLE
+    assert still.json()["messages"][3]["role"] == "error"
+    assert seen == [
+        {
+            "description": "описание",
+            "scenario": "сценарий",
+            "messages": [
+                {"role": "user", "text": "открой сайт"},
+                {"role": "user", "text": "ещё раз"},
+                {"role": "user", "text": "теперь"},
+            ],
+            "desktop_available": True,
+        }
+    ]
+    assert opened.json()["messages"][-1]["role"] == "assistant"
+    assert opened.json()["messages"][-1]["text"] == "ответ"
+    assert COMPUTER_UNAVAILABLE not in str(seen)
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 1
+    assert len(charges) == 1
+    assert me.json()["quota"] == 499
