@@ -145,6 +145,7 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
         "chats",
         "messages",
         "desktops",
+        "routines",
     }
     assert server.models.accounts.metadata is metadata
     assert server.models.sessions.metadata is metadata
@@ -156,13 +157,16 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert server.models.chats.metadata is metadata
     assert server.models.messages.metadata is metadata
     assert server.models.desktops.metadata is metadata
+    assert server.models.routines.metadata is metadata
     chain = _revision_chain()
     assert chain[0] == ("3c87a0f84d5e", None)
     assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
     assert ("048ee727aa3e", "ff582d8bc7fb") in chain
     assert ("c54ff0c6fb42", "048ee727aa3e") in chain
     assert ("78372be7d547", "c54ff0c6fb42") in chain
-    assert chain[-1][1] == "78372be7d547"
+    assert ("f524099440d0", "78372be7d547") in chain
+    assert chain[-1][1] == "f524099440d0"
+    assert chain[-1][0] != "f524099440d0"
     assert chain[-1][0] != "78372be7d547"
     assert chain[-1][0] != "c54ff0c6fb42"
     assert chain[-1][0] != "048ee727aa3e"
@@ -199,7 +203,9 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert ("048ee727aa3e", "ff582d8bc7fb") in chain
         assert ("c54ff0c6fb42", "048ee727aa3e") in chain
         assert ("78372be7d547", "c54ff0c6fb42") in chain
-        assert chain[-1][1] == "78372be7d547"
+        assert ("f524099440d0", "78372be7d547") in chain
+        assert chain[-1][1] == "f524099440d0"
+        assert chain[-1][0] != "f524099440d0"
         assert chain[-1][0] != "78372be7d547"
         assert chain[-1][0] != "c54ff0c6fb42"
         assert chain[-1][0] != "048ee727aa3e"
@@ -227,6 +233,7 @@ def test_select_one_and_alembic_upgrade_head() -> None:
             "chats",
             "messages",
             "desktops",
+            "routines",
             "alembic_version",
         }
     finally:

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    Time,
     UniqueConstraint,
     Uuid,
     text,
@@ -65,11 +67,13 @@ DESKTOP_COLUMNS = (
     "timezone",
     "last_pulse_at",
 )
+ROUTINE_COLUMNS = ("id", "bot_id", "weekdays", "time_of_day")
 ACCOUNT_REVISION = "3c87a0f84d5e"
 CONFIRMATION_REVISION = "ff582d8bc7fb"
 EMAIL_CONFIRMED_REVISION = "048ee727aa3e"
 SUBSCRIPTION_REVISION = "c54ff0c6fb42"
 DESKTOP_REVISION = "78372be7d547"
+PULSE_REVISION = "f524099440d0"
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
@@ -143,11 +147,13 @@ def _revision_chain() -> list[str]:
     assert links[EMAIL_CONFIRMED_REVISION] == CONFIRMATION_REVISION
     assert links[SUBSCRIPTION_REVISION] == EMAIL_CONFIRMED_REVISION
     assert links[DESKTOP_REVISION] == SUBSCRIPTION_REVISION
-    assert links[chain[-1]] == DESKTOP_REVISION
+    assert links[PULSE_REVISION] == DESKTOP_REVISION
+    assert links[chain[-1]] == PULSE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
     assert chain[-1] != DESKTOP_REVISION
+    assert chain[-1] != PULSE_REVISION
     return chain
 
 
@@ -395,6 +401,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     chats = metadata.tables["chats"]
     messages = metadata.tables["messages"]
     desktops = metadata.tables["desktops"]
+    routines = metadata.tables["routines"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -406,6 +413,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "chats",
         "messages",
         "desktops",
+        "routines",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -417,6 +425,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert chats is server.models.chats
     assert messages is server.models.messages
     assert desktops is server.models.desktops
+    assert routines is server.models.routines
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -427,6 +436,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(chats.columns.keys()) == CHAT_COLUMNS
     assert tuple(messages.columns.keys()) == MESSAGE_COLUMNS
     assert tuple(desktops.columns.keys()) == DESKTOP_COLUMNS
+    assert tuple(routines.columns.keys()) == ROUTINE_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -603,6 +613,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         bots,
         chats,
         desktops,
+        routines,
     ):
         assert [
             constraint
@@ -650,6 +661,28 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert [column.name for column in partial_index.columns] == ["account_id"]
     assert str(partial_index.dialect_options["postgresql"]["where"]) == "working"
 
+    assert [column.name for column in routines.primary_key] == ["id"]
+    _assert_model_column(routines.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        routines.c.bot_id,
+        Uuid,
+        nullable=False,
+        foreign_table="bots",
+    )
+    _assert_model_column(routines.c.weekdays, ARRAY, nullable=False)
+    assert isinstance(routines.c.weekdays.type.item_type, Integer)
+    _assert_model_column(
+        routines.c.time_of_day,
+        Time,
+        nullable=False,
+        timezone=False,
+    )
+    assert [
+        constraint
+        for constraint in routines.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == []
+
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
     assert down.returncode == 0, down.stderr
@@ -690,6 +723,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "chats",
                     "messages",
                     "desktops",
+                    "routines",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1025,6 +1059,35 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                 assert partial_row["is_unique"] is True
                 assert partial_row["predicate"] == "working"
                 assert list(partial_row["columns"]) == ["account_id"]
+                routine_columns = _columns(connection, "routines")
+                assert tuple(routine_columns) == ROUTINE_COLUMNS
+                _assert_catalog_column(
+                    routine_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    routine_columns, "bot_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    routine_columns,
+                    "weekdays",
+                    "_int4",
+                    "integer[]",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    routine_columns,
+                    "time_of_day",
+                    "time",
+                    "time without time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "routines") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (bot_id) REFERENCES bots(id)",
+                    ),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1040,6 +1103,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "chats",
                     "messages",
                     "desktops",
+                    "routines",
                 ):
                     assert (
                         connection.execute(

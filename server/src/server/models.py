@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     CheckConstraint,
     Column,
@@ -9,6 +10,7 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    Time,
     UniqueConstraint,
     Uuid,
     text,
@@ -134,4 +136,13 @@ desktops = Table(
         unique=True,
         postgresql_where=text("working"),
     ),
+)
+
+routines = Table(
+    "routines",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
+    Column("weekdays", ARRAY(Integer()), nullable=False),
+    Column("time_of_day", Time(timezone=False), nullable=False),
 )
