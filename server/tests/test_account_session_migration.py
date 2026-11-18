@@ -9,6 +9,7 @@ from sqlalchemy import (
     ARRAY,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Index,
     Integer,
@@ -78,6 +79,19 @@ DESKTOP_REVISION = "78372be7d547"
 PULSE_REVISION = "f524099440d0"
 ROUTINE_REVISION = "b7e2c4a91d58"
 PAUSED_REVISION = "a4f0c8e21b67"
+STOPPED_REVISION = "9e4b1c7a6d20"
+ROUTINE_RUN_COLUMNS = (
+    "id",
+    "routine_id",
+    "local_date",
+    "due_at",
+    "status",
+    "claimed_at",
+)
+ROUTINE_RUN_STATUS_CHECK = (
+    "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
+    "'claimed'::character varying, 'skipped'::character varying])::text[])))"
+)
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
@@ -154,7 +168,8 @@ def _revision_chain() -> list[str]:
     assert links[PULSE_REVISION] == DESKTOP_REVISION
     assert links[ROUTINE_REVISION] == PULSE_REVISION
     assert links[PAUSED_REVISION] == ROUTINE_REVISION
-    assert links[chain[-1]] == PAUSED_REVISION
+    assert links[STOPPED_REVISION] == PAUSED_REVISION
+    assert links[chain[-1]] == STOPPED_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
@@ -162,6 +177,7 @@ def _revision_chain() -> list[str]:
     assert chain[-1] != PULSE_REVISION
     assert chain[-1] != ROUTINE_REVISION
     assert chain[-1] != PAUSED_REVISION
+    assert chain[-1] != STOPPED_REVISION
     return chain
 
 
@@ -410,6 +426,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     messages = metadata.tables["messages"]
     desktops = metadata.tables["desktops"]
     routines = metadata.tables["routines"]
+    routine_runs = metadata.tables["routine_runs"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -422,6 +439,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "messages",
         "desktops",
         "routines",
+        "routine_runs",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -434,6 +452,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert messages is server.models.messages
     assert desktops is server.models.desktops
     assert routines is server.models.routines
+    assert routine_runs is server.models.routine_runs
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -445,6 +464,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(messages.columns.keys()) == MESSAGE_COLUMNS
     assert tuple(desktops.columns.keys()) == DESKTOP_COLUMNS
     assert tuple(routines.columns.keys()) == ROUTINE_COLUMNS
+    assert tuple(routine_runs.columns.keys()) == ROUTINE_RUN_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -701,6 +721,51 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         if isinstance(constraint, CheckConstraint)
     ] == []
 
+    assert [column.name for column in routine_runs.primary_key] == ["id"]
+    _assert_model_column(routine_runs.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        routine_runs.c.routine_id,
+        Uuid,
+        nullable=False,
+        foreign_table="routines",
+    )
+    _assert_model_column(routine_runs.c.local_date, Date, nullable=False)
+    _assert_model_column(
+        routine_runs.c.due_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    _assert_model_column(routine_runs.c.status, String, nullable=False, length=16)
+    _assert_model_column(
+        routine_runs.c.claimed_at,
+        DateTime,
+        nullable=True,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in routine_runs.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == [
+        (
+            "routine_runs_status_check",
+            "status IN ('pending', 'claimed', 'skipped')",
+        )
+    ]
+    run_uniques = [
+        constraint
+        for constraint in routine_runs.constraints
+        if isinstance(constraint, UniqueConstraint)
+    ]
+    assert len(run_uniques) == 1
+    assert [column.name for column in run_uniques[0].columns] == [
+        "routine_id",
+        "local_date",
+    ]
+    for column in routine_runs.columns:
+        assert not isinstance(column.type, Text)
+
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
     assert down.returncode == 0, down.stderr
@@ -742,6 +807,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "messages",
                     "desktops",
                     "routines",
+                    "routine_runs",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1117,6 +1183,47 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                         "FOREIGN KEY (bot_id) REFERENCES bots(id)",
                     ),
                 }
+                run_columns = _columns(connection, "routine_runs")
+                assert tuple(run_columns) == ROUTINE_RUN_COLUMNS
+                _assert_catalog_column(
+                    run_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    run_columns, "routine_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    run_columns, "local_date", "date", "date", not_null=True
+                )
+                _assert_catalog_column(
+                    run_columns,
+                    "due_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    run_columns,
+                    "status",
+                    "varchar",
+                    "character varying(16)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    run_columns,
+                    "claimed_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=False,
+                )
+                assert _constraints(connection, "routine_runs") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    ("u", "UNIQUE (routine_id, local_date)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (routine_id) REFERENCES routines(id)",
+                    ),
+                    ("c", ROUTINE_RUN_STATUS_CHECK),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1133,6 +1240,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "messages",
                     "desktops",
                     "routines",
+                    "routine_runs",
                 ):
                     assert (
                         connection.execute(

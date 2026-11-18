@@ -20,3 +20,10 @@ def mark_process_stopping() -> None:
 
 def routine_run_allowed() -> bool:
     return not _process_stopping
+
+
+def claim_if_allowed(claim) -> bool:
+    if not routine_run_allowed():
+        return False
+    claim()
+    return True

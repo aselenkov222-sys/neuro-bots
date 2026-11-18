@@ -2,20 +2,31 @@ import json
 import re
 import uuid
 from collections.abc import Mapping
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.engine import Connection, RowMapping
 
-from server.accounts import touch_session
-from server.auth import error_response
+from server.accounts import touch_session, utc_now
+from server.auth import (
+    begin,
+    current_account,
+    error_response,
+    origin_rejected,
+    unauthenticated,
+)
 from server.bots import not_found, open_confirmed, parse_id
 from server.config import development_tariff
-from server.desktops import find_working_desktop, timezone_name_accepted
-from server.models import accounts, bots, routines
+from server.desktops import (
+    desktop_not_found,
+    find_working_desktop,
+    parse_path_computer_id,
+    timezone_name_accepted,
+)
+from server.models import accounts, bots, chats, messages, routine_runs, routines
 
 router = APIRouter()
 
@@ -24,6 +35,9 @@ SCENARIO_REQUIRED = "Без сценария рутину создать нел�
 ROUTINE_LIMIT = "Лимит рутин исчерпан."
 ROUTINE_NOT_FOUND = "Рутина не найдена."
 INVALID_PAUSE = "Нужен признак паузы."
+SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
+SKIP_CODE = "routine_skipped"
+CLAIM_WAIT = timedelta(seconds=60)
 _CLOCK = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
@@ -87,6 +101,164 @@ def working_routines_stopped(
 
 def routine_may_start(row: Mapping[str, object], stopped: bool) -> bool:
     return starts_when_due(row) and not stopped
+
+
+def _aware(moment: datetime) -> datetime:
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
+    chat = (
+        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        .mappings()
+        .one()
+    )
+    connection.execute(
+        messages.insert().values(
+            id=uuid.uuid4(),
+            chat_id=chat["id"],
+            role="error",
+            text=SKIP_TEXT,
+            code=SKIP_CODE,
+            updated_at=now,
+        )
+    )
+    connection.execute(
+        chats.update().where(chats.c.id == chat["id"]).values(updated_at=now)
+    )
+
+
+def _settle_occurrence(
+    connection: Connection,
+    routine_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    local_date: date,
+    due_at: datetime,
+    now: datetime,
+) -> None:
+    existing = (
+        connection.execute(
+            select(routine_runs).where(
+                routine_runs.c.routine_id == routine_id,
+                routine_runs.c.local_date == local_date,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    deadline = due_at + CLAIM_WAIT
+    if existing is None:
+        status = "skipped" if now >= deadline else "pending"
+        connection.execute(
+            routine_runs.insert().values(
+                id=uuid.uuid4(),
+                routine_id=routine_id,
+                local_date=local_date,
+                due_at=due_at,
+                status=status,
+            )
+        )
+        if status == "skipped":
+            _write_skip(connection, bot_id, now)
+        return
+    if existing["status"] != "pending" or now < deadline:
+        return
+    updated = connection.execute(
+        routine_runs.update()
+        .where(
+            routine_runs.c.id == existing["id"],
+            routine_runs.c.status == "pending",
+        )
+        .values(status="skipped")
+    )
+    if updated.rowcount == 1:
+        _write_skip(connection, bot_id, now)
+
+
+def settle_due(connection: Connection, now: datetime) -> None:
+    moment = _aware(now)
+    rows = (
+        connection.execute(
+            select(
+                routines.c.id,
+                routines.c.bot_id,
+                routines.c.weekdays,
+                routines.c.time_of_day,
+                routines.c.paused,
+                bots.c.account_id,
+            ).join(bots, bots.c.id == routines.c.bot_id)
+        )
+        .mappings()
+        .all()
+    )
+    for row in rows:
+        account_id = row["account_id"]
+        if not routine_may_start(
+            row, working_routines_stopped(connection, account_id)
+        ):
+            continue
+        zone = working_desktop_zone(connection, account_id)
+        if zone is None or not timezone_name_accepted(zone):
+            continue
+        local = moment.astimezone(ZoneInfo(zone))
+        if local.isoweekday() not in {int(day) for day in row["weekdays"]}:
+            continue
+        due_at = appointed_utc(row["time_of_day"], zone, local.date())
+        if moment < due_at:
+            continue
+        _settle_occurrence(
+            connection,
+            row["id"],
+            row["bot_id"],
+            local.date(),
+            due_at,
+            moment,
+        )
+
+
+def claim_earliest_pending(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> RowMapping | None:
+    moment = _aware(now)
+    settle_due(connection, moment)
+    if working_routines_stopped(connection, account_id):
+        return None
+    pending = (
+        connection.execute(
+            select(
+                routine_runs.c.id,
+                routine_runs.c.routine_id,
+                routines.c.bot_id,
+            )
+            .join(routines, routines.c.id == routine_runs.c.routine_id)
+            .join(bots, bots.c.id == routines.c.bot_id)
+            .where(
+                bots.c.account_id == account_id,
+                routines.c.paused.is_(False),
+                routine_runs.c.status == "pending",
+                routine_runs.c.due_at > moment - CLAIM_WAIT,
+            )
+            .order_by(routine_runs.c.due_at.asc(), routine_runs.c.id.asc())
+            .limit(1)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if pending is None:
+        return None
+    updated = connection.execute(
+        routine_runs.update()
+        .where(
+            routine_runs.c.id == pending["id"],
+            routine_runs.c.status == "pending",
+        )
+        .values(status="claimed", claimed_at=moment)
+    )
+    if updated.rowcount != 1:
+        return None
+    return pending
 
 
 def routine_document(row: RowMapping) -> dict[str, object]:
@@ -297,3 +469,33 @@ async def update_routine_pause(
         assert row is not None
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(routine_document(row))
+
+
+@router.post("/api/desktops/{computer_id}/routine-run")
+def post_routine_run(request: Request, computer_id: str) -> Response:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            return unauthenticated()
+        parsed = parse_path_computer_id(computer_id)
+        if parsed is None:
+            return desktop_not_found()
+        session, account = current
+        desktop = find_working_desktop(connection, account["id"])
+        if desktop is None or desktop["computer_id"] != parsed:
+            return desktop_not_found()
+        claimed = claim_earliest_pending(connection, account["id"], now)
+        touch_session(connection, session["id"], now)
+        if claimed is None:
+            return Response(status_code=204)
+        return JSONResponse(
+            {
+                "id": str(claimed["id"]),
+                "routine_id": str(claimed["routine_id"]),
+                "bot_id": str(claimed["bot_id"]),
+            }
+        )

@@ -1,7 +1,7 @@
 import subprocess
 import sys
 import uuid
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,10 +12,20 @@ from server.accounts import create_account, create_session
 from server.app import app
 from server.config import development_tariff
 from server.db import create_db_engine, metadata
-from server.models import accounts, bots, chats, desktops, messages, routines, sessions
+from server.models import (
+    accounts,
+    bots,
+    chats,
+    desktops,
+    messages,
+    routine_runs,
+    routines,
+    sessions,
+)
 from server.routines import (
     appointed_utc,
     routine_may_start,
+    settle_due,
     starts_when_due,
     working_desktop_zone,
     working_routines_stopped,
@@ -876,3 +886,209 @@ def test_working_desktop_logout_stops_routines_and_keeps_the_role(
     assert routine_may_start(finished[time(9, 0)], allowed) is True
     assert routine_may_start(finished[time(10, 0)], allowed) is False
     assert _chat_messages(bot_id) == []
+
+
+DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+CLAIM_AT = DUE + timedelta(seconds=59)
+SKIP_AT = DUE + timedelta(seconds=60)
+SKIP_TEXT = "Рутина пропущена: рабочий десктоп не забрал запуск."
+
+
+def _refuse_aggregator(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_complete(*args: object, **kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", fail_complete)
+
+
+def _settle(moment: datetime) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            settle_due(connection, moment)
+    finally:
+        engine.dispose()
+
+
+def _runs_for(routine_id: str) -> list[dict]:
+    parsed = uuid.UUID(routine_id)
+    return [row for row in _rows(routine_runs) if row["routine_id"] == parsed]
+
+
+def _stored_clock(routine_id: str) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            shown = connection.execute(
+                text("SELECT time_of_day::text FROM routines WHERE id = :id"),
+                {"id": uuid.UUID(routine_id)},
+            ).scalar_one()
+            stored_type = connection.execute(
+                text(
+                    "SELECT pg_typeof(time_of_day)::text"
+                    " FROM routines WHERE id = :id"
+                ),
+                {"id": uuid.UUID(routine_id)},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert shown == "09:00:00"
+    assert stored_type == "time without time zone"
+
+
+def _prepare_due_routine(
+    email: str, *, paused: bool = False
+) -> tuple[str, uuid.UUID, uuid.UUID, dict, dict]:
+    cookie, account_id = _open_account(email, confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        created = _create_routine(
+            client, bot["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert created.status_code == 200
+        assert created.json()["paused"] is False
+        if paused:
+            held = _pause(client, bot["id"], created.json()["id"], True)
+            assert held.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        assert posted.json() == {"id": str(computer), "working": True}
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    return cookie, account_id, computer, bot, created.json()
+
+
+def test_claim_inside_the_window_takes_the_run_and_writes_no_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, _account_id, computer, bot, created = _prepare_due_routine(
+        "claim-window@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    with _client(cookie) as client:
+        claimed = client.post(
+            f"/api/desktops/{computer}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+    assert claimed.status_code == 200
+    assert tuple(claimed.json()) == ("id", "routine_id", "bot_id")
+    assert claimed.json()["routine_id"] == created["id"]
+    assert claimed.json()["bot_id"] == bot["id"]
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["id"] == uuid.UUID(claimed.json()["id"])
+    assert runs[0]["status"] == "claimed"
+    assert runs[0]["claimed_at"] == CLAIM_AT
+    assert runs[0]["due_at"] == DUE
+    assert runs[0]["local_date"] == date(2026, 11, 18)
+    assert _chat_messages(bot_id) == []
+    assert _session(cookie)["last_request_at"] == CLAIM_AT
+    _settle(SKIP_AT)
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert _chat_messages(bot_id) == []
+    stored = _account_routines(_account_id)[0]
+    assert stored["time_of_day"] == time(9, 0)
+    assert stored["time_of_day"].tzinfo is None
+    _stored_clock(created["id"])
+
+
+def test_missing_claim_writes_one_skip_for_that_local_date(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    _cookie, account_id, _computer, bot, created = _prepare_due_routine(
+        "skip-window@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _settle(DUE - timedelta(seconds=1))
+    assert _runs_for(created["id"]) == []
+    assert _chat_messages(bot_id) == []
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    assert opened[0]["claimed_at"] is None
+    assert opened[0]["due_at"] == DUE
+    assert opened[0]["local_date"] == date(2026, 11, 18)
+    assert _chat_messages(bot_id) == []
+    _settle(CLAIM_AT)
+    assert _runs_for(created["id"])[0]["status"] == "pending"
+    assert _chat_messages(bot_id) == []
+    _settle(SKIP_AT)
+    skipped = _runs_for(created["id"])
+    assert len(skipped) == 1
+    assert skipped[0]["status"] == "skipped"
+    assert skipped[0]["due_at"] == DUE
+    messages = _chat_messages(bot_id)
+    assert len(messages) == 1
+    assert messages[0]["role"] == "error"
+    assert messages[0]["code"] == "routine_skipped"
+    assert messages[0]["text"] == SKIP_TEXT
+    chat = next(row for row in _rows(chats) if row["bot_id"] == bot_id)
+    assert chat["updated_at"] == messages[0]["updated_at"]
+    _settle(SKIP_AT + timedelta(hours=3))
+    assert _runs_for(created["id"]) == skipped
+    assert _chat_messages(bot_id) == messages
+    stored = _account_routines(account_id)[0]
+    assert stored["time_of_day"] == time(9, 0)
+    assert stored["time_of_day"].tzinfo is None
+    _stored_clock(created["id"])
+    _late_cookie, _late_account, _late_computer, late_bot, late = _prepare_due_routine(
+        "late-skip@example.com"
+    )
+    late_bot_id = uuid.UUID(late_bot["id"])
+    _settle(SKIP_AT)
+    late_runs = _runs_for(late["id"])
+    assert len(late_runs) == 1
+    assert late_runs[0]["status"] == "skipped"
+    assert late_runs[0]["due_at"] == DUE
+    late_messages = _chat_messages(late_bot_id)
+    assert len(late_messages) == 1
+    assert late_messages[0]["text"] == SKIP_TEXT
+    _settle(SKIP_AT + timedelta(hours=3))
+    assert _runs_for(late["id"]) == late_runs
+    assert _chat_messages(late_bot_id) == late_messages
+
+
+def test_pause_and_logout_hold_open_neither_a_run_nor_a_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    _cookie, paused_account, _computer, paused_bot, paused = _prepare_due_routine(
+        "paused-window@example.com", paused=True
+    )
+    paused_bot_id = uuid.UUID(paused_bot["id"])
+    _settle(SKIP_AT)
+    assert _runs_for(paused["id"]) == []
+    assert _chat_messages(paused_bot_id) == []
+    assert _account_routines(paused_account)[0]["paused"] is True
+
+    cookie, held_account, _computer, held_bot, held = _prepare_due_routine(
+        "stopped-window@example.com"
+    )
+    held_bot_id = uuid.UUID(held_bot["id"])
+    with _client(cookie) as client:
+        signed_out = client.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+    desktop = next(
+        row for row in _rows(desktops) if row["account_id"] == held_account
+    )
+    assert desktop["working"] is True
+    assert desktop["routines_stopped"] is True
+    assert desktop["timezone"] == "Europe/Moscow"
+    _settle(DUE)
+    _settle(SKIP_AT)
+    assert _runs_for(held["id"]) == []
+    assert _chat_messages(held_bot_id) == []
+    assert _account_routines(held_account)[0]["paused"] is False

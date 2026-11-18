@@ -3,6 +3,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -153,4 +154,20 @@ routines = Table(
     Column("weekdays", ARRAY(Integer()), nullable=False),
     Column("time_of_day", Time(timezone=False), nullable=False),
     Column("paused", Boolean(), nullable=False, server_default=text("false")),
+)
+
+routine_runs = Table(
+    "routine_runs",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column("routine_id", Uuid(), ForeignKey("routines.id"), nullable=False),
+    Column("local_date", Date(), nullable=False),
+    Column("due_at", DateTime(timezone=True), nullable=False),
+    Column("status", String(16), nullable=False),
+    Column("claimed_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "status IN ('pending', 'claimed', 'skipped')",
+        name="routine_runs_status_check",
+    ),
+    UniqueConstraint("routine_id", "local_date"),
 )
