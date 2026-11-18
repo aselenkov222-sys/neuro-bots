@@ -1,7 +1,8 @@
 import json
 import re
 import uuid
-from datetime import time
+from datetime import date, datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -12,6 +13,7 @@ from server.accounts import touch_session
 from server.auth import error_response
 from server.bots import not_found, open_confirmed, parse_id
 from server.config import development_tariff
+from server.desktops import find_working_desktop, timezone_name_accepted
 from server.models import accounts, bots, routines
 
 router = APIRouter()
@@ -46,6 +48,22 @@ def _clock(value: str) -> time:
 
 def format_clock(value: time) -> str:
     return f"{value.hour:02d}:{value.minute:02d}"
+
+
+def appointed_utc(clock: time, zone_name: str, local_date: date) -> datetime:
+    if not timezone_name_accepted(zone_name):
+        raise ValueError(zone_name)
+    local_clock = datetime.combine(local_date, clock, tzinfo=ZoneInfo(zone_name))
+    return local_clock.astimezone(timezone.utc)
+
+
+def working_desktop_zone(
+    connection: Connection, account_id: uuid.UUID
+) -> str | None:
+    desktop = find_working_desktop(connection, account_id)
+    if desktop is None or desktop["timezone"] is None:
+        return None
+    return desktop["timezone"]
 
 
 def routine_document(row: RowMapping) -> dict[str, object]:

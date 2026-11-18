@@ -1,7 +1,7 @@
 import subprocess
 import sys
 import uuid
-from datetime import datetime, time, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 import pytest
@@ -12,7 +12,8 @@ from server.accounts import create_account, create_session
 from server.app import app
 from server.config import development_tariff
 from server.db import create_db_engine, metadata
-from server.models import accounts, bots, routines, sessions
+from server.models import accounts, bots, desktops, routines, sessions
+from server.routines import appointed_utc, working_desktop_zone
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -150,6 +151,35 @@ def _create_routine(client: TestClient, bot_id: str, payload: dict) -> object:
         json=payload,
         headers={"Origin": ORIGIN},
     )
+
+
+def _insert_desktop(
+    account_id: uuid.UUID, *, working: bool, zone: str | None
+) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                desktops.insert().values(
+                    id=uuid.uuid4(),
+                    account_id=account_id,
+                    computer_id=uuid.uuid4(),
+                    working=working,
+                    created_at=datetime(2026, 11, 18, tzinfo=timezone.utc),
+                    timezone=zone,
+                )
+            )
+    finally:
+        engine.dispose()
+
+
+def _zone(account_id: uuid.UUID) -> str | None:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            return working_desktop_zone(connection, account_id)
+    finally:
+        engine.dispose()
 
 
 def test_routine_model_and_table_have_schedule_columns_only(database: None) -> None:
@@ -510,3 +540,74 @@ def test_origin_and_session_reject_routine_changes(database: None) -> None:
     stored = _account_routines(account_id)
     assert len(stored) == 1
     assert str(stored[0]["id"]) == routine_id
+
+
+def test_appointed_utc_uses_the_desktop_zone() -> None:
+    clock = time(9, 0)
+    local_date = date(2026, 11, 18)
+    utc_nine = datetime(2026, 11, 18, 9, 0, tzinfo=timezone.utc)
+    moscow = appointed_utc(clock, "Europe/Moscow", local_date)
+    new_york = appointed_utc(clock, "America/New_York", local_date)
+    assert moscow == datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+    assert new_york == datetime(2026, 11, 18, 14, 0, tzinfo=timezone.utc)
+    assert moscow.tzinfo is timezone.utc
+    assert new_york.tzinfo is timezone.utc
+    assert moscow != utc_nine
+    assert new_york != utc_nine
+    for zone_name in ("Not/AZone", "Europe/Moskow", "UTC+3", ""):
+        with pytest.raises(ValueError):
+            appointed_utc(clock, zone_name, local_date)
+
+
+def test_saved_clock_stays_local_in_the_working_desktop_zone(
+    database: None,
+) -> None:
+    _, absent_id = _open_account("absent-zone@example.com", confirmed=True)
+    _, null_id = _open_account("null-zone@example.com", confirmed=True)
+    _, idle_id = _open_account("idle-zone@example.com", confirmed=True)
+    cookie, account_id = _open_account("moscow-zone@example.com", confirmed=True)
+    _insert_desktop(null_id, working=True, zone=None)
+    _insert_desktop(idle_id, working=False, zone="Europe/Moscow")
+    _insert_desktop(account_id, working=True, zone="Europe/Moscow")
+    assert _zone(absent_id) is None
+    assert _zone(null_id) is None
+    assert _zone(idle_id) is None
+    assert _zone(account_id) == "Europe/Moscow"
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        created = _create_routine(
+            client,
+            bot["id"],
+            {"weekdays": [3], "time": "09:00"},
+        )
+        assert created.status_code == 200
+        assert tuple(created.json()) == ROUTINE_FIELDS
+        assert created.json()["time"] == "09:00"
+        routine_id = uuid.UUID(created.json()["id"])
+    stored = _account_routines(account_id)
+    assert len(stored) == 1
+    row = stored[0]
+    assert set(row) == set(ROUTINE_COLUMNS)
+    assert row["time_of_day"] == time(9, 0)
+    assert row["time_of_day"].tzinfo is None
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            shown = connection.execute(
+                text("SELECT time_of_day::text FROM routines WHERE id = :id"),
+                {"id": routine_id},
+            ).scalar_one()
+            stored_type = connection.execute(
+                text(
+                    "SELECT pg_typeof(time_of_day)::text"
+                    " FROM routines WHERE id = :id"
+                ),
+                {"id": routine_id},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert shown == "09:00:00"
+    assert stored_type == "time without time zone"
+    appointed = appointed_utc(row["time_of_day"], _zone(account_id), date(2026, 11, 18))
+    assert appointed == datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+    assert appointed != datetime(2026, 11, 18, 9, 0, tzinfo=timezone.utc)
