@@ -2666,3 +2666,54 @@ def test_a_skipped_run_records_one_skipped_notice(
     _settle(SKIP_AT + timedelta(hours=3))
     assert _notices(cookie, computer).json()["notices"] == notices
     assert _chat_messages(bot_id) == messages
+
+
+def test_an_ordinary_reply_records_no_notice(
+    database: None,
+) -> None:
+    cookie, _account_id = _open_account("notice-reply@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _create_bot(client, "Искра", "план")
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "привет"},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        assert [row["role"] for row in posted.json()["messages"]] == [
+            "user",
+            "assistant",
+        ]
+        assert posted.json()["messages"][1]["text"] == STUB_TEXT
+    _desktop(cookie, computer)
+    assert _notices(cookie, computer).json() == {"notices": []}
+
+
+def test_a_queue_message_records_no_notice(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    cookie, _account_id = _open_account("notice-queue@example.com", confirmed=True)
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        first = _create_bot(client, "Первый", "сценарий первого")
+        second = _create_bot(client, "Второй", "сценарий второго")
+        earlier = _create_routine(
+            client, first["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        later = _create_routine(
+            client, second["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert earlier.status_code == 200
+        assert later.status_code == 200
+    _desktop(cookie, computer)
+    claimed = _claim(cookie, computer, CLAIM_AT, monkeypatch)
+    assert claimed.status_code == 200
+    assert claimed.json()["bot_id"] == first["id"]
+    waiting = _chat_messages(uuid.UUID(second["id"]))
+    assert [row["code"] for row in waiting] == ["routine_queue"]
+    notices = _notices(cookie, computer).json()["notices"]
+    assert [item["bot_id"] for item in notices] == [first["id"]]
+    assert [item["kind"] for item in notices] == ["completed"]
+    assert all(item["bot_id"] != second["id"] for item in notices)

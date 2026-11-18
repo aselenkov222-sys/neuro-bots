@@ -53,6 +53,20 @@ def test_local_notification_is_recorded_for_completion_failure_and_skip() -> Non
     assert PHRASES[SKIPPED] == "Запуск пропущен"
 
 
+def test_an_ordinary_reply_and_a_queue_note_are_not_posted() -> None:
+    commands: list[list[str]] = []
+    bot_id = str(uuid.uuid4())
+    posted = post_local(
+        [
+            _notice("routine_queue", bot_id),
+            _notice("reply", bot_id),
+        ],
+        run=_run(commands),
+    )
+    assert posted == []
+    assert commands == []
+
+
 def test_click_opens_the_main_chat_for_a_hidden_and_a_visible_window() -> None:
     bot_id = str(uuid.uuid4())
     script = open_chat_script(bot_id)
