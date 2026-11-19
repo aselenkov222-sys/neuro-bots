@@ -301,3 +301,66 @@ def test_main_chat_stays_and_extra_chat_can_be_deleted(database: None) -> None:
     assert [str(row["id"]) for row in stored] == [main_id]
     assert _texts(bot["id"], uuid.UUID(main_id)) == ["основной", STUB]
     assert _texts(bot["id"], uuid.UUID(extra_id)) == []
+
+
+def test_one_off_reply_stays_in_the_extra_chat(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie = _open_ready("extra-reply@example.com")
+    seen: list[dict] = []
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> str:
+        seen.append(
+            {
+                "description": description,
+                "scenario": scenario,
+                "messages": messages,
+                "desktop_available": desktop_available,
+            }
+        )
+        return "ответ разового"
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client, "один сценарий")
+        main = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "история основного"},
+            headers={"Origin": ORIGIN},
+        )
+        assert main.status_code == 200
+        created = client.post(
+            f"/api/bots/{bot['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        extra_id = created.json()["id"]
+        posted = client.post(
+            f"/api/bots/{bot['id']}/chats/{extra_id}/messages",
+            json={"text": "разовое поручение"},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        assert [row["text"] for row in posted.json()["messages"]] == [
+            "разовое поручение",
+            "ответ разового",
+        ]
+        again = client.get(f"/api/bots/{bot['id']}/messages")
+        assert [row["text"] for row in again.json()["messages"]] == [
+            "история основного",
+            "ответ разового",
+        ]
+        me = client.get("/api/me")
+        assert me.json()["quota"] == 498
+    assert seen[1] == {
+        "description": "описание",
+        "scenario": "один сценарий",
+        "messages": [{"role": "user", "text": "разовое поручение"}],
+        "desktop_available": False,
+    }
+    assert "история основного" not in str(seen[1])

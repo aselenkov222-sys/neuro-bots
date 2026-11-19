@@ -771,11 +771,17 @@ def test_browser_opens_an_empty_extra_chat(database: None) -> None:
             page.wait_for_selector("text=Чат пустой. История из основного сюда не копируется.")
             assert page.locator("text=Дополнительный чат. История основного сюда не копируется.").count() == 1
             assert page.locator(f"text={STUB}").count() == 0
-            assert page.locator("#composer").is_disabled()
+            assert page.locator("#composer").is_enabled()
+            page.fill("#composer", "разовое поручение")
+            page.click("button[aria-label='Отправить']")
+            page.wait_for_selector("text=разовое поручение")
+            assert page.locator(".bubble").filter(has_text=STUB).count() == 1
+            assert page.locator(".bubble").filter(has_text="история основного").count() == 0
             assert page.locator("text=Удалить чат").count() == 1
             page.click("role=tab[name='Основной']")
-            page.wait_for_selector(f"text={STUB}")
-            assert page.locator("text=история основного").count() == 1
+            page.wait_for_selector(".bubble:has-text('история основного')")
+            assert page.locator(".bubble").filter(has_text="история основного").count() == 1
+            assert page.locator(".bubble").filter(has_text="разовое поручение").count() == 0
             assert page.locator("#scenario").count() == 0
             assert page.locator("text=Удалить чат").count() == 0
             page.click("role=tab[name='Дополнительный']")

@@ -528,11 +528,8 @@ function chatLabel(chat) {
 
 function messagesPath() {
   const chat = activeChat();
-  if (!state.activeId) return "";
-  if (chat && chat.kind === "extra") {
-    return `/api/bots/${state.activeId}/chats/${chat.id}/messages`;
-  }
-  return `/api/bots/${state.activeId}/messages`;
+  if (!state.activeId || !chat) return "";
+  return `/api/bots/${state.activeId}/chats/${chat.id}/messages`;
 }
 
 function chatScreen() {
@@ -570,8 +567,8 @@ function chatScreen() {
       <div class="messages">${thread}</div>
       <form class="composer" data-form="send">
         <label class="sr-only" for="composer">Сообщение</label>
-        <input id="composer" type="text" placeholder="Написать в этот чат" autocomplete="off"${extra ? " disabled" : ""}>
-        <button class="btn-orange icon-btn" type="submit" aria-label="Отправить"${extra ? " disabled" : ""}>${icon("send")}</button>
+        <input id="composer" type="text" placeholder="Написать в этот чат" autocomplete="off">
+        <button class="btn-orange icon-btn" type="submit" aria-label="Отправить">${icon("send")}</button>
       </form>
     </section>`;
 }
@@ -886,9 +883,8 @@ async function addChat() {
 async function submitMessage() {
   const input = document.getElementById("composer");
   const text = input.value.trim();
-  const chat = activeChat();
-  if (!text || !state.activeId || (chat && chat.kind === "extra")) return;
-  const result = await api(`/api/bots/${state.activeId}/messages`, {
+  if (!text || !state.activeId || !activeChat()) return;
+  const result = await api(messagesPath(), {
     method: "POST",
     body: { text }
   });
@@ -901,7 +897,7 @@ async function submitMessage() {
   let listed = result;
   while (Date.now() - started <= BROWSER_WAIT_MS) {
     await finishBrowserTask();
-    const next = await api(`/api/bots/${state.activeId}/messages`);
+    const next = await api(messagesPath());
     if (next.ok && next.data) listed = next;
     const messages = listed.data && listed.data.messages;
     if (!messages || !replyPending(messages, text)) break;
@@ -1199,9 +1195,8 @@ window.addEventListener("message", (event) => {
     body: { login: "saved", site: data.site }
   }).then((result) => {
     if (!result.ok || !state.activeId) return null;
-    const chat = activeChat();
-    if (chat && chat.kind === "extra") return null;
-    return api(`/api/bots/${state.activeId}/messages`);
+    if (!activeChat()) return null;
+    return api(messagesPath());
   }).then((listed) => {
     if (!listed || !listed.ok || !listed.data) return;
     state.messages = listed.data.messages;

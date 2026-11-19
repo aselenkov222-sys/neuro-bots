@@ -153,9 +153,11 @@ def bot_holds_browser(
     return item is not None and item.bot_id == bot_id
 
 
-def hold_text(account_id: uuid.UUID, bot_id: uuid.UUID, text: str) -> None:
+def hold_text(
+    account_id: uuid.UUID, bot_id: uuid.UUID, chat_id: uuid.UUID, text: str
+) -> None:
     with _lock:
-        _held.setdefault((account_id, bot_id), []).append(text)
+        _held.setdefault((account_id, bot_id), []).append((chat_id, text))
 
 
 def take_login_choice(
@@ -485,14 +487,15 @@ def release_held(
         return
     with _lock:
         waiting = _held.pop((account_id, bot_id), [])
-    for _text in waiting:
-        _answer_held(connection, account_id, bot_id, now)
+    for chat_id, _text in waiting:
+        _answer_held(connection, account_id, bot_id, chat_id, now)
 
 
 def _answer_held(
     connection: Connection,
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
+    chat_id: uuid.UUID,
     now: datetime,
 ) -> None:
     bot = (
@@ -509,8 +512,8 @@ def _answer_held(
         return
     chat_id = connection.execute(
         select(chats.c.id).where(
+            chats.c.id == chat_id,
             chats.c.bot_id == bot_id,
-            chats.c.kind == "main",
         )
     ).scalar_one_or_none()
     if chat_id is None:
