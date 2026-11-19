@@ -643,3 +643,50 @@ def test_an_extra_chat_confirms_the_same_bot_scenario(
     assert _scenario(bot["id"]) == RULES
     for message_id, text in main_before.items():
         assert _texts_by_id(nxt.json()["messages"])[message_id] == text
+
+
+def _set_message_text(message_id: str, text: str) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            updated = connection.execute(
+                messages.update()
+                .where(messages.c.id == uuid.UUID(message_id))
+                .values(text=text)
+            )
+            assert updated.rowcount == 1
+    finally:
+        engine.dispose()
+
+
+def test_confirmation_writes_the_stored_assistant_text(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    email = "scenario-stored@example.com"
+    cookie = _open_ready(email)
+    account_id = _account_id(email)
+    stored = "текст, который уже лежит в сообщении ассистента"
+    with _client(cookie) as client:
+        bot = _bot(client)
+        proposal = _proposal(client, bot["id"])
+        assert proposal["text"] == RULES
+        assert proposal["text"] != STUB
+        _set_message_text(proposal["id"], stored)
+        listed = client.get(f"/api/bots/{bot['id']}/messages")
+        assert listed.json()["messages"][1]["text"] == stored
+        assert listed.json()["messages"][0]["text"] == REQUEST
+        confirmed = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["messages"][1]["text"] == stored
+        assert confirmed.json()["messages"][1]["code"] == "scenario_confirmed"
+        assert confirmed.json()["messages"][0]["text"] == REQUEST
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == stored
+    assert _scenario(bot["id"]) == stored
+    assert _scenario(bot["id"]) != RULES
+    assert _used(account_id) == 0
+    assert _charges(account_id) == []
