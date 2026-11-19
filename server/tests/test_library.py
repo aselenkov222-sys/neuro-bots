@@ -396,3 +396,79 @@ def test_a_name_that_is_not_xlsx_stores_text_only(
     assert counter["used"] == 1
     assert len(charges) == 1
     assert me.json()["quota"] == 499
+
+
+def test_analysis_comes_back_as_text_without_a_file(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-analysis@example.com")
+    reply = "В письме одна просьба и срок до пятницы."
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> str:
+        return reply
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "Сделай анализ этого письма."},
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/messages")
+    assert posted.status_code == 200
+    user, assistant = posted.json()["messages"]
+    assert user["role"] == "user"
+    assert user["text"] == "Сделай анализ этого письма."
+    assert "file" not in user
+    assert assistant["role"] == "assistant"
+    assert assistant["text"] == reply
+    assert assistant["text"] != STUB
+    assert "file" not in assistant
+    assert tuple(assistant) == MESSAGE_FIELDS
+    assert listed.json() == posted.json()
+    assert _library(bot["id"]) == []
+
+
+def test_translation_comes_back_as_text_without_a_file(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-translation@example.com")
+    reply = "Please send the letter by Friday."
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> str:
+        return reply
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "Переведи это письмо на английский."},
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/messages")
+    assert posted.status_code == 200
+    user, assistant = posted.json()["messages"]
+    assert user["role"] == "user"
+    assert user["text"] == "Переведи это письмо на английский."
+    assert "file" not in user
+    assert assistant["role"] == "assistant"
+    assert assistant["text"] == reply
+    assert assistant["text"] != STUB
+    assert "file" not in assistant
+    assert tuple(assistant) == MESSAGE_FIELDS
+    assert listed.json() == posted.json()
+    assert _library(bot["id"]) == []
