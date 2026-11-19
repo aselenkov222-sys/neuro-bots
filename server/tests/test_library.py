@@ -909,6 +909,8 @@ def test_chat_screen_offers_open_and_delete() -> None:
     assert "grid-template-columns: minmax(0, 1fr) 228px;" in styles
     assert ".home .library" in styles
     assert ".home .file" in styles
+    stacked = styles.split(".home .library .file > .btn-quiet", 1)[1].split("}", 1)[0]
+    assert "grid-column: 1 / -1" in stacked
 
 
 def test_deleting_an_extra_chat_keeps_its_xlsx(
