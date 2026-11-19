@@ -9,14 +9,16 @@ from desktop.routine_gate import mark_window_shown, window_hidden
 COMPLETED = "completed"
 FAILED = "failed"
 SKIPPED = "skipped"
+WAITING = "waiting"
 PHRASES = {
     COMPLETED: "Запуск завершился",
     FAILED: "Запуск сорвался",
     SKIPPED: "Запуск пропущен",
+    WAITING: "Ждёт «Да»",
 }
 _TITLE = "Кабинет"
 _NOTIFICATION = re.compile(
-    r'^display notification "(Запуск завершился|Запуск сорвался|Запуск пропущен)" '
+    r'^display notification "(Запуск завершился|Запуск сорвался|Запуск пропущен|Ждёт «Да»)" '
     r'with title "Кабинет" subtitle '
     r'"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"$'
 )

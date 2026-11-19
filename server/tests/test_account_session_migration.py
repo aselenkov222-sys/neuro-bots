@@ -94,6 +94,7 @@ FAILED_REVISION = "b8e5c2a94f17"
 ORDER_REVISION = "c4d8e2a71b06"
 CHECK_REVISION = "e6b1a9c34f28"
 NOTICE_REVISION = "f3a8c1d27e05"
+GATE_REVISION = "b3c7e9a41d52"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -104,12 +105,33 @@ NOTICE_COLUMNS = (
 )
 NOTICE_KIND_CHECK = (
     "CHECK (((kind)::text = ANY ((ARRAY['completed'::character varying, "
-    "'failed'::character varying, 'skipped'::character varying])::text[])))"
+    "'failed'::character varying, 'skipped'::character varying, "
+    "'waiting'::character varying])::text[])))"
 )
 ROUTINE_CHECK_COLUMNS = ("id", "bot_id", "status", "created_at")
 ROUTINE_CHECK_STATUS_CHECK = (
     "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
-    "'claimed'::character varying])::text[])))"
+    "'claimed'::character varying, 'awaiting'::character varying])::text[])))"
+)
+DANGEROUS_STEP_COLUMNS = (
+    "id",
+    "run_id",
+    "check_id",
+    "bot_id",
+    "message_id",
+    "action",
+    "position",
+    "answer",
+    "answered_at",
+    "performed_at",
+)
+DANGEROUS_ANSWER_CHECK = (
+    "CHECK (((answer IS NULL) OR ((answer)::text = ANY "
+    "((ARRAY['yes'::character varying, 'no'::character varying])::text[]))))"
+)
+DANGEROUS_PARENT_CHECK = (
+    "CHECK ((((run_id IS NOT NULL) AND (check_id IS NULL)) OR "
+    "((run_id IS NULL) AND (check_id IS NOT NULL))))"
 )
 ROUTINE_RUN_COLUMNS = (
     "id",
@@ -122,7 +144,8 @@ ROUTINE_RUN_COLUMNS = (
 ROUTINE_RUN_STATUS_CHECK = (
     "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
     "'claimed'::character varying, 'skipped'::character varying, "
-    "'cancelled'::character varying, 'failed'::character varying])::text[])))"
+    "'cancelled'::character varying, 'failed'::character varying, "
+    "'awaiting'::character varying, 'finished'::character varying])::text[])))"
 )
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
@@ -208,8 +231,10 @@ def _revision_chain() -> list[str]:
     assert links[ORDER_REVISION] == FAILED_REVISION
     assert links[CHECK_REVISION] == ORDER_REVISION
     assert links[NOTICE_REVISION] == CHECK_REVISION
-    assert links[chain[-1]] == CHECK_REVISION
-    assert chain[-1] == NOTICE_REVISION
+    assert links[GATE_REVISION] == NOTICE_REVISION
+    assert links[chain[-1]] == NOTICE_REVISION
+    assert chain[-1] == GATE_REVISION
+    assert chain[-1] != NOTICE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
     assert chain[-1] != SUBSCRIPTION_REVISION
@@ -476,6 +501,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     routine_runs = metadata.tables["routine_runs"]
     routine_checks = metadata.tables["routine_checks"]
     desktop_notices = metadata.tables["desktop_notices"]
+    dangerous_steps = metadata.tables["dangerous_steps"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -491,6 +517,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "routine_runs",
         "routine_checks",
         "desktop_notices",
+        "dangerous_steps",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -506,6 +533,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert routine_runs is server.models.routine_runs
     assert routine_checks is server.models.routine_checks
     assert desktop_notices is server.models.desktop_notices
+    assert dangerous_steps is server.models.dangerous_steps
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -520,6 +548,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(routine_runs.columns.keys()) == ROUTINE_RUN_COLUMNS
     assert tuple(routine_checks.columns.keys()) == ROUTINE_CHECK_COLUMNS
     assert tuple(desktop_notices.columns.keys()) == NOTICE_COLUMNS
+    assert tuple(dangerous_steps.columns.keys()) == DANGEROUS_STEP_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -811,7 +840,8 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     ] == [
         (
             "routine_runs_status_check",
-            "status IN ('pending', 'claimed', 'skipped', 'cancelled', 'failed')",
+            "status IN ('pending', 'claimed', 'skipped', 'cancelled', 'failed', "
+            "'awaiting', 'finished')",
         )
     ]
     run_uniques = [
@@ -851,7 +881,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     ] == [
         (
             "routine_checks_status_check",
-            "status IN ('pending', 'claimed')",
+            "status IN ('pending', 'claimed', 'awaiting')",
         )
     ]
     for column in routine_checks.columns:
@@ -891,11 +921,72 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     ] == [
         (
             "desktop_notices_kind_check",
-            "kind IN ('completed', 'failed', 'skipped')",
+            "kind IN ('completed', 'failed', 'skipped', 'waiting')",
         )
     ]
     for column in desktop_notices.columns:
         assert not isinstance(column.type, Text)
+
+    assert [column.name for column in dangerous_steps.primary_key] == ["id"]
+    _assert_model_column(dangerous_steps.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        dangerous_steps.c.run_id,
+        Uuid,
+        nullable=True,
+        foreign_table="routine_runs",
+        ondelete="CASCADE",
+    )
+    _assert_model_column(
+        dangerous_steps.c.check_id,
+        Uuid,
+        nullable=True,
+        foreign_table="routine_checks",
+        ondelete="CASCADE",
+    )
+    _assert_model_column(
+        dangerous_steps.c.bot_id,
+        Uuid,
+        nullable=False,
+        foreign_table="bots",
+    )
+    _assert_model_column(
+        dangerous_steps.c.message_id,
+        Uuid,
+        nullable=False,
+        foreign_table="messages",
+    )
+    _assert_model_column(dangerous_steps.c.action, Text, nullable=False)
+    _assert_model_column(dangerous_steps.c.position, Integer, nullable=False)
+    _assert_model_column(
+        dangerous_steps.c.answer, String, nullable=True, length=3
+    )
+    _assert_model_column(
+        dangerous_steps.c.answered_at,
+        DateTime,
+        nullable=True,
+        timezone=True,
+    )
+    _assert_model_column(
+        dangerous_steps.c.performed_at,
+        DateTime,
+        nullable=True,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in dangerous_steps.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == [
+        (
+            "dangerous_steps_parent_check",
+            "(run_id IS NOT NULL AND check_id IS NULL) OR "
+            "(run_id IS NULL AND check_id IS NOT NULL)",
+        ),
+        (
+            "dangerous_steps_answer_check",
+            "answer IS NULL OR answer IN ('yes', 'no')",
+        ),
+    ]
 
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
@@ -941,6 +1032,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "routine_runs",
                     "routine_checks",
                     "desktop_notices",
+                    "dangerous_steps",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1438,6 +1530,71 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     ),
                     ("c", NOTICE_KIND_CHECK),
                 }
+                step_columns = _columns(connection, "dangerous_steps")
+                assert tuple(step_columns) == DANGEROUS_STEP_COLUMNS
+                _assert_catalog_column(
+                    step_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    step_columns, "run_id", "uuid", "uuid", not_null=False
+                )
+                _assert_catalog_column(
+                    step_columns, "check_id", "uuid", "uuid", not_null=False
+                )
+                _assert_catalog_column(
+                    step_columns, "bot_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    step_columns, "message_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    step_columns, "action", "text", "text", not_null=True
+                )
+                _assert_catalog_column(
+                    step_columns, "position", "int4", "integer", not_null=True
+                )
+                _assert_catalog_column(
+                    step_columns,
+                    "answer",
+                    "varchar",
+                    "character varying(3)",
+                    not_null=False,
+                )
+                _assert_catalog_column(
+                    step_columns,
+                    "answered_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=False,
+                )
+                _assert_catalog_column(
+                    step_columns,
+                    "performed_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=False,
+                )
+                assert _constraints(connection, "dangerous_steps") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (bot_id) REFERENCES bots(id)",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (check_id) REFERENCES routine_checks(id) ON DELETE CASCADE",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (message_id) REFERENCES messages(id)",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (run_id) REFERENCES routine_runs(id) ON DELETE CASCADE",
+                    ),
+                    ("c", DANGEROUS_ANSWER_CHECK),
+                    ("c", DANGEROUS_PARENT_CHECK),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1457,6 +1614,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "routine_runs",
                     "routine_checks",
                     "desktop_notices",
+                    "dangerous_steps",
                 ):
                     assert (
                         connection.execute(

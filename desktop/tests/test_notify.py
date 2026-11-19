@@ -9,6 +9,7 @@ from desktop.notify import (
     FAILED,
     PHRASES,
     SKIPPED,
+    WAITING,
     bind_cabinet,
     click_command,
     notification_command,
@@ -101,6 +102,18 @@ def _click_recorded(command: list[str], *, hidden: bool) -> list[str]:
     assert shown == (["shown"] if hidden else [])
     assert window_hidden() is False
     return scripts
+
+
+def test_waiting_for_yes_posts_a_local_notification_that_opens_the_chat() -> None:
+    bot_id = str(uuid.uuid4())
+    notice = _notice(WAITING, bot_id)
+    commands: list[list[str]] = []
+    posted = post_local([notice], run=_run(commands))
+    assert posted == [notice]
+    assert PHRASES[WAITING] == "Ждёт «Да»"
+    assert commands == [notification_command(PHRASES[WAITING], bot_id)]
+    hidden = _click_recorded(commands[0], hidden=True)
+    assert hidden == [open_chat_script(bot_id)]
 
 
 def test_loopback_posts_those_notifications_and_refuses_a_password() -> None:

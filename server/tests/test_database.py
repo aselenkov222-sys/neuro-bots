@@ -149,6 +149,7 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
         "routine_runs",
         "routine_checks",
         "desktop_notices",
+        "dangerous_steps",
     }
     assert server.models.accounts.metadata is metadata
     assert server.models.sessions.metadata is metadata
@@ -164,6 +165,7 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert server.models.routine_runs.metadata is metadata
     assert server.models.routine_checks.metadata is metadata
     assert server.models.desktop_notices.metadata is metadata
+    assert server.models.dangerous_steps.metadata is metadata
     chain = _revision_chain()
     assert chain[0] == ("3c87a0f84d5e", None)
     assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
@@ -181,8 +183,10 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert ("c4d8e2a71b06", "b8e5c2a94f17") in chain
     assert ("e6b1a9c34f28", "c4d8e2a71b06") in chain
     assert ("f3a8c1d27e05", "e6b1a9c34f28") in chain
-    assert chain[-1] == ("f3a8c1d27e05", "e6b1a9c34f28")
-    assert chain[-1][1] == "e6b1a9c34f28"
+    assert ("b3c7e9a41d52", "f3a8c1d27e05") in chain
+    assert chain[-1] == ("b3c7e9a41d52", "f3a8c1d27e05")
+    assert chain[-1][1] == "f3a8c1d27e05"
+    assert chain[-1][0] != "f3a8c1d27e05"
     assert chain[-1][0] != "e6b1a9c34f28"
     assert chain[-1][0] != "c4d8e2a71b06"
     assert chain[-1][0] != "d4f1b8e06c32"
@@ -239,8 +243,10 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert ("c4d8e2a71b06", "b8e5c2a94f17") in chain
         assert ("e6b1a9c34f28", "c4d8e2a71b06") in chain
         assert ("f3a8c1d27e05", "e6b1a9c34f28") in chain
-        assert chain[-1] == ("f3a8c1d27e05", "e6b1a9c34f28")
-        assert chain[-1][1] == "e6b1a9c34f28"
+        assert ("b3c7e9a41d52", "f3a8c1d27e05") in chain
+        assert chain[-1] == ("b3c7e9a41d52", "f3a8c1d27e05")
+        assert chain[-1][1] == "f3a8c1d27e05"
+        assert chain[-1][0] != "f3a8c1d27e05"
         assert chain[-1][0] != "e6b1a9c34f28"
         assert chain[-1][0] != "c4d8e2a71b06"
         assert chain[-1][0] != "d4f1b8e06c32"
@@ -281,6 +287,7 @@ def test_select_one_and_alembic_upgrade_head() -> None:
             "routine_runs",
             "routine_checks",
             "desktop_notices",
+            "dangerous_steps",
             "alembic_version",
         }
     finally:

@@ -177,7 +177,8 @@ routine_runs = Table(
     Column("status", String(16), nullable=False),
     Column("claimed_at", DateTime(timezone=True), nullable=True),
     CheckConstraint(
-        "status IN ('pending', 'claimed', 'skipped', 'cancelled', 'failed')",
+        "status IN ('pending', 'claimed', 'skipped', 'cancelled', 'failed', "
+        "'awaiting', 'finished')",
         name="routine_runs_status_check",
     ),
     UniqueConstraint("routine_id", "local_date"),
@@ -191,7 +192,7 @@ routine_checks = Table(
     Column("status", String(16), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "status IN ('pending', 'claimed')",
+        "status IN ('pending', 'claimed', 'awaiting')",
         name="routine_checks_status_check",
     ),
 )
@@ -206,7 +207,41 @@ desktop_notices = Table(
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("delivered_at", DateTime(timezone=True), nullable=True),
     CheckConstraint(
-        "kind IN ('completed', 'failed', 'skipped')",
+        "kind IN ('completed', 'failed', 'skipped', 'waiting')",
         name="desktop_notices_kind_check",
+    ),
+)
+
+dangerous_steps = Table(
+    "dangerous_steps",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column(
+        "run_id",
+        Uuid(),
+        ForeignKey("routine_runs.id", ondelete="CASCADE"),
+        nullable=True,
+    ),
+    Column(
+        "check_id",
+        Uuid(),
+        ForeignKey("routine_checks.id", ondelete="CASCADE"),
+        nullable=True,
+    ),
+    Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
+    Column("message_id", Uuid(), ForeignKey("messages.id"), nullable=False),
+    Column("action", Text(), nullable=False),
+    Column("position", Integer(), nullable=False),
+    Column("answer", String(3), nullable=True),
+    Column("answered_at", DateTime(timezone=True), nullable=True),
+    Column("performed_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "answer IS NULL OR answer IN ('yes', 'no')",
+        name="dangerous_steps_answer_check",
+    ),
+    CheckConstraint(
+        "(run_id IS NOT NULL AND check_id IS NULL) OR "
+        "(run_id IS NULL AND check_id IS NOT NULL)",
+        name="dangerous_steps_parent_check",
     ),
 )

@@ -1059,6 +1059,27 @@ html[data-theme="dark"] .home .bubble.user {
   padding-right: 0;
 }
 
+.home .bubble.gate {
+  align-self: stretch;
+  max-width: none;
+  background: rgba(194, 65, 12, 0.06);
+  border: 1px solid rgba(194, 65, 12, 0.45);
+  box-shadow: 0 0 16px rgba(194, 65, 12, 0.16);
+}
+
+html[data-theme="dark"] .home .bubble.gate {
+  background: rgba(255, 138, 69, 0.08);
+  border-color: rgba(255, 138, 69, 0.5);
+}
+
+.home .tag {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--danger-ink);
+}
+
 .home .side-id {
   display: grid;
   grid-template-columns: 32px minmax(0, 1fr);

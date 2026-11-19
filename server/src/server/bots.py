@@ -26,6 +26,7 @@ from server.browser_action import (
     named_address,
     take_login_choice,
 )
+from server.dangerous import DANGEROUS_CODE, gate_state
 from server.config import development_tariff
 from server.desktops import find_working_desktop
 from server.models import (
@@ -326,18 +327,29 @@ def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, 
         .mappings()
         .all()
     )
-    return {
-        "messages": [
-            {
-                "id": str(row["id"]),
-                "role": row["role"],
-                "text": row["text"],
-                "code": row["code"],
-                "updated_at": format_utc(row["updated_at"]),
-            }
-            for row in rows
-        ]
-    }
+    payload = [
+        {
+            "id": str(row["id"]),
+            "role": row["role"],
+            "text": row["text"],
+            "code": row["code"],
+            "updated_at": format_utc(row["updated_at"]),
+        }
+        for row in rows
+    ]
+    gated = [
+        uuid.UUID(item["id"])
+        for item in payload
+        if item["code"] == DANGEROUS_CODE
+    ]
+    states = gate_state(connection, gated)
+    for item in payload:
+        state = states.get(uuid.UUID(item["id"]))
+        if state is None:
+            continue
+        item["answer"] = state["answer"]
+        item["pending"] = state["pending"]
+    return {"messages": payload}
 
 
 def _adapter_messages(connection: Connection, chat_id: uuid.UUID) -> list[dict[str, str]]:
