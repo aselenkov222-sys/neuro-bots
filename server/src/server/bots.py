@@ -37,6 +37,7 @@ from server.models import (
     quota_counters,
     subscription_periods,
 )
+from server.scenario_chat import PROPOSAL_CODE, proposed_scenario
 
 router = APIRouter()
 
@@ -571,6 +572,21 @@ def _deliver_message(
         opened.now,
     )
     follow_at = opened.now + timedelta(microseconds=1)
+    proposed = proposed_scenario(text)
+    if proposed is not None:
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "assistant",
+            proposed,
+            PROPOSAL_CODE,
+            follow_at,
+        )
+        opened.connection.execute(
+            chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat["id"]))
     desktop = find_working_desktop(opened.connection, opened.account["id"])
     desktop_available = (
         desktop is not None and desktop["last_pulse_at"] is not None
