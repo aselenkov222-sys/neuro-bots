@@ -13,9 +13,11 @@ from server.app import app
 from server.db import create_db_engine
 from server.models import (
     accounts,
+    bots,
     chats,
     messages,
     quota_counters,
+    routines,
     subscription_periods,
 )
 
@@ -364,3 +366,53 @@ def test_one_off_reply_stays_in_the_extra_chat(
         "desktop_available": False,
     }
     assert "история основного" not in str(seen[1])
+
+
+def test_delete_extra_chat_leaves_the_bot_that_owns_the_library(
+    database: None,
+) -> None:
+    cookie = _open_ready("extra-library@example.com")
+    with _client(cookie) as client:
+        bot = _bot(client, "сценарий библиотеки")
+        routine = client.post(
+            f"/api/bots/{bot['id']}/routines",
+            json={"weekdays": [1], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert routine.status_code == 200
+        routine_id = routine.json()["id"]
+        created = client.post(
+            f"/api/bots/{bot['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        extra_id = created.json()["id"]
+        posted = client.post(
+            f"/api/bots/{bot['id']}/chats/{extra_id}/messages",
+            json={"text": "разовое"},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        removed = client.delete(
+            f"/api/bots/{bot['id']}/chats/{extra_id}",
+            headers={"Origin": ORIGIN},
+        )
+        assert removed.status_code == 204
+        card = client.get(f"/api/bots/{bot['id']}")
+        assert card.status_code == 200
+        assert card.json()["id"] == bot["id"]
+        assert card.json()["scenario"] == "сценарий библиотеки"
+        kept = client.get(f"/api/bots/{bot['id']}/routines")
+        assert kept.status_code == 200
+        assert [row["id"] for row in kept.json()] == [routine_id]
+        remaining = client.get(f"/api/bots/{bot['id']}/chats")
+        assert [row["kind"] for row in remaining.json()["chats"]] == ["main"]
+        main_messages = client.get(f"/api/bots/{bot['id']}/messages")
+        assert main_messages.json() == {"messages": []}
+    bot_id = uuid.UUID(bot["id"])
+    assert [row for row in _rows(bots) if row["id"] == bot_id][0]["scenario"] == (
+        "сценарий библиотеки"
+    )
+    assert [row for row in _rows(routines) if row["bot_id"] == bot_id][0]["id"] == (
+        uuid.UUID(routine_id)
+    )
+    assert _texts(bot["id"], uuid.UUID(extra_id)) == []
