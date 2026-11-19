@@ -318,3 +318,121 @@ def test_exhausted_quota_still_shows_the_requested_text(
         assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == OLD
     assert _used(account_id) == development_tariff.model_requests
     assert _charges(account_id) == []
+
+
+NOT_FOUND = {"code": "not_found", "message": "Бот не найден."}
+PROPOSAL_NOT_FOUND = {"code": "not_found", "message": "Сообщение не найдено."}
+INVALID_CONFIRM = {"code": "invalid_request", "message": "Нужно подтверждение."}
+INVALID_ORIGIN = {
+    "code": "invalid_origin",
+    "message": "Запрос пришёл не с нашего сервера.",
+}
+SAVED = "Сценарий сохранён. Прежний текст заменён целиком."
+
+
+def _proposal(client: TestClient, bot_id: str, text: str = REQUEST) -> dict:
+    posted = client.post(
+        f"/api/bots/{bot_id}/messages",
+        json={"text": text},
+        headers={"Origin": ORIGIN},
+    )
+    assert posted.status_code == 200
+    proposal = posted.json()["messages"][-1]
+    assert proposal["code"] == "scenario_proposal"
+    return proposal
+
+
+def test_confirm_button_is_in_the_chat() -> None:
+    script = (Path(__file__).resolve().parents[2] / "web" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'data-action="confirm-scenario"' in script
+    assert ">Подтвердить</button>" in script
+    assert "scenario_proposal" in script
+    assert "scenario_confirmed" in script
+    assert SAVED in script
+
+
+def test_confirmation_replaces_the_scenario_and_silence_does_not(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    email = "scenario-confirm@example.com"
+    cookie = _open_ready(email)
+    other = _open_ready("scenario-confirm-other@example.com")
+    with _client(cookie) as client:
+        bot = _bot(client)
+        proposal = _proposal(client, bot["id"])
+        assert proposal["text"] == RULES
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == OLD
+        silent = client.get(f"/api/bots/{bot['id']}/messages")
+        assert silent.json()["messages"][1]["code"] == "scenario_proposal"
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == OLD
+        missing_origin = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+        )
+        assert missing_origin.status_code == 403
+        assert missing_origin.json() == INVALID_ORIGIN
+        refused = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": False},
+            headers={"Origin": ORIGIN},
+        )
+        assert refused.status_code == 400
+        assert refused.json() == INVALID_CONFIRM
+        hidden = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True, "password": "not-stored"},
+            headers={"Origin": ORIGIN},
+        )
+        assert hidden.status_code == 400
+        assert hidden.json() == INVALID_CONFIRM
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == OLD
+        user_id = silent.json()["messages"][0]["id"]
+        wrong = client.post(
+            f"/api/bots/{bot['id']}/messages/{user_id}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert wrong.status_code == 404
+        assert wrong.json() == PROPOSAL_NOT_FOUND
+        confirmed = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert confirmed.status_code == 200
+        rows = confirmed.json()["messages"]
+        assert rows[0]["text"] == REQUEST
+        assert rows[1]["text"] == RULES
+        assert rows[1]["code"] == "scenario_confirmed"
+        assert "Подтвердить" not in rows[1]["text"]
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == RULES
+        edited = client.patch(
+            f"/api/bots/{bot['id']}",
+            json={"scenario": "текст с карточки"},
+            headers={"Origin": ORIGIN},
+        )
+        assert edited.status_code == 200
+        again = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert again.status_code == 200
+        assert again.json()["messages"][1]["text"] == RULES
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == "текст с карточки"
+    with _client(other) as client:
+        foreign = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert foreign.status_code == 404
+        assert foreign.json() == NOT_FOUND
+    stored = next(row for row in _rows(messages) if str(row["id"]) == proposal["id"])
+    assert stored["text"] == RULES
+    assert stored["code"] == "scenario_confirmed"
+    assert _scenario(bot["id"]) == "текст с карточки"
+    assert all("not-stored" not in row["text"] for row in _rows(messages))

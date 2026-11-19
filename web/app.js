@@ -508,6 +508,15 @@ function messageHtml(message, bot) {
         : "";
     return `<article class="bubble gate"><span class="tag">Опасное действие</span><p>${text}</p>${actions}<p class="meta">${when}</p></article>`;
   }
+  if (message.code === "scenario_proposal" || message.code === "scenario_confirmed") {
+    const actions = message.code === "scenario_proposal"
+      ? `<div class="actions"><button type="button" class="btn-orange" data-action="confirm-scenario" data-id="${esc(message.id)}">Подтвердить</button></div>`
+      : `<p class="flash" role="status">Сценарий сохранён. Прежний текст заменён целиком.</p>`;
+    const avatar = bot
+      ? `<span class="avatar sm" style="--av:${bot.color}">${icon(bot.icon)}</span>`
+      : "";
+    return `<article class="bubble bot">${avatar}<div><p>${text}</p>${actions}<p class="meta">${when}</p></div></article>`;
+  }
   if (message.role === "user") {
     return `<article class="bubble user"><p>${text}</p><p class="meta">${when}</p></article>`;
   }
@@ -1048,9 +1057,27 @@ app.addEventListener("click", (event) => {
     answerGate(target.dataset.id, action === "gate-yes" ? "yes" : "no");
     return;
   }
+  if (action === "confirm-scenario") {
+    confirmScenario(target.dataset.id);
+    return;
+  }
   if (action === "keep-routine-time") keepHeldRoutine();
   restoreFocus(target);
 });
+
+async function confirmScenario(messageId) {
+  if (!state.activeId || typeof messageId !== "string" || !messageId) return;
+  const result = await api(`/api/bots/${state.activeId}/messages/${messageId}/scenario`, {
+    method: "POST",
+    body: { confirm: true }
+  });
+  note(result);
+  if (result.ok && result.data && Array.isArray(result.data.messages)) {
+    state.messages = result.data.messages;
+  }
+  if (result.ok) await loadCard();
+  render();
+}
 
 async function answerGate(messageId, answer) {
   if (!state.activeId || (answer !== "yes" && answer !== "no") || typeof messageId !== "string") return;

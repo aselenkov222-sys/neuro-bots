@@ -794,3 +794,83 @@ def test_browser_opens_an_empty_extra_chat(database: None) -> None:
             browser.close()
     finally:
         _stop(process, journal)
+
+
+def test_browser_confirms_a_scenario_from_the_chat(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"cabinet-{uuid.uuid4()}@example.com"
+    rules = "каждый день проверяй почту"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text
+                and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/#register")
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Почта")
+            page.fill("#create-scenario", "старый текст")
+            page.click("#save-bot")
+            page.wait_for_selector(".bot-card")
+            page.click(".bot-card")
+            page.wait_for_selector("#scenario")
+            assert page.locator("#scenario").input_value() == "старый текст"
+            page.click("text=В чат")
+            page.wait_for_selector("#composer")
+            page.fill("#composer", f"Сохрани правила: {rules}")
+            page.click("button[aria-label='Отправить']")
+            page.wait_for_selector("[data-action='confirm-scenario']")
+            proposal = page.locator(".bubble").filter(
+                has=page.locator("[data-action='confirm-scenario']")
+            )
+            assert proposal.count() == 1
+            assert rules in proposal.inner_text()
+            assert page.locator(f"text={STUB}").count() == 0
+            page.click("text=Карточка")
+            page.wait_for_selector("#scenario")
+            assert page.locator("#scenario").input_value() == "старый текст"
+            page.click("text=В чат")
+            page.wait_for_selector("[data-action='confirm-scenario']")
+            page.locator("[data-action='confirm-scenario']").click()
+            page.wait_for_selector("text=Сценарий сохранён. Прежний текст заменён целиком.")
+            assert page.locator("[data-action='confirm-scenario']").count() == 0
+            assert rules in page.locator(".bubble").filter(has=page.locator(".flash")).inner_text()
+            page.click("text=Карточка")
+            page.wait_for_selector("#scenario")
+            assert page.locator("#scenario").input_value() == rules
+            browser.close()
+    finally:
+        _stop(process, journal)
