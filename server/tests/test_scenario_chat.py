@@ -581,3 +581,65 @@ def test_the_next_routine_reads_the_confirmed_scenario(
     ]
     assert len(runs) == 1
     assert runs[0]["status"] == "claimed"
+
+
+def test_an_extra_chat_confirms_the_same_bot_scenario(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict] = []
+
+    def spy(**kwargs: object) -> str:
+        seen.append(kwargs)
+        return STUB
+
+    cookie = _open_ready("scenario-extra@example.com")
+    with _client(cookie) as client:
+        bot = _bot(client)
+        main = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "история основного"},
+            headers={"Origin": ORIGIN},
+        )
+        assert main.status_code == 200
+        main_before = _texts_by_id(main.json()["messages"])
+        created = client.post(
+            f"/api/bots/{bot['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+        extra_id = created.json()["id"]
+        posted = client.post(
+            f"/api/bots/{bot['id']}/chats/{extra_id}/messages",
+            json={"text": REQUEST},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        extra_rows = posted.json()["messages"]
+        assert [row["text"] for row in extra_rows] == [REQUEST, RULES]
+        assert extra_rows[1]["code"] == "scenario_proposal"
+        main_during = client.get(f"/api/bots/{bot['id']}/messages")
+        assert _texts_by_id(main_during.json()["messages"]) == main_before
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == OLD
+        confirmed = client.post(
+            f"/api/bots/{bot['id']}/messages/{extra_rows[1]['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["messages"][1]["text"] == RULES
+        assert confirmed.json()["messages"][1]["code"] == "scenario_confirmed"
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == RULES
+        main_after = client.get(f"/api/bots/{bot['id']}/messages")
+        assert _texts_by_id(main_after.json()["messages"]) == main_before
+        monkeypatch.setattr("server.aggregator.complete", spy)
+        nxt = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "дальше в основном"},
+            headers={"Origin": ORIGIN},
+        )
+        assert nxt.status_code == 200
+    assert len(seen) == 1
+    assert seen[0]["scenario"] == RULES
+    assert _scenario(bot["id"]) == RULES
+    for message_id, text in main_before.items():
+        assert _texts_by_id(nxt.json()["messages"])[message_id] == text
