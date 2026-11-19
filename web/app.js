@@ -563,6 +563,7 @@ function chatScreen() {
         </div>
         <div class="thread-tools">
           <button type="button" class="btn-quiet" data-action="add-chat">Новый чат</button>
+          ${extra ? '<button type="button" class="btn-quiet" data-action="delete-chat">Удалить чат</button>' : ""}
           <a class="btn-quiet" href="#bot">Карточка</a>
         </div>
       </div>
@@ -851,6 +852,23 @@ async function submitCreate() {
   render();
 }
 
+async function deleteChat() {
+  const chat = activeChat();
+  if (!state.activeId || !chat || chat.kind !== "extra") return;
+  const result = await api(`/api/bots/${state.activeId}/chats/${chat.id}`, {
+    method: "DELETE"
+  });
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
+  state.activeChatId = null;
+  state.messages = [];
+  await loadMessages();
+  render();
+}
+
 async function addChat() {
   if (!state.activeId) return;
   const result = await api(`/api/bots/${state.activeId}/chats`, { method: "POST" });
@@ -1011,6 +1029,10 @@ app.addEventListener("click", (event) => {
   }
   if (action === "add-chat") {
     addChat();
+    return;
+  }
+  if (action === "delete-chat") {
+    deleteChat();
     return;
   }
   if (action === "open-chat") {

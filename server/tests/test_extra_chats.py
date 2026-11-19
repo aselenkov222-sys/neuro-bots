@@ -26,6 +26,7 @@ ACCEPTED = "abcdef1!"
 STUB = "Сейчас я на заглушке агрегатора и не вызываю модель."
 NOT_FOUND = {"code": "not_found", "message": "Бот не найден."}
 CHAT_NOT_FOUND = {"code": "not_found", "message": "Чат не найден."}
+MAIN_KEPT = {"code": "main_chat", "message": "Основной чат удалить нельзя."}
 INVALID_ORIGIN = {
     "code": "invalid_origin",
     "message": "Запрос пришёл не с нашего сервера.",
@@ -223,3 +224,80 @@ def test_extra_chat_rejects_a_foreign_bot_and_a_missing_origin(database: None) -
         unknown = client.get(f"/api/bots/{bot['id']}/chats/{uuid.uuid4()}/messages")
         assert unknown.status_code == 404
         assert unknown.json() == CHAT_NOT_FOUND
+
+
+def _insert_message(chat_id: uuid.UUID, text: str) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                messages.insert().values(
+                    id=uuid.uuid4(),
+                    chat_id=chat_id,
+                    role="user",
+                    text=text,
+                    code=None,
+                    updated_at=datetime(2026, 11, 16, 12, 1, tzinfo=timezone.utc),
+                )
+            )
+    finally:
+        engine.dispose()
+
+
+def test_main_chat_stays_and_extra_chat_can_be_deleted(database: None) -> None:
+    cookie = _open_ready("extra-delete@example.com")
+    other = _open_ready("extra-delete-other@example.com")
+    with _client(cookie) as client:
+        bot = _bot(client, "сценарий")
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "основной"},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        listed = client.get(f"/api/bots/{bot['id']}/chats")
+        main_id = listed.json()["chats"][0]["id"]
+        created = client.post(
+            f"/api/bots/{bot['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        extra_id = created.json()["id"]
+        _insert_message(uuid.UUID(extra_id), "только здесь")
+        refused = client.delete(
+            f"/api/bots/{bot['id']}/chats/{main_id}",
+            headers={"Origin": ORIGIN},
+        )
+        assert refused.status_code == 400
+        assert refused.json() == MAIN_KEPT
+        assert client.get(f"/api/bots/{bot['id']}/messages").json()["messages"][0]["text"] == "основной"
+        missing_origin = client.delete(f"/api/bots/{bot['id']}/chats/{extra_id}")
+        assert missing_origin.status_code == 403
+        assert missing_origin.json() == INVALID_ORIGIN
+        removed = client.delete(
+            f"/api/bots/{bot['id']}/chats/{extra_id}",
+            headers={"Origin": ORIGIN},
+        )
+        assert removed.status_code == 204
+        assert removed.content == b""
+        gone = client.get(f"/api/bots/{bot['id']}/chats/{extra_id}/messages")
+        assert gone.status_code == 404
+        assert gone.json() == CHAT_NOT_FOUND
+        again = client.delete(
+            f"/api/bots/{bot['id']}/chats/{extra_id}",
+            headers={"Origin": ORIGIN},
+        )
+        assert again.status_code == 404
+        assert again.json() == CHAT_NOT_FOUND
+        remaining = client.get(f"/api/bots/{bot['id']}/chats")
+        assert [row["id"] for row in remaining.json()["chats"]] == [main_id]
+    with _client(other) as client:
+        foreign = client.delete(
+            f"/api/bots/{bot['id']}/chats/{main_id}",
+            headers={"Origin": ORIGIN},
+        )
+        assert foreign.status_code == 404
+        assert foreign.json() == NOT_FOUND
+    stored = [row for row in _rows(chats) if str(row["bot_id"]) == bot["id"]]
+    assert [str(row["id"]) for row in stored] == [main_id]
+    assert _texts(bot["id"], uuid.UUID(main_id)) == ["основной", STUB]
+    assert _texts(bot["id"], uuid.UUID(extra_id)) == []

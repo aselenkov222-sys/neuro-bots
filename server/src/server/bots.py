@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
@@ -71,6 +71,7 @@ EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 COMPUTER_UNAVAILABLE_TEXT = "компьютер недоступен"
 CHAT_NOT_FOUND = "Чат не найден."
+MAIN_CHAT_KEPT = "Основной чат удалить нельзя."
 MAIN_KIND = "main"
 EXTRA_KIND = "extra"
 
@@ -92,6 +93,10 @@ def not_found() -> JSONResponse:
 
 def chat_not_found() -> JSONResponse:
     return error_response(404, "not_found", CHAT_NOT_FOUND)
+
+
+def main_chat_kept() -> JSONResponse:
+    return error_response(400, "main_chat", MAIN_CHAT_KEPT)
 
 
 def bot_document(row: RowMapping) -> dict[str, object]:
@@ -696,6 +701,33 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+@router.delete("/api/bots/{bot_id}/chats/{chat_id}")
+def delete_chat(request: Request, bot_id: str, chat_id: str) -> Response:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_chat = parse_id(chat_id)
+        if parsed_chat is None:
+            return chat_not_found()
+        chat = _owned_chat(opened.connection, parsed_chat, parsed_id)
+        if chat is None:
+            return chat_not_found()
+        if chat["kind"] == MAIN_KIND:
+            return main_chat_kept()
+        opened.connection.execute(
+            messages.delete().where(messages.c.chat_id == chat["id"])
+        )
+        opened.connection.execute(chats.delete().where(chats.c.id == chat["id"]))
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return Response(status_code=204)
 
 
 @router.get("/api/bots/{bot_id}/chats")
