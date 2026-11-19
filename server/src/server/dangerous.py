@@ -60,7 +60,10 @@ def routine_is_awaiting(connection: Connection, routine_id: uuid.UUID) -> bool:
 
 def _chat_id(connection: Connection, bot_id: uuid.UUID) -> uuid.UUID:
     return connection.execute(
-        select(chats.c.id).where(chats.c.bot_id == bot_id)
+        select(chats.c.id).where(
+            chats.c.bot_id == bot_id,
+            chats.c.kind == "main",
+        )
     ).scalar_one()
 
 

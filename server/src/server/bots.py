@@ -70,6 +70,9 @@ EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 COMPUTER_UNAVAILABLE_TEXT = "компьютер недоступен"
+CHAT_NOT_FOUND = "Чат не найден."
+MAIN_KIND = "main"
+EXTRA_KIND = "extra"
 
 
 class Opened(NamedTuple):
@@ -85,6 +88,10 @@ def email_unconfirmed() -> JSONResponse:
 
 def not_found() -> JSONResponse:
     return error_response(404, "not_found", NOT_FOUND)
+
+
+def chat_not_found() -> JSONResponse:
+    return error_response(404, "not_found", CHAT_NOT_FOUND)
 
 
 def bot_document(row: RowMapping) -> dict[str, object]:
@@ -260,11 +267,56 @@ class QuotaCounterMissing(RuntimeError):
     pass
 
 
-def _load_chat(connection: Connection, bot_id: uuid.UUID) -> RowMapping:
+def main_chat(connection: Connection, bot_id: uuid.UUID) -> RowMapping:
     return (
-        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        connection.execute(
+            select(chats).where(
+                chats.c.bot_id == bot_id,
+                chats.c.kind == MAIN_KIND,
+            )
+        )
         .mappings()
         .one()
+    )
+
+
+def _owned_chat(
+    connection: Connection, chat_id: uuid.UUID, bot_id: uuid.UUID
+) -> RowMapping | None:
+    return (
+        connection.execute(
+            select(chats).where(
+                chats.c.id == chat_id,
+                chats.c.bot_id == bot_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+def chat_document(row: RowMapping) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "kind": row["kind"],
+        "created_at": format_utc(row["created_at"]),
+        "updated_at": format_utc(row["updated_at"]),
+    }
+
+
+def _bot_chats(connection: Connection, bot_id: uuid.UUID) -> list[RowMapping]:
+    rows = (
+        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        .mappings()
+        .all()
+    )
+    return sorted(
+        rows,
+        key=lambda row: (
+            0 if row["kind"] == MAIN_KIND else 1,
+            row["created_at"],
+            row["id"],
+        ),
     )
 
 
@@ -426,6 +478,8 @@ async def create_bot(request: Request) -> JSONResponse:
                 id=uuid.uuid4(),
                 bot_id=bot_id,
                 updated_at=opened.now,
+                kind=MAIN_KIND,
+                created_at=opened.now,
             )
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
@@ -494,7 +548,7 @@ def list_messages(request: Request, bot_id: str) -> JSONResponse:
         bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
         if bot is None:
             return not_found()
-        chat = _load_chat(opened.connection, parsed_id)
+        chat = main_chat(opened.connection, parsed_id)
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
 
@@ -514,7 +568,7 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
         if isinstance(text, JSONResponse):
             return text
         counter = _lock_quota_counter(opened.connection, opened.account["id"])
-        chat = _load_chat(opened.connection, parsed_id)
+        chat = main_chat(opened.connection, parsed_id)
         _insert_message(
             opened.connection,
             chat["id"],
@@ -640,5 +694,69 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
             .where(chats.c.id == chat["id"])
             .values(updated_at=follow_at)
         )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+@router.get("/api/bots/{bot_id}/chats")
+def list_chats(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        rows = _bot_chats(opened.connection, parsed_id)
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse({"chats": [chat_document(row) for row in rows]})
+
+
+@router.post("/api/bots/{bot_id}/chats")
+def create_extra_chat(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        chat_id = uuid.uuid4()
+        opened.connection.execute(
+            chats.insert().values(
+                id=chat_id,
+                bot_id=parsed_id,
+                updated_at=opened.now,
+                kind=EXTRA_KIND,
+                created_at=opened.now,
+            )
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        row = _owned_chat(opened.connection, chat_id, parsed_id)
+        assert row is not None
+        return JSONResponse(chat_document(row))
+
+
+@router.get("/api/bots/{bot_id}/chats/{chat_id}/messages")
+def list_chat_messages(request: Request, bot_id: str, chat_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_chat = parse_id(chat_id)
+        if parsed_chat is None:
+            return chat_not_found()
+        chat = _owned_chat(opened.connection, parsed_chat, parsed_id)
+        if chat is None:
+            return chat_not_found()
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))

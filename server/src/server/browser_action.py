@@ -508,7 +508,10 @@ def _answer_held(
     if bot is None:
         return
     chat_id = connection.execute(
-        select(chats.c.id).where(chats.c.bot_id == bot_id)
+        select(chats.c.id).where(
+            chats.c.bot_id == bot_id,
+            chats.c.kind == "main",
+        )
     ).scalar_one_or_none()
     if chat_id is None:
         return

@@ -1030,6 +1030,36 @@ html[data-theme="dark"] .home .roster-item.is-on {
   gap: 6px;
 }
 
+.home .chat-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  margin-top: 4px;
+}
+
+.home .chat-tab {
+  min-height: 28px;
+  padding: 0 0 2px;
+  border: 0;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 13px;
+}
+
+.home .chat-tab.is-on {
+  color: var(--text);
+  border-bottom-color: var(--orange);
+  box-shadow: 0 8px 12px -10px var(--glow-orange);
+}
+
+.home .chat-tab:focus-visible {
+  outline: 2px solid var(--orange);
+  outline-offset: 2px;
+}
+
 .home .messages {
   min-height: 0;
   max-height: none;

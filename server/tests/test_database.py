@@ -184,8 +184,10 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert ("e6b1a9c34f28", "c4d8e2a71b06") in chain
     assert ("f3a8c1d27e05", "e6b1a9c34f28") in chain
     assert ("b3c7e9a41d52", "f3a8c1d27e05") in chain
-    assert chain[-1] == ("b3c7e9a41d52", "f3a8c1d27e05")
-    assert chain[-1][1] == "f3a8c1d27e05"
+    assert ("e7a1c4b82d60", "b3c7e9a41d52") in chain
+    assert chain[-1] == ("e7a1c4b82d60", "b3c7e9a41d52")
+    assert chain[-1][1] == "b3c7e9a41d52"
+    assert chain[-1][0] != "b3c7e9a41d52"
     assert chain[-1][0] != "f3a8c1d27e05"
     assert chain[-1][0] != "e6b1a9c34f28"
     assert chain[-1][0] != "c4d8e2a71b06"
@@ -244,8 +246,10 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert ("e6b1a9c34f28", "c4d8e2a71b06") in chain
         assert ("f3a8c1d27e05", "e6b1a9c34f28") in chain
         assert ("b3c7e9a41d52", "f3a8c1d27e05") in chain
-        assert chain[-1] == ("b3c7e9a41d52", "f3a8c1d27e05")
-        assert chain[-1][1] == "f3a8c1d27e05"
+        assert ("e7a1c4b82d60", "b3c7e9a41d52") in chain
+        assert chain[-1] == ("e7a1c4b82d60", "b3c7e9a41d52")
+        assert chain[-1][1] == "b3c7e9a41d52"
+        assert chain[-1][0] != "b3c7e9a41d52"
         assert chain[-1][0] != "f3a8c1d27e05"
         assert chain[-1][0] != "e6b1a9c34f28"
         assert chain[-1][0] != "c4d8e2a71b06"

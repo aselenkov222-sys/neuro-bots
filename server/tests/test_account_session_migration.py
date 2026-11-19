@@ -57,7 +57,7 @@ BOT_COLUMNS = (
     "scenario",
     "updated_at",
 )
-CHAT_COLUMNS = ("id", "bot_id", "updated_at")
+CHAT_COLUMNS = ("id", "bot_id", "updated_at", "kind", "created_at")
 MESSAGE_COLUMNS = ("id", "chat_id", "role", "text", "code", "updated_at")
 DESKTOP_COLUMNS = (
     "id",
@@ -95,6 +95,7 @@ ORDER_REVISION = "c4d8e2a71b06"
 CHECK_REVISION = "e6b1a9c34f28"
 NOTICE_REVISION = "f3a8c1d27e05"
 GATE_REVISION = "b3c7e9a41d52"
+CHAT_REVISION = "e7a1c4b82d60"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -150,6 +151,10 @@ ROUTINE_RUN_STATUS_CHECK = (
 MESSAGE_ROLE_CHECK = (
     "CHECK (((role)::text = ANY ((ARRAY['user'::character varying, "
     "'assistant'::character varying, 'error'::character varying])::text[])))"
+)
+CHAT_KIND_CHECK = (
+    "CHECK (((kind)::text = ANY ((ARRAY['main'::character varying, "
+    "'extra'::character varying])::text[])))"
 )
 
 
@@ -232,8 +237,10 @@ def _revision_chain() -> list[str]:
     assert links[CHECK_REVISION] == ORDER_REVISION
     assert links[NOTICE_REVISION] == CHECK_REVISION
     assert links[GATE_REVISION] == NOTICE_REVISION
-    assert links[chain[-1]] == NOTICE_REVISION
-    assert chain[-1] == GATE_REVISION
+    assert links[CHAT_REVISION] == GATE_REVISION
+    assert links[chain[-1]] == GATE_REVISION
+    assert chain[-1] == CHAT_REVISION
+    assert chain[-1] != GATE_REVISION
     assert chain[-1] != NOTICE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
     assert chain[-1] != EMAIL_CONFIRMED_REVISION
@@ -433,11 +440,17 @@ def _insert_accepted_message_roles(connection: Connection) -> None:
     connection.execute(
         text(
             """
-            INSERT INTO chats (id, bot_id, updated_at)
-            VALUES (:id, :bot_id, :updated_at)
+            INSERT INTO chats (id, bot_id, updated_at, kind, created_at)
+            VALUES (:id, :bot_id, :updated_at, :kind, :created_at)
             """
         ),
-        {"id": chat_id, "bot_id": bot_id, "updated_at": moment},
+        {
+            "id": chat_id,
+            "bot_id": bot_id,
+            "updated_at": moment,
+            "kind": "main",
+            "created_at": moment,
+        },
     )
     for role in ("user", "assistant", "error"):
         connection.execute(
@@ -695,6 +708,24 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=False,
         timezone=True,
     )
+    _assert_model_column(chats.c.kind, String, nullable=False, length=16)
+    _assert_model_column(
+        chats.c.created_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in chats.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == [("chats_kind_check", "kind IN ('main', 'extra')")]
+    assert [index.name for index in chats.indexes] == ["chats_one_main"]
+    main_index = next(iter(chats.indexes))
+    assert isinstance(main_index, Index)
+    assert main_index.unique is True
+    assert [column.name for column in main_index.columns] == ["bot_id"]
+    assert str(main_index.dialect_options["postgresql"]["where"]) == "kind = 'main'"
 
     assert [column.name for column in messages.primary_key] == ["id"]
     _assert_model_column(messages.c.id, Uuid, nullable=False)
@@ -723,7 +754,6 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         quota_counters,
         quota_charges,
         bots,
-        chats,
         desktops,
         routines,
     ):
@@ -972,11 +1002,11 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=True,
         timezone=True,
     )
-    assert [
+    assert {
         (constraint.name, str(constraint.sqltext))
         for constraint in dangerous_steps.constraints
         if isinstance(constraint, CheckConstraint)
-    ] == [
+    } == {
         (
             "dangerous_steps_parent_check",
             "(run_id IS NOT NULL AND check_id IS NULL) OR "
@@ -986,7 +1016,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
             "dangerous_steps_answer_check",
             "answer IS NULL OR answer IN ('yes', 'no')",
         ),
-    ]
+    }
 
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
@@ -1274,13 +1304,38 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "timestamp with time zone",
                     not_null=True,
                 )
+                _assert_catalog_column(
+                    chat_columns,
+                    "kind",
+                    "varchar",
+                    "character varying(16)",
+                    not_null=True,
+                )
+                _assert_catalog_column(
+                    chat_columns,
+                    "created_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
                 assert _constraints(connection, "chats") == {
                     ("p", "PRIMARY KEY (id)"),
                     (
                         "f",
                         "FOREIGN KEY (bot_id) REFERENCES bots(id)",
                     ),
+                    ("c", CHAT_KIND_CHECK),
                 }
+                main_indexes = [
+                    row
+                    for row in _indexes(connection, "chats")
+                    if row["index_name"] == "chats_one_main"
+                ]
+                assert len(main_indexes) == 1
+                main_row = main_indexes[0]
+                assert main_row["is_unique"] is True
+                assert main_row["predicate"] == "((kind)::text = 'main'::text)"
+                assert list(main_row["columns"]) == ["bot_id"]
 
                 message_columns = _columns(connection, "messages")
                 assert tuple(message_columns) == MESSAGE_COLUMNS
