@@ -34,10 +34,14 @@ from server.library import attach_files, store_library_file
 from server.models import (
     bots,
     chats,
+    dangerous_steps,
+    desktop_notices,
     library_files,
     messages,
     quota_charges,
     quota_counters,
+    routine_checks,
+    routines,
     subscription_periods,
 )
 from server.scenario_chat import PROPOSAL_CODE, confirm_proposal, proposed_scenario
@@ -251,6 +255,23 @@ def parse_patch(body: dict[str, object]) -> dict[str, str] | JSONResponse:
             return icon_error
         changes["icon"] = body["icon"]
     return changes
+
+
+def _remove_bot(connection: Connection, bot_id: uuid.UUID) -> None:
+    chat_ids = select(chats.c.id).where(chats.c.bot_id == bot_id)
+    connection.execute(
+        dangerous_steps.delete().where(dangerous_steps.c.bot_id == bot_id)
+    )
+    connection.execute(
+        desktop_notices.delete().where(desktop_notices.c.bot_id == bot_id)
+    )
+    connection.execute(
+        routine_checks.delete().where(routine_checks.c.bot_id == bot_id)
+    )
+    connection.execute(routines.delete().where(routines.c.bot_id == bot_id))
+    connection.execute(messages.delete().where(messages.c.chat_id.in_(chat_ids)))
+    connection.execute(chats.delete().where(chats.c.bot_id == bot_id))
+    connection.execute(bots.delete().where(bots.c.id == bot_id))
 
 
 def _load_bot(
@@ -565,6 +586,22 @@ async def update_bot(request: Request, bot_id: str) -> JSONResponse:
         row = _load_bot(opened.connection, parsed_id, opened.account["id"])
         assert row is not None
         return JSONResponse(bot_document(row))
+
+
+@router.delete("/api/bots/{bot_id}")
+def delete_bot(request: Request, bot_id: str) -> Response:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        _remove_bot(opened.connection, parsed_id)
+        return Response(status_code=204)
 
 
 @router.get("/api/bots/{bot_id}/messages")

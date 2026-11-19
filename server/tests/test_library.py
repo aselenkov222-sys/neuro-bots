@@ -17,9 +17,11 @@ from server.app import app
 from server.db import create_db_engine
 from server.models import (
     accounts,
+    bots,
     chats,
     library_files,
     messages,
+    routines,
     sessions,
     quota_charges,
     quota_counters,
@@ -48,6 +50,7 @@ INVALID_ORIGIN = {
 }
 UNAUTHENTICATED = {"code": "unauthenticated", "message": "Нужна сессия."}
 UNCONFIRMED = {"code": "email_unconfirmed", "message": "Почта ещё не подтверждена."}
+MAIN_KEPT = {"code": "main_chat", "message": "Основной чат удалить нельзя."}
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -906,3 +909,240 @@ def test_chat_screen_offers_open_and_delete() -> None:
     assert "grid-template-columns: minmax(0, 1fr) 228px;" in styles
     assert ".home .library" in styles
     assert ".home .file" in styles
+
+
+def test_deleting_an_extra_chat_keeps_its_xlsx(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-extra-keep@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> str | CompleteResult:
+        if messages[-1]["text"] == "таблица в дополнительном":
+            return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+        return "ответ основного"
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        main = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "в основном"},
+            headers={"Origin": ORIGIN},
+        )
+        created = client.post(
+            f"/api/bots/{bot['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        extra_id = created.json()["id"]
+        posted = client.post(
+            f"/api/bots/{bot['id']}/chats/{extra_id}/messages",
+            json={"text": "таблица в дополнительном"},
+            headers={"Origin": ORIGIN},
+        )
+        before = client.get(f"/api/bots/{bot['id']}/messages")
+        removed = client.delete(
+            f"/api/bots/{bot['id']}/chats/{extra_id}",
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/library")
+        file_id = listed.json()["files"][0]["id"]
+        opened = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        gone = client.get(f"/api/bots/{bot['id']}/chats/{extra_id}/messages")
+        again = client.get(f"/api/bots/{bot['id']}/messages")
+    assert main.status_code == 200
+    assert posted.status_code == 200
+    assert posted.json()["messages"][1]["file"]["name"] == XLSX_NAME
+    assert removed.status_code == 204
+    assert removed.content == b""
+    assert before.json()["messages"][0]["text"] == "в основном"
+    assert before.json()["messages"][1]["text"] == "ответ основного"
+    assert again.json() == before.json()
+    assert gone.status_code == 404
+    assert listed.status_code == 200
+    assert [item["name"] for item in listed.json()["files"]] == [XLSX_NAME]
+    assert opened.status_code == 200
+    assert opened.content == XLSX_BYTES
+    stored = _library(bot["id"])
+    assert len(stored) == 1
+    assert stored[0]["name"] == XLSX_NAME
+    assert bytes(stored[0]["content"]) == XLSX_BYTES
+    assert stored[0]["chat_id"] is None
+    assert stored[0]["message_id"] is None
+    extra_messages = [
+        row for row in _rows(messages) if row["chat_id"] == uuid.UUID(extra_id)
+    ]
+    assert extra_messages == []
+    assert [row for row in _rows(chats) if row["id"] == uuid.UUID(extra_id)] == []
+
+
+def test_refusing_to_delete_the_main_chat_keeps_the_xlsx(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-main-kept@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        chats_body = client.get(f"/api/bots/{bot['id']}/chats")
+        main_id = chats_body.json()["chats"][0]["id"]
+        refused = client.delete(
+            f"/api/bots/{bot['id']}/chats/{main_id}",
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/library")
+        file_id = posted.json()["messages"][1]["file"]["id"]
+        opened = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        transcript = client.get(f"/api/bots/{bot['id']}/messages")
+    assert refused.status_code == 400
+    assert refused.json() == MAIN_KEPT
+    assert listed.status_code == 200
+    assert listed.json()["files"][0]["id"] == file_id
+    assert opened.content == XLSX_BYTES
+    assert [row["text"] for row in transcript.json()["messages"]] == [
+        "собери таблицу",
+        REPLY,
+    ]
+    stored = _library(bot["id"])
+    assert len(stored) == 1
+    assert bytes(stored[0]["content"]) == XLSX_BYTES
+    assert stored[0]["chat_id"] == uuid.UUID(main_id)
+
+
+def test_deleting_the_bot_removes_its_library_and_leaves_the_other(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, account_id = _open_ready("library-bot-delete@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        if messages[-1]["text"] == "вторая таблица":
+            return CompleteResult("Второй лист.", (SECOND_NAME, SECOND_BYTES))
+        return CompleteResult(REPLY, (XLSX_NAME, b"PK\x03\x04\x00deleted-bot-xlsx"))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        first = _bot(client)
+        posted = client.post(
+            f"/api/bots/{first['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        routine = client.post(
+            f"/api/bots/{first['id']}/routines",
+            json={"weekdays": [1], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        second = client.post(
+            "/api/bots",
+            json={"name": "Второй", "description": "описание", "scenario": "сценарий"},
+            headers={"Origin": ORIGIN},
+        )
+        other = client.post(
+            f"/api/bots/{second.json()['id']}/messages",
+            json={"text": "вторая таблица"},
+            headers={"Origin": ORIGIN},
+        )
+        before = client.get("/api/me")
+        removed = client.delete(
+            f"/api/bots/{first['id']}",
+            headers={"Origin": ORIGIN},
+        )
+        gone = client.get(f"/api/bots/{first['id']}")
+        kept = client.get(
+            f"/api/bots/{second.json()['id']}/library/{other.json()['messages'][1]['file']['id']}"
+        )
+        after = client.get("/api/me")
+    assert posted.status_code == 200
+    assert routine.status_code == 200
+    assert second.status_code == 200
+    assert other.status_code == 200
+    assert removed.status_code == 204
+    assert removed.content == b""
+    assert gone.status_code == 404
+    assert gone.json() == NOT_FOUND
+    assert kept.status_code == 200
+    assert kept.content == SECOND_BYTES
+    first_id = uuid.UUID(first["id"])
+    second_id = uuid.UUID(second.json()["id"])
+    assert [row for row in _rows(bots) if row["id"] == first_id] == []
+    assert [row for row in _rows(routines) if row["bot_id"] == first_id] == []
+    assert [row for row in _rows(chats) if row["bot_id"] == first_id] == []
+    remaining = _rows(library_files)
+    assert [row for row in remaining if row["bot_id"] == first_id] == []
+    assert b"PK\x03\x04\x00deleted-bot-xlsx" not in {
+        bytes(row["content"]) for row in remaining
+    }
+    kept_rows = [row for row in remaining if row["bot_id"] == second_id]
+    assert len(kept_rows) == 1
+    assert kept_rows[0]["name"] == SECOND_NAME
+    assert bytes(kept_rows[0]["content"]) == SECOND_BYTES
+    assert before.json()["quota"] == after.json()["quota"] == 498
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 2
+    assert len(charges) == 2
+
+
+def test_another_account_and_a_missing_origin_cannot_delete_the_bot(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-bot-owner@example.com")
+    stranger, _other = _open_ready("library-bot-stranger@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        missing = client.delete(f"/api/bots/{bot['id']}")
+    with _client(stranger) as client:
+        foreign = client.delete(
+            f"/api/bots/{bot['id']}",
+            headers={"Origin": ORIGIN},
+        )
+    assert posted.status_code == 200
+    assert missing.status_code == 403
+    assert missing.json() == INVALID_ORIGIN
+    assert foreign.status_code == 404
+    assert foreign.json() == NOT_FOUND
+    bot_id = uuid.UUID(bot["id"])
+    assert [row for row in _rows(bots) if row["id"] == bot_id] != []
+    stored = _library(bot["id"])
+    assert len(stored) == 1
+    assert bytes(stored[0]["content"]) == XLSX_BYTES
