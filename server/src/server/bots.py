@@ -37,6 +37,7 @@ from server.models import (
     quota_counters,
     subscription_periods,
 )
+from server.scenario_chat import PROPOSAL_CODE, confirm_proposal, proposed_scenario
 
 router = APIRouter()
 
@@ -72,6 +73,8 @@ QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 COMPUTER_UNAVAILABLE_TEXT = "компьютер недоступен"
 CHAT_NOT_FOUND = "Чат не найден."
 MAIN_CHAT_KEPT = "Основной чат удалить нельзя."
+PROPOSAL_NOT_FOUND = "Сообщение не найдено."
+INVALID_CONFIRM = "Нужно подтверждение."
 MAIN_KIND = "main"
 EXTRA_KIND = "extra"
 
@@ -93,6 +96,14 @@ def not_found() -> JSONResponse:
 
 def chat_not_found() -> JSONResponse:
     return error_response(404, "not_found", CHAT_NOT_FOUND)
+
+
+def proposal_not_found() -> JSONResponse:
+    return error_response(404, "not_found", PROPOSAL_NOT_FOUND)
+
+
+def invalid_confirm() -> JSONResponse:
+    return error_response(400, "invalid_request", INVALID_CONFIRM)
 
 
 def main_chat_kept() -> JSONResponse:
@@ -571,6 +582,21 @@ def _deliver_message(
         opened.now,
     )
     follow_at = opened.now + timedelta(microseconds=1)
+    proposed = proposed_scenario(text)
+    if proposed is not None:
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "assistant",
+            proposed,
+            PROPOSAL_CODE,
+            follow_at,
+        )
+        opened.connection.execute(
+            chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat["id"]))
     desktop = find_working_desktop(opened.connection, opened.account["id"])
     desktop_available = (
         desktop is not None and desktop["last_pulse_at"] is not None
@@ -731,6 +757,52 @@ async def create_chat_message(
         if isinstance(text, JSONResponse):
             return text
         return _deliver_message(opened, bot, chat, text)
+
+
+async def read_confirm(request: Request) -> bool | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return invalid_confirm()
+    if (
+        not isinstance(body, dict)
+        or "password" in body
+        or "cookie" in body
+        or body.get("confirm") is not True
+    ):
+        return invalid_confirm()
+    return True
+
+
+@router.post("/api/bots/{bot_id}/messages/{message_id}/scenario")
+async def confirm_scenario(
+    request: Request, bot_id: str, message_id: str
+) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_message = parse_id(message_id)
+        if parsed_message is None:
+            return proposal_not_found()
+        confirmed = await read_confirm(request)
+        if isinstance(confirmed, JSONResponse):
+            return confirmed
+        outcome, chat_id = confirm_proposal(
+            opened.connection,
+            parsed_id,
+            parsed_message,
+            opened.now,
+        )
+        if outcome == "missing" or chat_id is None:
+            return proposal_not_found()
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat_id))
 
 
 @router.delete("/api/bots/{bot_id}/chats/{chat_id}")
