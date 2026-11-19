@@ -911,7 +911,7 @@ html[data-theme="dark"] .home {
 
 .home .inbox {
   display: grid;
-  grid-template-columns: 236px minmax(0, 1fr) 228px;
+  grid-template-columns: minmax(0, 1fr) 228px;
   height: min(620px, calc(100vh - 140px));
   min-height: 440px;
   border-radius: 10px;
@@ -1131,6 +1131,32 @@ html[data-theme="dark"] .home .bubble.gate {
 }
 
 .home .side .btn-quiet { width: 100%; }
+
+.home .library {
+  display: grid;
+  gap: 6px;
+}
+
+.home .file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--green-line) 45%, transparent);
+  background: transparent;
+  color: var(--green-ink);
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: 0 0 10px var(--glow-green);
+}
+
+.home .library .btn-quiet,
+.home .file .btn-quiet {
+  width: auto;
+}
 
 .home .btn-orange,
 .home .btn-green,

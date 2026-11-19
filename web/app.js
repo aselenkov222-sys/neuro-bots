@@ -53,7 +53,8 @@ const state = {
   routineHold: null,
   messages: [],
   chats: [],
-  activeChatId: null
+  activeChatId: null,
+  library: []
 };
 
 function esc(value) {
@@ -524,7 +525,26 @@ function messageHtml(message, bot) {
     ? `<span class="avatar sm" style="--av:${bot.color}">${icon(bot.icon)}</span>`
     : "";
   const link = accessLink(accessSite(message), bot);
-  return `<article class="bubble bot">${avatar}<div><p>${text}</p>${link}<p class="meta">${when}</p></div></article>`;
+  return `<article class="bubble bot">${avatar}<div><p>${text}</p>${fileChip(message && message.file, false)}${link}<p class="meta">${when}</p></div></article>`;
+}
+
+function fileChip(file, remove) {
+  if (!file || typeof file.id !== "string" || typeof file.name !== "string" || !file.id || !file.name) {
+    return "";
+  }
+  const open = `<button type="button" class="btn-quiet" data-action="open-file" data-id="${esc(file.id)}" data-name="${esc(file.name)}">Открыть</button>`;
+  const drop = remove
+    ? `<button type="button" class="btn-quiet" data-action="delete-file" data-id="${esc(file.id)}">Удалить</button>`
+    : "";
+  return `<div class="file">${icon("table")} <span>${esc(file.name)}</span>${open}${drop}</div>`;
+}
+
+function libraryHtml() {
+  const files = Array.isArray(state.library) ? state.library : [];
+  const body = files.length
+    ? files.map((file) => fileChip(file, true)).join("")
+    : '<p class="empty">Файлов пока нет.</p>';
+  return `<div class="library"><h2>Библиотека</h2>${body}</div>`;
 }
 
 function activeChat() {
@@ -560,26 +580,29 @@ function chatScreen() {
   return `
     ${topbar("Чаты", "", logoutControl())}
     ${noticeHtml()}
-    <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
-      <div class="thread-head">
-        <div class="thread-titles">
-          <h2 class="thread-title">${esc(bot.name)}</h2>
-          <div class="chat-tabs" role="tablist" aria-label="Чаты этого бота">${tabs}</div>
-          ${meta ? `<p class="meta">${meta}</p>` : ""}
+    <div class="inbox">
+      <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
+        <div class="thread-head">
+          <div class="thread-titles">
+            <h2 class="thread-title">${esc(bot.name)}</h2>
+            <div class="chat-tabs" role="tablist" aria-label="Чаты этого бота">${tabs}</div>
+            ${meta ? `<p class="meta">${meta}</p>` : ""}
+          </div>
+          <div class="thread-tools">
+            <button type="button" class="btn-quiet" data-action="add-chat">Новый чат</button>
+            ${extra ? '<button type="button" class="btn-quiet" data-action="delete-chat">Удалить чат</button>' : ""}
+            <a class="btn-quiet" href="#bot">Карточка</a>
+          </div>
         </div>
-        <div class="thread-tools">
-          <button type="button" class="btn-quiet" data-action="add-chat">Новый чат</button>
-          ${extra ? '<button type="button" class="btn-quiet" data-action="delete-chat">Удалить чат</button>' : ""}
-          <a class="btn-quiet" href="#bot">Карточка</a>
-        </div>
-      </div>
-      <div class="messages">${thread}</div>
-      <form class="composer" data-form="send">
-        <label class="sr-only" for="composer">Сообщение</label>
-        <input id="composer" type="text" placeholder="Написать в этот чат" autocomplete="off">
-        <button class="btn-orange icon-btn" type="submit" aria-label="Отправить">${icon("send")}</button>
-      </form>
-    </section>`;
+        <div class="messages">${thread}</div>
+        <form class="composer" data-form="send">
+          <label class="sr-only" for="composer">Сообщение</label>
+          <input id="composer" type="text" placeholder="Написать в этот чат" autocomplete="off">
+          <button class="btn-orange icon-btn" type="submit" aria-label="Отправить">${icon("send")}</button>
+        </form>
+      </section>
+      <aside class="zone side">${libraryHtml()}</aside>
+    </div>`;
 }
 
 function render() {
@@ -784,7 +807,62 @@ async function showCurrent() {
   }
   if (desired === "bots") await loadBots();
   if (desired === "bot") await loadCard();
-  if (desired === "chat") await loadMessages();
+  if (desired === "chat") {
+    await loadMessages();
+    await loadLibrary();
+  }
+  render();
+}
+
+async function loadLibrary() {
+  if (!state.activeId) {
+    state.library = [];
+    return;
+  }
+  const result = await api(`/api/bots/${state.activeId}/library`);
+  if (!result.ok || !result.data || !Array.isArray(result.data.files)) {
+    state.library = [];
+    note(result);
+    return;
+  }
+  state.library = result.data.files;
+}
+
+async function openLibraryFile(fileId, name) {
+  if (!state.activeId || typeof fileId !== "string" || !fileId) return;
+  const response = await fetch(`/api/bots/${state.activeId}/library/${fileId}`, {
+    credentials: "same-origin"
+  });
+  if (!response.ok) {
+    const type = response.headers.get("content-type") || "";
+    const data = type.includes("application/json") ? await response.json() : null;
+    note({ ok: false, data });
+    render();
+    return;
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = typeof name === "string" && name ? name : "file.xlsx";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function deleteLibraryFile(fileId) {
+  if (!state.activeId || typeof fileId !== "string" || !fileId) return;
+  const result = await api(`/api/bots/${state.activeId}/library/${fileId}`, {
+    method: "DELETE"
+  });
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
+  await loadLibrary();
+  await loadMessages();
   render();
 }
 
@@ -913,6 +991,7 @@ async function submitMessage() {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   state.messages = listed.data.messages;
+  await loadLibrary();
   render();
   const next = document.getElementById("composer");
   if (next) next.focus();
@@ -1029,6 +1108,7 @@ app.addEventListener("click", (event) => {
     state.chats = [];
     state.activeChatId = null;
     state.messages = [];
+    state.library = [];
     location.hash = "#bot";
     return;
   }
@@ -1038,6 +1118,14 @@ app.addEventListener("click", (event) => {
   }
   if (action === "delete-chat") {
     deleteChat();
+    return;
+  }
+  if (action === "open-file") {
+    openLibraryFile(target.dataset.id, target.dataset.name);
+    return;
+  }
+  if (action === "delete-file") {
+    deleteLibraryFile(target.dataset.id);
     return;
   }
   if (action === "open-chat") {

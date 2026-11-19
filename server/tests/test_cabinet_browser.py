@@ -766,6 +766,10 @@ def test_browser_opens_an_empty_extra_chat(database: None) -> None:
             page.fill("#composer", "история основного")
             page.click("button[aria-label='Отправить']")
             page.wait_for_selector(f"text={STUB}")
+            assert page.locator(".library h2").inner_text() == "Библиотека"
+            assert page.locator(".library .empty").inner_text() == "Файлов пока нет."
+            assert page.locator(".roster").count() == 0
+            assert page.locator("input[type='file']").count() == 0
             assert page.locator("text=Основной чат. Его нельзя удалить.").count() == 1
             page.click("text=Новый чат")
             page.wait_for_selector("text=Чат пустой. История из основного сюда не копируется.")

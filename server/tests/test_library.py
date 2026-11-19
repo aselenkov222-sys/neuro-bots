@@ -3,6 +3,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,6 +33,18 @@ XLSX_NAME = "письма.xlsx"
 XLSX_BYTES = b"PK\x03\x04\x00library-xlsx-marker"
 REPLY = "Таблица готова."
 MESSAGE_FIELDS = ("id", "role", "text", "code", "updated_at")
+FILE_FIELDS = ("id", "name", "created_at")
+SHEET = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+SECOND_NAME = "отчёт.xlsx"
+SECOND_BYTES = b"PK\x03\x04\x00second-sheet"
+NOT_FOUND = {"code": "not_found", "message": "Бот не найден."}
+FILE_MISSING = {"code": "not_found", "message": "Файл не найден."}
+INVALID_ORIGIN = {
+    "code": "invalid_origin",
+    "message": "Запрос пришёл не с нашего сервера.",
+}
+UNAUTHENTICATED = {"code": "unauthenticated", "message": "Нужна сессия."}
+UNCONFIRMED = {"code": "email_unconfirmed", "message": "Почта ещё не подтверждена."}
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -472,3 +485,300 @@ def test_translation_comes_back_as_text_without_a_file(
     assert tuple(assistant) == MESSAGE_FIELDS
     assert listed.json() == posted.json()
     assert _library(bot["id"]) == []
+
+
+def _disposition_name(header: str) -> str:
+    prefix = "attachment; filename*=UTF-8''"
+    assert header.startswith(prefix)
+    return unquote(header.removeprefix(prefix))
+
+
+def _open_unconfirmed(email: str) -> str:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            account_id = create_account(connection, email, ACCEPTED)
+            session_id = create_session(connection, account_id)
+    finally:
+        engine.dispose()
+    return str(session_id)
+
+
+def test_user_opens_the_stored_xlsx(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-open@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        if messages[-1]["text"] == "ещё таблица":
+            return CompleteResult("Второй лист.", (SECOND_NAME, SECOND_BYTES))
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        created = client.post(
+            f"/api/bots/{bot['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        extra = client.post(
+            f"/api/bots/{bot['id']}/chats/{created.json()['id']}/messages",
+            json={"text": "ещё таблица"},
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/library")
+        first = client.get(
+            f"/api/bots/{bot['id']}/library/{listed.json()['files'][0]['id']}"
+        )
+        second = client.get(
+            f"/api/bots/{bot['id']}/library/{listed.json()['files'][1]['id']}"
+        )
+    assert posted.status_code == 200
+    assert extra.status_code == 200
+    assert listed.status_code == 200
+    files = listed.json()["files"]
+    assert [tuple(item) for item in files] == [FILE_FIELDS, FILE_FIELDS]
+    assert [item["name"] for item in files] == [XLSX_NAME, SECOND_NAME]
+    assert XLSX_BYTES not in listed.content
+    assert SECOND_BYTES not in listed.content
+    assert files[0]["created_at"] <= files[1]["created_at"]
+    assert first.status_code == 200
+    assert first.headers["content-type"] == SHEET
+    assert _disposition_name(first.headers["content-disposition"]) == XLSX_NAME
+    assert first.content == XLSX_BYTES
+    assert second.status_code == 200
+    assert second.headers["content-type"] == SHEET
+    assert _disposition_name(second.headers["content-disposition"]) == SECOND_NAME
+    assert second.content == SECOND_BYTES
+    stored = _library(bot["id"])
+    assert {row["name"] for row in stored} == {XLSX_NAME, SECOND_NAME}
+    assert {bytes(row["content"]) for row in stored} == {XLSX_BYTES, SECOND_BYTES}
+
+
+def test_user_deletes_the_file_and_the_chat_text_stays(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, account_id = _open_ready("library-delete@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        file_id = posted.json()["messages"][1]["file"]["id"]
+        before = client.get("/api/me")
+        removed = client.delete(
+            f"/api/bots/{bot['id']}/library/{file_id}",
+            headers={"Origin": ORIGIN},
+        )
+        messages = client.get(f"/api/bots/{bot['id']}/messages")
+        library = client.get(f"/api/bots/{bot['id']}/library")
+        missing = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        after = client.get("/api/me")
+    assert removed.status_code == 204
+    assert removed.content == b""
+    user, assistant = messages.json()["messages"]
+    assert user["text"] == "собери таблицу"
+    assert assistant["text"] == REPLY
+    assert "file" not in user
+    assert "file" not in assistant
+    assert tuple(assistant) == MESSAGE_FIELDS
+    assert library.json() == {"files": []}
+    assert missing.status_code == 404
+    assert missing.json() == FILE_MISSING
+    assert _library(bot["id"]) == []
+    assert before.json()["quota"] == after.json()["quota"] == 499
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 1
+    assert len(charges) == 1
+
+
+def test_upload_does_not_create_a_library_file(database: None) -> None:
+    cookie, _account_id = _open_ready("library-upload@example.com")
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/library",
+            json={"name": "свой.xlsx", "content": "свои байты"},
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/library")
+    assert posted.status_code == 405
+    assert listed.json() == {"files": []}
+    assert _library(bot["id"]) == []
+
+
+def test_a_later_reply_does_not_delete_the_file(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-keep@example.com")
+    calls: list[str] = []
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> str | CompleteResult:
+        calls.append(messages[-1]["text"])
+        if messages[-1]["text"] == "собери таблицу":
+            return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+        if messages[-1]["text"] == "разбери текст":
+            return "Только разбор."
+        return CompleteResult("Второй лист.", (SECOND_NAME, SECOND_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        first = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        file_id = first.json()["messages"][1]["file"]["id"]
+        follow = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "разбери текст"},
+            headers={"Origin": ORIGIN},
+        )
+        kept = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        again = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "ещё таблица"},
+            headers={"Origin": ORIGIN},
+        )
+        listed = client.get(f"/api/bots/{bot['id']}/library")
+        still = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+    assert follow.json()["messages"][1]["file"]["id"] == file_id
+    assert follow.json()["messages"][3]["text"] == "Только разбор."
+    assert "file" not in follow.json()["messages"][3]
+    assert kept.content == XLSX_BYTES
+    assert [item["name"] for item in listed.json()["files"]] == [
+        XLSX_NAME,
+        SECOND_NAME,
+    ]
+    assert still.content == XLSX_BYTES
+    assert again.json()["messages"][-1]["file"]["name"] == SECOND_NAME
+    assert calls == ["собери таблицу", "разбери текст", "ещё таблица"]
+
+
+def test_another_account_cannot_open_or_delete_the_file(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-owner@example.com")
+    other, _other_id = _open_ready("library-stranger@example.com")
+    plain = _open_unconfirmed("library-plain@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        file_id = posted.json()["messages"][1]["file"]["id"]
+    with _client(other) as client:
+        listed = client.get(f"/api/bots/{bot['id']}/library")
+        opened = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        removed = client.delete(
+            f"/api/bots/{bot['id']}/library/{file_id}",
+            headers={"Origin": ORIGIN},
+        )
+    with _client(plain) as client:
+        unconfirmed = client.get(f"/api/bots/{bot['id']}/library")
+    with TestClient(app) as anonymous:
+        missing = anonymous.get(f"/api/bots/{bot['id']}/library")
+    assert listed.status_code == 404
+    assert listed.json() == NOT_FOUND
+    assert opened.status_code == 404
+    assert opened.json() == NOT_FOUND
+    assert removed.status_code == 404
+    assert removed.json() == NOT_FOUND
+    assert unconfirmed.status_code == 403
+    assert unconfirmed.json() == UNCONFIRMED
+    assert missing.status_code == 401
+    assert missing.json() == UNAUTHENTICATED
+    stored = _library(bot["id"])
+    assert len(stored) == 1
+    assert bytes(stored[0]["content"]) == XLSX_BYTES
+
+
+def test_delete_without_origin_keeps_the_file(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_ready("library-origin@example.com")
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+        file_id = posted.json()["messages"][1]["file"]["id"]
+        refused = client.delete(f"/api/bots/{bot['id']}/library/{file_id}")
+        opened = client.get(f"/api/bots/{bot['id']}/library/{file_id}")
+    assert refused.status_code == 403
+    assert refused.json() == INVALID_ORIGIN
+    assert opened.content == XLSX_BYTES
+    assert len(_library(bot["id"])) == 1
+
+
+def test_chat_screen_offers_open_and_delete() -> None:
+    script = (PROJECT_ROOT.parent / "web" / "app.js").read_text()
+    styles = (PROJECT_ROOT.parent / "web" / "styles.css").read_text()
+    screen = script.split("function fileChip(", 1)[1].split("function render(", 1)[0]
+    assert "<h2>Библиотека</h2>" in screen
+    assert ">Открыть</button>" in screen
+    assert ">Удалить</button>" in screen
+    assert "Файлов пока нет." in screen
+    assert 'class="inbox"' in screen
+    assert "roster" not in screen
+    assert 'type="file"' not in script
+    assert "grid-template-columns: minmax(0, 1fr) 228px;" in styles
+    assert ".home .library" in styles
+    assert ".home .file" in styles

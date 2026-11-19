@@ -7,12 +7,9 @@ from server.app import app
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 REMOVED = (
-    "библиотек",
-    "Библиотек",
     "Главный",
     "Рабочий десктоп",
     "Оплатить",
-    "xlsx",
     'data-action="pay"',
     "pick-tariff",
     "main-toggle",
@@ -110,3 +107,10 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
             assert piece not in tariff
             assert piece not in bots
             assert piece not in chat
+        for surface in (tariff, register, login, bots, card):
+            assert "Библиотек" not in surface
+            assert "xlsx" not in surface
+        library = _screen(script, "libraryHtml", "function activeChat(")
+        assert "<h2>Библиотека</h2>" in library
+        assert "Файлов пока нет." in library
+        assert "libraryHtml()" in chat
