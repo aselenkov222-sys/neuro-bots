@@ -1,3 +1,5 @@
+import logging
+import os
 import subprocess
 import sys
 import uuid
@@ -18,6 +20,7 @@ from server.models import (
     chats,
     library_files,
     messages,
+    sessions,
     quota_charges,
     quota_counters,
     subscription_periods,
@@ -766,6 +769,127 @@ def test_delete_without_origin_keeps_the_file(
     assert refused.json() == INVALID_ORIGIN
     assert opened.content == XLSX_BYTES
     assert len(_library(bot["id"])) == 1
+
+
+def _session_cookie(response) -> str:
+    pair = response.headers["set-cookie"].split(";", 1)[0]
+    name, value = pair.split("=", 1)
+    assert name == "session"
+    uuid.UUID(value)
+    return value
+
+
+def _vault_catalog_path() -> Path:
+    configured = os.environ.get("NEURO_BOTS_STATE_DIR")
+    if configured:
+        base = Path(configured)
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "neuro-bots"
+    else:
+        base = Path.home() / ".local" / "share" / "neuro-bots"
+    return base / "vault.json"
+
+
+def _vault_catalog_bytes() -> bytes | None:
+    path = _vault_catalog_path()
+    if not path.is_file():
+        return None
+    return path.read_bytes()
+
+
+def test_another_login_downloads_the_same_xlsx_and_the_vault_stays_clear(
+    database: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    email = "library-second@example.com"
+    cookie, account_id = _open_ready(email)
+
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+    ) -> CompleteResult:
+        return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
+
+    monkeypatch.setattr("server.aggregator.complete", complete)
+    with _client(cookie) as client:
+        bot = _bot(client)
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "собери таблицу"},
+            headers={"Origin": ORIGIN},
+        )
+    assert posted.status_code == 200
+    file_id = posted.json()["messages"][1]["file"]["id"]
+    with TestClient(app) as fresh:
+        logged = fresh.post(
+            "/api/login",
+            json={"email": email, "password": ACCEPTED},
+            headers={"Origin": ORIGIN},
+        )
+    assert logged.status_code == 200
+    second = _session_cookie(logged)
+    assert second != cookie
+    owned = [
+        row for row in _rows(sessions) if row["account_id"] == account_id
+    ]
+    assert {str(row["id"]) for row in owned} == {cookie, second}
+    catalog_before = _vault_catalog_bytes()
+    with caplog.at_level(logging.DEBUG):
+        with _client(second) as other:
+            listed = other.get(f"/api/bots/{bot['id']}/library")
+            opened = other.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        with _client(cookie) as first:
+            signed_out = first.post("/api/logout", headers={"Origin": ORIGIN})
+        with _client(second) as other:
+            again = other.get(f"/api/bots/{bot['id']}/library/{file_id}")
+        with _client(cookie) as first:
+            closed = first.get(f"/api/bots/{bot['id']}/library/{file_id}")
+    assert listed.status_code == 200
+    assert [item["name"] for item in listed.json()["files"]] == [XLSX_NAME]
+    assert listed.json()["files"][0]["id"] == file_id
+    assert XLSX_BYTES not in listed.content
+    assert opened.status_code == 200
+    assert opened.content == XLSX_BYTES
+    assert opened.headers["content-type"].startswith(SHEET)
+    assert "set-cookie" not in opened.headers
+    assert signed_out.status_code == 200
+    assert again.status_code == 200
+    assert again.content == XLSX_BYTES
+    assert closed.status_code == 401
+    assert closed.json() == UNAUTHENTICATED
+    stored = _library(bot["id"])
+    assert len(stored) == 1
+    assert stored[0]["name"] == XLSX_NAME
+    assert bytes(stored[0]["content"]) == XLSX_BYTES
+    saved = sorted(
+        (
+            row
+            for row in _rows(messages)
+            if row["chat_id"] == stored[0]["chat_id"]
+        ),
+        key=lambda row: (row["updated_at"], row["role"] != "user"),
+    )
+    assert [row["text"] for row in saved] == ["собери таблицу", REPLY]
+    assert all(XLSX_BYTES not in row["text"].encode() for row in saved)
+    remaining = [
+        row for row in _rows(sessions) if row["account_id"] == account_id
+    ]
+    assert [str(row["id"]) for row in remaining] == [second]
+    catalog_after = _vault_catalog_bytes()
+    assert catalog_after == catalog_before
+    catalog = catalog_after or b""
+    assert XLSX_NAME.encode() not in catalog
+    assert XLSX_BYTES not in catalog
+    assert XLSX_NAME not in second
+    assert XLSX_BYTES not in second.encode()
+    journal = caplog.text.encode()
+    assert XLSX_BYTES not in journal
+    assert XLSX_NAME.encode() not in journal
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 1
+    assert len(charges) == 1
 
 
 def test_chat_screen_offers_open_and_delete() -> None:
