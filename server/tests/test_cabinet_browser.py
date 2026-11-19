@@ -574,3 +574,137 @@ def test_browser_warns_before_saving_a_taken_time(database: None) -> None:
             browser.close()
     finally:
         _stop(process, journal)
+
+
+def test_browser_yes_and_no_come_from_the_chat_buttons(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"cabinet-{uuid.uuid4()}@example.com"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text
+                and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/")
+            page.wait_for_selector("h1")
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+            computer = str(uuid.uuid4())
+            pulsed = page.evaluate(
+                """async (computer) => {
+                  const headers = {"Content-Type": "application/json"};
+                  const posted = await fetch("/api/desktops", {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({id: computer})
+                  });
+                  const beat = await fetch(`/api/desktops/${computer}/pulse`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({timezone: "Europe/Moscow"})
+                  });
+                  return [posted.status, beat.status];
+                }""",
+                computer,
+            )
+            assert pulsed == [200, 200]
+
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Почта")
+            page.fill("#create-scenario", "Отправить ответ.")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Почта").click()
+            page.wait_for_selector("[data-action='check-now']")
+            page.locator("[data-action='check-now']").click()
+            page.wait_for_selector(".bubble.gate")
+            gate = page.locator(".bubble.gate")
+            assert gate.locator(".tag").inner_text() == "Опасное действие"
+            assert gate.locator("[data-action='gate-yes']").inner_text() == "Да"
+            assert gate.locator("[data-action='gate-no']").inner_text() == "Нет"
+            page.fill("#composer", "Да")
+            page.click("button[aria-label='Отправить']")
+            page.wait_for_selector(f"text={STUB}")
+            assert gate.locator("[data-action='gate-yes']").count() == 1
+            assert page.locator(".flash").count() == 0
+            gate.locator("[data-action='gate-no']").click()
+            page.wait_for_selector("text=Не сделано: Отправить ответ.")
+            assert page.locator(".flash").inner_text() == "Вы ответили «Нет»."
+            assert gate.locator("[data-action='gate-yes']").count() == 0
+            assert page.locator(".bubble").filter(has_text=STUB).count() >= 1
+
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Отправка")
+            page.fill("#create-scenario", "Опубликовать заметку.")
+            page.click("#save-bot")
+            page.locator(".bot-card", has_text="Отправка").click()
+            page.wait_for_selector("[data-action='check-now']")
+            page.locator("[data-action='check-now']").click()
+            page.wait_for_selector("[data-action='gate-yes']")
+            assert page.locator(".bubble").filter(has_text=STUB).count() == 0
+            page.locator("[data-action='gate-yes']").click()
+            page.wait_for_selector("text=Вы ответили «Да».")
+            assert page.locator("[data-action='gate-no']").count() == 0
+            assert page.locator(".bubble").filter(has_text=STUB).count() == 0
+            finished = page.evaluate(
+                """async (computer) => {
+                  const headers = {"Content-Type": "application/json"};
+                  const released = await fetch(`/api/desktops/${computer}/routine-run`, {
+                    method: "POST",
+                    headers,
+                    body: "{}"
+                  });
+                  const step = await released.json();
+                  const performed = await fetch(`/api/desktops/${computer}/routine-run`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({step_id: step.step_id, performed: true})
+                  });
+                  return [released.status, step.action, performed.status];
+                }""",
+                computer,
+            )
+            assert finished[0] == 200
+            assert finished[1] == "Опубликовать заметку."
+            assert finished[2] == 204
+            page.locator("a", has_text="Карточка").click()
+            page.wait_for_selector("text=В чат")
+            page.locator("a", has_text="В чат").click()
+            page.wait_for_selector(f"text={STUB}")
+            assert page.locator(".flash").inner_text() == "Вы ответили «Да»."
+            assert page.locator("[data-action='gate-yes']").count() == 0
+            browser.close()
+    finally:
+        _stop(process, journal)

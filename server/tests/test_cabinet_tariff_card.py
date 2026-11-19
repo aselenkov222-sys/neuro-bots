@@ -12,8 +12,6 @@ REMOVED = (
     "Главный",
     "Рабочий десктоп",
     "Оплатить",
-    "gate-yes",
-    "gate-no",
     "xlsx",
     'data-action="pay"',
     "pick-tariff",
@@ -24,8 +22,6 @@ REMOVED = (
     "До первой оплаты",
     'from: "file"',
     'from: "gate"',
-    ">Да<",
-    ">Нет<",
 )
 
 

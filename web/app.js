@@ -89,6 +89,7 @@ const BROWSER_WAIT_MS = 60000;
 let pulseTimer = null;
 let browserTimer = null;
 let browserBusy = false;
+let routineBusy = false;
 
 function claimDesktop() {
   const bridge = window.__neuroDesktop;
@@ -138,7 +139,13 @@ function startPulse() {
   if (pulseTimer !== null) return;
   sendPulse();
   pulseTimer = setInterval(sendPulse, PULSE_INTERVAL_MS);
-  if (browserTimer === null) browserTimer = setInterval(finishBrowserTask, 1000);
+  if (browserTimer === null) {
+    browserTimer = setInterval(() => {
+      finishBrowserTask();
+      continueRoutine();
+    }, 1000);
+  }
+  continueRoutine();
 }
 
 function stopPulse() {
@@ -202,6 +209,37 @@ async function finishBrowserTask() {
     });
   } finally {
     browserBusy = false;
+  }
+}
+
+async function continueRoutine() {
+  const bridge = window.__neuroDesktop;
+  if (routineBusy || !state.me || !bridge || typeof bridge.id !== "string") return;
+  routineBusy = true;
+  try {
+    const claimed = await api(`/api/desktops/${bridge.id}/routine-run`, {
+      method: "POST",
+      body: {}
+    });
+    if (!claimed.ok || !claimed.data) return;
+    if (
+      typeof claimed.data.action === "string" &&
+      typeof claimed.data.step_id === "string"
+    ) {
+      await api(`/api/desktops/${bridge.id}/routine-run`, {
+        method: "POST",
+        body: { step_id: claimed.data.step_id, performed: true }
+      });
+    }
+    if (!state.activeId || claimed.data.bot_id !== state.activeId) return;
+    const listed = await api(`/api/bots/${state.activeId}/messages`);
+    if (!listed.ok || !listed.data || !Array.isArray(listed.data.messages)) return;
+    state.messages = listed.data.messages;
+    render();
+  } catch (error) {
+    return;
+  } finally {
+    routineBusy = false;
   }
 }
 
@@ -459,6 +497,15 @@ function accessLink(site, bot) {
 function messageHtml(message, bot) {
   const when = esc(formatLocal(message.updated_at));
   const text = esc(message.text || "");
+  if (message.code === "dangerous_action") {
+    const answered = message.answer === "yes" || message.answer === "no";
+    const actions = answered
+      ? `<p class="flash" role="status">Вы ответили «${message.answer === "yes" ? "Да" : "Нет"}».</p>`
+      : message.pending === true
+        ? `<div class="actions"><button type="button" class="btn-orange" data-action="gate-yes" data-id="${esc(message.id)}">Да</button><button type="button" class="btn-quiet" data-action="gate-no" data-id="${esc(message.id)}">Нет</button></div>`
+        : "";
+    return `<article class="bubble gate"><span class="tag">Опасное действие</span><p>${text}</p>${actions}<p class="meta">${when}</p></article>`;
+  }
   if (message.role === "user") {
     return `<article class="bubble user"><p>${text}</p><p class="meta">${when}</p></article>`;
   }
@@ -894,9 +941,27 @@ app.addEventListener("click", (event) => {
   if (action === "toggle-day") toggleDay(Number(target.dataset.day));
   if (action === "toggle-pause") togglePause();
   if (action === "check-now") checkNow();
+  if (action === "gate-yes" || action === "gate-no") {
+    answerGate(target.dataset.id, action === "gate-yes" ? "yes" : "no");
+    return;
+  }
   if (action === "keep-routine-time") keepHeldRoutine();
   restoreFocus(target);
 });
+
+async function answerGate(messageId, answer) {
+  if (!state.activeId || (answer !== "yes" && answer !== "no") || typeof messageId !== "string") return;
+  const result = await api(`/api/bots/${state.activeId}/messages/${messageId}/answer`, {
+    method: "POST",
+    body: { answer }
+  });
+  note(result);
+  if (result.ok && result.data && Array.isArray(result.data.messages)) {
+    state.messages = result.data.messages;
+  }
+  render();
+  continueRoutine();
+}
 
 async function checkNow() {
   if (!state.activeId || routineLocked()) return;

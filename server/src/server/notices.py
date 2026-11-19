@@ -9,7 +9,8 @@ from server.models import bots, desktop_notices
 COMPLETED = "completed"
 FAILED = "failed"
 SKIPPED = "skipped"
-KINDS = (COMPLETED, FAILED, SKIPPED)
+WAITING = "waiting"
+KINDS = (COMPLETED, FAILED, SKIPPED, WAITING)
 
 
 def _aware(moment: datetime) -> datetime:

@@ -12,6 +12,18 @@ from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
 from server.accounts import format_utc, touch_session, utc_now
+from server.browser_action import enqueue_open, named_address
+from server.dangerous import (
+    first_gate,
+    not_done_text,
+    open_gate,
+    released_step,
+    routine_is_awaiting,
+    scenario_lines,
+    take_answer,
+    take_perform,
+    write_message,
+)
 from server.auth import (
     begin,
     current_account,
@@ -51,7 +63,7 @@ from server.models import (
     routines,
     subscription_periods,
 )
-from server.notices import COMPLETED, FAILED, SKIPPED, record_notice
+from server.notices import COMPLETED, FAILED, SKIPPED, WAITING, record_notice
 
 router = APIRouter()
 
@@ -73,6 +85,9 @@ VAULT_CHOICE = "vault_choice"
 VAULT_CHOICE_CODE = "vault_choice_required"
 VAULT_CHOICE_TEXT = "Запуск завершён: без выбора записи войти нельзя."
 UNKNOWN_RUN_REASON = "Неизвестная причина запуска."
+ASLEEP = "desktop_asleep"
+ASLEEP_TEXT = "Запуск завершён: рабочий десктоп уснул."
+INVALID_ANSWER = "Нужен ответ «Да» или «Нет»."
 RUN_FAILURES = {
     SITE_NOT_OPENED: (SITE_NOT_OPENED, SITE_NOT_OPENED_TEXT),
     LOGIN_FAILED: (LOGIN_FAILED, LOGIN_FAILED_TEXT),
@@ -518,6 +533,29 @@ def _settle_occurrence(
     claimable: bool,
     scenario: object,
 ) -> None:
+    if routine_is_awaiting(connection, routine_id):
+        if now >= due_at:
+            waiting = _run_row(connection, routine_id, local_date)
+            if waiting is None:
+                connection.execute(
+                    routine_runs.insert().values(
+                        id=uuid.uuid4(),
+                        routine_id=routine_id,
+                        local_date=local_date,
+                        due_at=due_at,
+                        status="cancelled",
+                    )
+                )
+            elif waiting["status"] == "pending":
+                connection.execute(
+                    routine_runs.update()
+                    .where(
+                        routine_runs.c.id == waiting["id"],
+                        routine_runs.c.status == "pending",
+                    )
+                    .values(status="cancelled")
+                )
+        return
     if not allowed:
         if now >= due_at:
             _ensure_cancelled(connection, routine_id, local_date, due_at)
@@ -586,8 +624,77 @@ def _settle_occurrence(
     )
 
 
+def settle_asleep(connection: Connection, now: datetime) -> None:
+    moment = _aware(now)
+    runs = (
+        connection.execute(
+            select(
+                routine_runs.c.id,
+                routines.c.bot_id,
+                bots.c.account_id,
+            )
+            .join(routines, routines.c.id == routine_runs.c.routine_id)
+            .join(bots, bots.c.id == routines.c.bot_id)
+            .where(routine_runs.c.status == "awaiting")
+        )
+        .mappings()
+        .all()
+    )
+    for row in runs:
+        desktop = find_working_desktop(connection, row["account_id"])
+        alive = desktop is not None and _process_alive(
+            desktop["last_pulse_at"], moment
+        )
+        if alive:
+            continue
+        _mark_failed(
+            connection,
+            row["id"],
+            "awaiting",
+            row["bot_id"],
+            moment,
+            ASLEEP,
+            ASLEEP_TEXT,
+        )
+    checks = (
+        connection.execute(
+            select(
+                routine_checks.c.id,
+                routine_checks.c.bot_id,
+                bots.c.account_id,
+            )
+            .join(bots, bots.c.id == routine_checks.c.bot_id)
+            .where(routine_checks.c.status == "awaiting")
+        )
+        .mappings()
+        .all()
+    )
+    for row in checks:
+        desktop = find_working_desktop(connection, row["account_id"])
+        alive = desktop is not None and _process_alive(
+            desktop["last_pulse_at"], moment
+        )
+        if alive:
+            continue
+        updated = connection.execute(
+            routine_checks.update()
+            .where(
+                routine_checks.c.id == row["id"],
+                routine_checks.c.status == "awaiting",
+            )
+            .values(status="claimed")
+        )
+        if updated.rowcount != 1:
+            continue
+        _write_chat_error(
+            connection, row["bot_id"], moment, ASLEEP, ASLEEP_TEXT
+        )
+        record_notice(connection, row["bot_id"], FAILED, moment)
+
+
 def settle_due(connection: Connection, now: datetime) -> None:
     moment = _aware(now)
+    settle_asleep(connection, moment)
     rows = (
         connection.execute(
             select(
@@ -694,7 +801,9 @@ def claim_earliest_pending(
     if updated.rowcount != 1:
         return None
     _note_queue(connection, account_id, pending["bot_id"], moment)
-    _complete_claimed_run(connection, account_id, pending["bot_id"], moment)
+    _complete_claimed_run(
+        connection, account_id, pending["bot_id"], pending["id"], moment
+    )
     return pending
 
 
@@ -754,6 +863,17 @@ def _claim_earliest_check(
         )
         record_notice(connection, pending["bot_id"], FAILED, now)
         return
+    scenario = bot["scenario"]
+    if isinstance(scenario, str) and _maybe_wait(
+        connection,
+        account_id,
+        pending["bot_id"],
+        scenario,
+        now,
+        run_id=None,
+        check_id=pending["id"],
+    ):
+        return
     _speak_scenario(
         connection,
         account_id,
@@ -763,12 +883,161 @@ def _claim_earliest_check(
     )
 
 
+def _enqueue_lines(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    lines: list[str],
+) -> None:
+    desktop = find_working_desktop(connection, account_id)
+    if desktop is None:
+        return
+    chat_id = connection.execute(
+        select(chats.c.id).where(chats.c.bot_id == bot_id)
+    ).scalar_one()
+    for line in lines:
+        address = named_address(line)
+        if address is None:
+            continue
+        enqueue_open(
+            account_id=account_id,
+            computer_id=desktop["computer_id"],
+            url=address,
+            bot_id=bot_id,
+            chat_id=chat_id,
+        )
+
+
+def _maybe_wait(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    scenario: str,
+    now: datetime,
+    *,
+    run_id: uuid.UUID | None,
+    check_id: uuid.UUID | None,
+    after: int = -1,
+) -> bool:
+    found = first_gate(scenario, after=after)
+    if found is None:
+        return False
+    position, action = found
+    _enqueue_lines(
+        connection,
+        account_id,
+        bot_id,
+        scenario_lines(scenario)[after + 1 : position],
+    )
+    open_gate(
+        connection,
+        bot_id,
+        action,
+        position,
+        now,
+        run_id=run_id,
+        check_id=check_id,
+    )
+    if run_id is not None:
+        connection.execute(
+            routine_runs.update()
+            .where(
+                routine_runs.c.id == run_id,
+                routine_runs.c.status.in_(("claimed", "awaiting")),
+            )
+            .values(status="awaiting")
+        )
+    if check_id is not None:
+        connection.execute(
+            routine_checks.update()
+            .where(
+                routine_checks.c.id == check_id,
+                routine_checks.c.status.in_(("claimed", "awaiting")),
+            )
+            .values(status="awaiting")
+        )
+    record_notice(connection, bot_id, WAITING, now)
+    return True
+
+
+def _continue_after(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    scenario: str,
+    after: int,
+    now: datetime,
+    *,
+    run_id: uuid.UUID | None,
+    check_id: uuid.UUID | None,
+) -> None:
+    if _maybe_wait(
+        connection,
+        account_id,
+        bot_id,
+        scenario,
+        now,
+        run_id=run_id,
+        check_id=check_id,
+        after=after,
+    ):
+        return
+    _enqueue_lines(
+        connection,
+        account_id,
+        bot_id,
+        scenario_lines(scenario)[after + 1 :],
+    )
+    if run_id is not None:
+        connection.execute(
+            routine_runs.update()
+            .where(
+                routine_runs.c.id == run_id,
+                routine_runs.c.status == "awaiting",
+            )
+            .values(status="claimed")
+        )
+    if check_id is not None:
+        connection.execute(
+            routine_checks.update()
+            .where(
+                routine_checks.c.id == check_id,
+                routine_checks.c.status == "awaiting",
+            )
+            .values(status="claimed")
+        )
+    _speak_scenario(
+        connection,
+        account_id,
+        bot_id,
+        now,
+        desktop_available=True,
+    )
+
+
 def _complete_claimed_run(
     connection: Connection,
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
+    run_id: uuid.UUID,
     now: datetime,
 ) -> None:
+    bot = (
+        connection.execute(select(bots.c.scenario).where(bots.c.id == bot_id))
+        .mappings()
+        .one()
+    )
+    scenario = bot["scenario"]
+    if isinstance(scenario, str) and _maybe_wait(
+        connection,
+        account_id,
+        bot_id,
+        scenario,
+        now,
+        run_id=run_id,
+        check_id=None,
+    ):
+        return
     _speak_scenario(
         connection,
         account_id,
@@ -1025,24 +1294,36 @@ def check_now(request: Request, bot_id: str) -> JSONResponse:
             )
             is not None
         )
+        check_id = uuid.uuid4()
         opened.connection.execute(
             routine_checks.insert().values(
-                id=uuid.uuid4(),
+                id=check_id,
                 bot_id=parsed_id,
                 status="pending" if queued else "claimed",
                 created_at=opened.now,
             )
         )
         if not queued:
-            _speak_scenario(
+            scenario = bot["scenario"]
+            waited = isinstance(scenario, str) and _maybe_wait(
                 opened.connection,
                 opened.account["id"],
                 parsed_id,
+                scenario,
                 opened.now,
-                desktop_available=_desktop_live(
-                    opened.connection, opened.account["id"]
-                ),
+                run_id=None,
+                check_id=check_id,
             )
+            if not waited:
+                _speak_scenario(
+                    opened.connection,
+                    opened.account["id"],
+                    parsed_id,
+                    opened.now,
+                    desktop_available=_desktop_live(
+                        opened.connection, opened.account["id"]
+                    ),
+                )
         touch_session(opened.connection, opened.session["id"], opened.now)
         document = _messages_document(opened.connection, chat["id"])
         document["queued"] = queued
@@ -1168,8 +1449,17 @@ async def update_routine_pause(
             .values(**values)
         )
         if paused is True:
+            settle_asleep(opened.connection, opened.now)
             cancel_routine_today(
                 opened.connection, existing, opened.account["id"], opened.now
+            )
+            opened.connection.execute(
+                routine_runs.update()
+                .where(
+                    routine_runs.c.routine_id == parsed_routine,
+                    routine_runs.c.status == "awaiting",
+                )
+                .values(status="finished")
             )
         elif paused is False:
             release_routine_today(
@@ -1224,9 +1514,13 @@ def report_run_failure(
     )
 
 
+def _invalid_answer() -> JSONResponse:
+    return error_response(400, "invalid_request", INVALID_ANSWER)
+
+
 async def _read_failure_report(
     request: Request,
-) -> tuple[uuid.UUID | None, str] | None | JSONResponse:
+) -> tuple[uuid.UUID | None, str] | tuple[str, uuid.UUID] | None | JSONResponse:
     raw = await request.body()
     if raw.strip() == b"":
         return None
@@ -1234,7 +1528,19 @@ async def _read_failure_report(
         body = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return None
-    if not isinstance(body, dict) or "reason" not in body:
+    if not isinstance(body, dict):
+        return None
+    if "password" in body or "cookie" in body:
+        return _invalid_answer()
+    if "performed" in body or "step_id" in body:
+        step_raw = body.get("step_id")
+        if body.get("performed") is not True or not isinstance(step_raw, str):
+            return _invalid_answer()
+        try:
+            return ("performed", uuid.UUID(step_raw))
+        except ValueError:
+            return _invalid_answer()
+    if "reason" not in body:
         return None
     reason = body.get("reason")
     if not isinstance(reason, str) or reason not in RUN_FAILURES:
@@ -1246,6 +1552,72 @@ async def _read_failure_report(
         return uuid.UUID(raw_id), reason
     except ValueError:
         return None, reason
+
+
+def _perform_released(
+    connection: Connection,
+    account_id: uuid.UUID,
+    step_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    step = take_perform(connection, account_id, step_id, now)
+    if step is None:
+        return
+    desktop = find_working_desktop(connection, account_id)
+    address = named_address(step["action"])
+    if desktop is not None and address is not None:
+        chat_id = connection.execute(
+            select(chats.c.id).where(chats.c.bot_id == step["bot_id"])
+        ).scalar_one()
+        enqueue_open(
+            account_id=account_id,
+            computer_id=desktop["computer_id"],
+            url=address,
+            bot_id=step["bot_id"],
+            chat_id=chat_id,
+        )
+    scenario = connection.execute(
+        select(bots.c.scenario).where(bots.c.id == step["bot_id"])
+    ).scalar_one()
+    if not isinstance(scenario, str):
+        return
+    _continue_after(
+        connection,
+        account_id,
+        step["bot_id"],
+        scenario,
+        step["position"],
+        now + timedelta(microseconds=1),
+        run_id=step["run_id"],
+        check_id=step["check_id"],
+    )
+
+
+def _released_document(
+    connection: Connection, account_id: uuid.UUID
+) -> dict[str, str] | None:
+    step = released_step(connection, account_id)
+    if step is None:
+        return None
+    if step["run_id"] is not None:
+        routine_id = connection.execute(
+            select(routine_runs.c.routine_id).where(
+                routine_runs.c.id == step["run_id"]
+            )
+        ).scalar_one()
+        return {
+            "id": str(step["run_id"]),
+            "routine_id": str(routine_id),
+            "bot_id": str(step["bot_id"]),
+            "action": step["action"],
+            "step_id": str(step["id"]),
+        }
+    return {
+        "id": str(step["check_id"]),
+        "bot_id": str(step["bot_id"]),
+        "action": step["action"],
+        "step_id": str(step["id"]),
+    }
 
 
 @router.post("/api/desktops/{computer_id}/routine-run")
@@ -1266,13 +1638,22 @@ async def post_routine_run(request: Request, computer_id: str) -> Response:
         desktop = find_working_desktop(connection, account["id"])
         if desktop is None or desktop["computer_id"] != parsed:
             return desktop_not_found()
+        settle_asleep(connection, now)
         if isinstance(report, JSONResponse):
             return report
+        if isinstance(report, tuple) and report[0] == "performed":
+            _perform_released(connection, account["id"], report[1], now)
+            touch_session(connection, session["id"], now)
+            return Response(status_code=204)
         if report is not None:
             run_id, reason = report
             report_run_failure(connection, account["id"], run_id, reason, now)
             touch_session(connection, session["id"], now)
             return Response(status_code=204)
+        released = _released_document(connection, account["id"])
+        if released is not None:
+            touch_session(connection, session["id"], now)
+            return JSONResponse(released)
         claimed = claim_earliest_pending(connection, account["id"], now)
         touch_session(connection, session["id"], now)
         if claimed is None:
@@ -1283,4 +1664,77 @@ async def post_routine_run(request: Request, computer_id: str) -> Response:
                 "routine_id": str(claimed["routine_id"]),
                 "bot_id": str(claimed["bot_id"]),
             }
+        )
+
+
+async def _read_answer(request: Request) -> str | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _invalid_answer()
+    if not isinstance(body, dict) or "password" in body or "cookie" in body:
+        return _invalid_answer()
+    answer = body.get("answer")
+    if answer not in {"yes", "no"}:
+        return _invalid_answer()
+    return answer
+
+
+@router.post("/api/bots/{bot_id}/messages/{message_id}/answer")
+async def post_dangerous_answer(
+    request: Request, bot_id: str, message_id: str
+) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_bot = parse_id(bot_id)
+        parsed_message = parse_id(message_id)
+        if parsed_bot is None or parsed_message is None:
+            return not_found()
+        answer = await _read_answer(request)
+        if isinstance(answer, JSONResponse):
+            return answer
+        bot = _owned_bot(opened.connection, parsed_bot, opened.account["id"])
+        if bot is None:
+            return not_found()
+        settle_asleep(opened.connection, opened.now)
+        step = take_answer(
+            opened.connection,
+            opened.account["id"],
+            parsed_bot,
+            parsed_message,
+            answer,
+            opened.now,
+        )
+        if step is not None and answer == "no":
+            write_message(
+                opened.connection,
+                parsed_bot,
+                "assistant",
+                not_done_text(step["action"]),
+                None,
+                opened.now + timedelta(microseconds=1),
+            )
+            scenario = bot["scenario"]
+            if isinstance(scenario, str):
+                _continue_after(
+                    opened.connection,
+                    opened.account["id"],
+                    parsed_bot,
+                    scenario,
+                    step["position"],
+                    opened.now + timedelta(microseconds=2),
+                    run_id=step["run_id"],
+                    check_id=step["check_id"],
+                )
+        chat = (
+            opened.connection.execute(
+                select(chats).where(chats.c.bot_id == parsed_bot)
+            )
+            .mappings()
+            .one()
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(
+            _messages_document(opened.connection, chat["id"])
         )

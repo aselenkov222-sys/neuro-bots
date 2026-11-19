@@ -30,12 +30,15 @@ from server.models import (
     messages,
     quota_charges,
     quota_counters,
+    dangerous_steps,
+    desktop_notices,
     routine_checks,
     routine_runs,
     routines,
     sessions,
     subscription_periods,
 )
+from server.browser_action import clear_opens, peek_open, pop_open
 from server.routines import (
     appointed_utc,
     routine_may_start,
@@ -2717,3 +2720,403 @@ def test_a_queue_message_records_no_notice(
     assert [item["bot_id"] for item in notices] == [first["id"]]
     assert [item["kind"] for item in notices] == ["completed"]
     assert all(item["bot_id"] != second["id"] for item in notices)
+
+
+REPO = Path(__file__).resolve().parents[2]
+SEND = "Отправить ответ."
+INBOX = "https://example.com/inbox"
+SEND_URL = "https://example.com/send"
+ASLEEP_TEXT = "Запуск завершён: рабочий десктоп уснул."
+MONDAY_DUE = datetime(2026, 11, 23, 6, 0, tzinfo=timezone.utc)
+
+
+def test_yes_and_no_buttons_come_from_the_mockup() -> None:
+    script = (REPO / "web" / "app.js").read_text(encoding="utf-8")
+    styles = (REPO / "web" / "styles.css").read_text(encoding="utf-8")
+    assert 'data-action="gate-yes"' in script
+    assert 'data-action="gate-no"' in script
+    assert 'class="btn-orange"' in script
+    assert 'class="btn-quiet"' in script
+    assert ">Да</button>" in script
+    assert ">Нет</button>" in script
+    assert "Опасное действие" in script
+    assert "Вы ответили «" in script
+    assert ".bubble.gate" in styles
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> dict[str, datetime]:
+    holder = {"now": moment}
+
+    def current() -> datetime:
+        return holder["now"]
+
+    monkeypatch.setattr("server.routines.utc_now", current)
+    monkeypatch.setattr("server.bots.utc_now", current)
+    return holder
+
+
+def _run(
+    cookie: str, computer: uuid.UUID, body: dict | None = None
+):
+    with _client(cookie) as client:
+        return client.post(
+            f"/api/desktops/{computer}/routine-run",
+            json=body if body is not None else {},
+            headers={"Origin": ORIGIN},
+        )
+
+
+def _steps(bot_id: uuid.UUID) -> list[dict]:
+    return [row for row in _rows(dangerous_steps) if row["bot_id"] == bot_id]
+
+
+def _stored_notices(bot_id: uuid.UUID) -> list[dict]:
+    return [row for row in _rows(desktop_notices) if row["bot_id"] == bot_id]
+
+
+def _used(account_id: uuid.UUID) -> int:
+    period_ids = {
+        row["id"]
+        for row in _rows(subscription_periods)
+        if row["account_id"] == account_id
+    }
+    return next(
+        row["used"]
+        for row in _rows(quota_counters)
+        if row["period_id"] in period_ids
+    )
+
+
+def _pulse(account_id: uuid.UUID, moment: datetime) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                desktops.update()
+                .where(desktops.c.account_id == account_id)
+                .values(last_pulse_at=moment)
+            )
+    finally:
+        engine.dispose()
+
+
+def test_closed_list_stops_before_the_step(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def spy(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id = _open_account("gates@example.com", confirmed=True)
+    safe = ("Прочитать почту.", "Войти сохранённым доступом.")
+    dangerous = (
+        "Отправить ответ.",
+        "Заплатить за заказ.",
+        "Оплатить счёт.",
+        "Удалить черновик.",
+        "Опубликовать запись.",
+        "Сменить пароль.",
+    )
+    with _client(cookie) as client:
+        for text in safe:
+            before = len(calls)
+            bot = _create_bot(client, "Почта", text)
+            checked = client.post(
+                f"/api/bots/{bot['id']}/check",
+                headers={"Origin": ORIGIN},
+            )
+            assert checked.status_code == 200
+            assert len(calls) == before + 1
+            assert [row["text"] for row in checked.json()["messages"]] == [STUB_TEXT]
+            assert _steps(uuid.UUID(bot["id"])) == []
+        for text in dangerous:
+            before = len(calls)
+            used = _used(account_id)
+            bot = _create_bot(client, "Шаг", text)
+            checked = client.post(
+                f"/api/bots/{bot['id']}/check",
+                headers={"Origin": ORIGIN},
+            )
+            assert checked.status_code == 200
+            assert len(calls) == before
+            assert _used(account_id) == used
+            listed = checked.json()["messages"]
+            assert len(listed) == 1
+            assert listed[0]["role"] == "assistant"
+            assert listed[0]["code"] == "dangerous_action"
+            assert listed[0]["text"] == text
+            assert listed[0]["answer"] is None
+            assert listed[0]["pending"] is True
+            stored = _steps(uuid.UUID(bot["id"]))
+            assert len(stored) == 1
+            assert stored[0]["action"] == text
+            assert stored[0]["performed_at"] is None
+            assert stored[0]["answer"] is None
+            assert [row["kind"] for row in _stored_notices(uuid.UUID(bot["id"]))] == [
+                "waiting"
+            ]
+
+
+def test_a_dangerous_address_stays_closed_until_yes(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_opens()
+    monkeypatch.setattr(
+        "server.aggregator.complete", lambda **kwargs: STUB_TEXT
+    )
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "send-url@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_scenario(
+        cookie,
+        bot["id"],
+        f"Прочитать почту {INBOX}\nОтправить {SEND_URL}",
+    )
+    clock = _clock(monkeypatch, CLAIM_AT)
+    claimed = _run(cookie, computer)
+    assert claimed.status_code == 200
+    assert tuple(claimed.json()) == ("id", "routine_id", "bot_id")
+    assert _runs_for(created["id"])[0]["status"] == "awaiting"
+    assert peek_open(account_id, computer) == INBOX
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    assert _steps(bot_id)[0]["performed_at"] is None
+    clock["now"] = CLAIM_AT + timedelta(seconds=10)
+    idle = _run(cookie, computer)
+    assert idle.status_code == 204
+    assert peek_open(account_id, computer) is None
+    message_id = next(
+        row["id"]
+        for row in _chat_messages(bot_id)
+        if row["code"] == "dangerous_action"
+    )
+    with _client(cookie) as client:
+        answered = client.post(
+            f"/api/bots/{bot['id']}/messages/{message_id}/answer",
+            json={"answer": "yes"},
+            headers={"Origin": ORIGIN},
+        )
+    assert answered.status_code == 200
+    assert answered.json()["messages"][0]["answer"] == "yes"
+    assert answered.json()["messages"][0]["pending"] is False
+    assert [row["text"] for row in answered.json()["messages"] if row["role"] == "user"] == [
+        "Да"
+    ]
+    assert peek_open(account_id, computer) is None
+    assert _steps(bot_id)[0]["performed_at"] is None
+    clock["now"] = CLAIM_AT + timedelta(seconds=20)
+    released = _run(cookie, computer)
+    assert released.status_code == 200
+    assert released.json()["action"] == f"Отправить {SEND_URL}"
+    assert released.json()["step_id"]
+    assert "password" not in released.json()
+    assert "cookie" not in released.json()
+    clock["now"] = CLAIM_AT + timedelta(seconds=30)
+    performed = _run(
+        cookie,
+        computer,
+        {"step_id": released.json()["step_id"], "performed": True},
+    )
+    assert performed.status_code == 204
+    assert _steps(bot_id)[0]["performed_at"] is not None
+    assert peek_open(account_id, computer) == SEND_URL
+    spoken = _chat_messages(bot_id)
+    assert STUB_TEXT in [row["text"] for row in spoken]
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    pop_open(account_id, computer)
+    clear_opens()
+
+
+def test_no_skips_the_step_and_writes_what_was_not_done(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def spy(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    clear_opens()
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "skip-step@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_scenario(
+        cookie, bot["id"], f"Прочитать почту.\n{SEND}\nПрочитать почту {INBOX}"
+    )
+    clock = _clock(monkeypatch, CLAIM_AT)
+    assert _run(cookie, computer).status_code == 200
+    assert calls == []
+    assert _used(account_id) == 0
+    message_id = next(
+        row["id"]
+        for row in _chat_messages(bot_id)
+        if row["code"] == "dangerous_action"
+    )
+    clock["now"] = CLAIM_AT + timedelta(seconds=10)
+    with _client(cookie) as client:
+        chatted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "Да"},
+            headers={"Origin": ORIGIN},
+        )
+        assert chatted.status_code == 200
+        assert _steps(bot_id)[0]["answer"] is None
+        assert _steps(bot_id)[0]["performed_at"] is None
+        answered = client.post(
+            f"/api/bots/{bot['id']}/messages/{message_id}/answer",
+            json={"answer": "no"},
+            headers={"Origin": ORIGIN},
+        )
+    assert answered.status_code == 200
+    texts = [row["text"] for row in answered.json()["messages"]]
+    assert "Нет" in texts
+    assert f"Не сделано: {SEND}" in texts
+    assert STUB_TEXT in texts
+    assert peek_open(account_id, computer) == INBOX
+    pop_open(account_id, computer)
+    assert _steps(bot_id)[0]["answer"] == "no"
+    assert _steps(bot_id)[0]["performed_at"] is None
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert _used(account_id) == 2
+    assert calls and "password" not in calls[0]
+    clock["now"] = CLAIM_AT + timedelta(seconds=20)
+    again = _run(cookie, computer, {"step_id": str(_steps(bot_id)[0]["id"]), "performed": True})
+    assert again.status_code == 204
+    assert _steps(bot_id)[0]["performed_at"] is None
+
+
+def test_the_next_run_waits_and_pause_is_not_a_skip(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "server.aggregator.complete", lambda **kwargs: STUB_TEXT
+    )
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "wait-next@example.com"
+    )
+    other_cookie_bot = None
+    bot_id = uuid.UUID(bot["id"])
+    _set_scenario(cookie, bot["id"], SEND)
+    with _client(cookie) as client:
+        other = _create_bot(client, "Другой", "обычный сценарий")
+        other_cookie_bot = other
+        second = _create_routine(
+            client, other["id"], {"weekdays": [1, 3, 5], "time": "09:00"}
+        )
+        assert second.status_code == 200
+    clock = _clock(monkeypatch, CLAIM_AT)
+    assert _run(cookie, computer).status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "awaiting"
+    other_claim = _run(cookie, computer)
+    assert other_claim.status_code == 200
+    assert other_claim.json()["bot_id"] == other_cookie_bot["id"]
+    assert _steps(bot_id)[0]["performed_at"] is None
+    _pulse(account_id, MONDAY_DUE + timedelta(seconds=61))
+    clock["now"] = MONDAY_DUE + timedelta(seconds=61)
+    _settle(clock["now"])
+    later = [
+        row
+        for row in _runs_for(created["id"])
+        if row["local_date"] == date(2026, 11, 23)
+    ]
+    opened = [
+        row
+        for row in _runs_for(created["id"])
+        if row["local_date"] == date(2026, 11, 18)
+    ]
+    assert len(later) == 1
+    assert later[0]["status"] == "cancelled"
+    assert len(opened) == 1
+    assert opened[0]["status"] == "awaiting"
+    assert all(row["code"] != "routine_skipped" for row in _chat_messages(bot_id))
+    clock["now"] = MONDAY_DUE + timedelta(days=7)
+    _pulse(account_id, clock["now"])
+    with _client(cookie) as client:
+        paused = _pause(client, bot["id"], created["id"], True)
+    assert paused.status_code == 200
+    finished = [
+        row
+        for row in _runs_for(created["id"])
+        if row["local_date"] == date(2026, 11, 18)
+    ]
+    assert finished[0]["status"] == "finished"
+    assert all(row["code"] != "routine_skipped" for row in _chat_messages(bot_id))
+    assert "failed" not in [row["kind"] for row in _stored_notices(bot_id)]
+    assert _steps(bot_id)[0]["performed_at"] is None
+    message_id = next(
+        row["id"]
+        for row in _chat_messages(bot_id)
+        if row["code"] == "dangerous_action"
+    )
+    with _client(cookie) as client:
+        late = client.post(
+            f"/api/bots/{bot['id']}/messages/{message_id}/answer",
+            json={"answer": "yes"},
+            headers={"Origin": ORIGIN},
+        )
+    assert late.status_code == 200
+    assert _steps(bot_id)[0]["answer"] is None
+    assert _steps(bot_id)[0]["performed_at"] is None
+    after = _run(cookie, computer)
+    if after.status_code == 200:
+        assert after.json()["bot_id"] != bot["id"]
+    else:
+        assert after.status_code == 204
+    assert [
+        row["status"]
+        for row in _runs_for(created["id"])
+        if row["local_date"] == date(2026, 11, 18)
+    ] == ["finished"]
+    assert _steps(bot_id)[0]["performed_at"] is None
+
+
+def test_a_lost_pulse_ends_the_wait_and_a_late_yes_starts_nothing(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "server.aggregator.complete", lambda **kwargs: STUB_TEXT
+    )
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        "asleep-yes@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_scenario(cookie, bot["id"], SEND)
+    clock = _clock(monkeypatch, CLAIM_AT)
+    assert _run(cookie, computer).status_code == 200
+    _pulse(account_id, CLAIM_AT - timedelta(seconds=31))
+    clock["now"] = CLAIM_AT + timedelta(seconds=5)
+    _settle(clock["now"])
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    failed = _chat_messages(bot_id)
+    assert [row["code"] for row in failed if row["role"] == "error"] == [
+        "desktop_asleep"
+    ]
+    assert failed[-1]["text"] == ASLEEP_TEXT
+    assert all(row["code"] != "routine_skipped" for row in failed)
+    assert {row["kind"] for row in _stored_notices(bot_id)} == {"waiting", "failed"}
+    message_id = next(row["id"] for row in failed if row["code"] == "dangerous_action")
+    with _client(cookie) as client:
+        late = client.post(
+            f"/api/bots/{bot['id']}/messages/{message_id}/answer",
+            json={"answer": "yes"},
+            headers={"Origin": ORIGIN},
+        )
+    assert late.status_code == 200
+    assert _steps(bot_id)[0]["answer"] is None
+    assert _steps(bot_id)[0]["performed_at"] is None
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    _pulse(account_id, clock["now"] + timedelta(minutes=5))
+    clock["now"] = clock["now"] + timedelta(minutes=5)
+    _settle(clock["now"])
+    assert _runs_for(created["id"])[0]["status"] == "failed"
+    assert [row["code"] for row in _chat_messages(bot_id) if row["role"] == "error"] == [
+        "desktop_asleep"
+    ]
+    assert _run(cookie, computer).status_code == 204
+    assert _steps(bot_id)[0]["performed_at"] is None
