@@ -20,6 +20,7 @@ from server.auth import (
     unauthenticated,
 )
 from server.config import development_tariff
+from server.library import attach_files, store_library_file
 from server.models import (
     bots,
     chats,
@@ -319,18 +320,18 @@ def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, 
         .mappings()
         .all()
     )
-    return {
-        "messages": [
-            {
-                "id": str(row["id"]),
-                "role": row["role"],
-                "text": row["text"],
-                "code": row["code"],
-                "updated_at": format_utc(row["updated_at"]),
-            }
-            for row in rows
-        ]
-    }
+    payload: list[dict[str, object]] = [
+        {
+            "id": str(row["id"]),
+            "role": row["role"],
+            "text": row["text"],
+            "code": row["code"],
+            "updated_at": format_utc(row["updated_at"]),
+        }
+        for row in rows
+    ]
+    attach_files(connection, payload, [row["id"] for row in rows])
+    return {"messages": payload}
 
 
 def _lock_quota(connection: Connection, account_id: uuid.UUID):
@@ -364,10 +365,11 @@ def _insert_message(
     text: str,
     code: str | None,
     updated_at: datetime,
-) -> None:
+) -> uuid.UUID:
+    message_id = uuid.uuid4()
     connection.execute(
         messages.insert().values(
-            id=uuid.uuid4(),
+            id=message_id,
             chat_id=chat_id,
             role=role,
             text=text,
@@ -375,6 +377,7 @@ def _insert_message(
             updated_at=updated_at,
         )
     )
+    return message_id
 
 
 def _reply_at(connection: Connection, chat_id: uuid.UUID, now: datetime) -> datetime:
@@ -439,7 +442,8 @@ def finish_open(
             messages=_adapter_messages(connection, pending.chat_id),
             desktop_available=_pulse_live(connection, account_id),
         )
-        if reply == "":
+        text, xlsx = aggregator.split_reply(reply)
+        if text == "":
             _insert_message(
                 connection,
                 pending.chat_id,
@@ -449,14 +453,24 @@ def finish_open(
                 reply_at,
             )
         else:
-            _insert_message(
+            message_id = _insert_message(
                 connection,
                 pending.chat_id,
                 "assistant",
-                reply,
+                text,
                 None,
                 reply_at,
             )
+            if xlsx is not None:
+                store_library_file(
+                    connection,
+                    bot_id=bot["id"],
+                    chat_id=pending.chat_id,
+                    message_id=message_id,
+                    name=xlsx[0],
+                    content=xlsx[1],
+                    created_at=reply_at,
+                )
             connection.execute(
                 quota_charges.insert().values(
                     id=uuid.uuid4(),
@@ -536,7 +550,8 @@ def _answer_held(
             messages=_adapter_messages(connection, chat_id),
             desktop_available=_pulse_live(connection, account_id),
         )
-        if reply == "":
+        text, xlsx = aggregator.split_reply(reply)
+        if text == "":
             _insert_message(
                 connection,
                 chat_id,
@@ -546,14 +561,24 @@ def _answer_held(
                 reply_at,
             )
         else:
-            _insert_message(
+            message_id = _insert_message(
                 connection,
                 chat_id,
                 "assistant",
-                reply,
+                text,
                 None,
                 reply_at,
             )
+            if xlsx is not None:
+                store_library_file(
+                    connection,
+                    bot_id=bot_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    name=xlsx[0],
+                    content=xlsx[1],
+                    created_at=reply_at,
+                )
             connection.execute(
                 quota_charges.insert().values(
                     id=uuid.uuid4(),

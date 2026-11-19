@@ -51,6 +51,7 @@ from server.desktops import (
     parse_path_computer_id,
     timezone_name_accepted,
 )
+from server.library import store_library_file
 from server.models import (
     accounts,
     bots,
@@ -1080,7 +1081,8 @@ def _speak_scenario(
         messages=_adapter_messages(connection, chat["id"]),
         desktop_available=desktop_available,
     )
-    if reply == "":
+    text, xlsx = aggregator.split_reply(reply)
+    if text == "":
         _insert_message(
             connection,
             chat["id"],
@@ -1091,14 +1093,24 @@ def _speak_scenario(
         )
         record_notice(connection, bot_id, FAILED, now)
     else:
-        _insert_message(
+        message_id = _insert_message(
             connection,
             chat["id"],
             "assistant",
-            reply,
+            text,
             None,
             now,
         )
+        if xlsx is not None:
+            store_library_file(
+                connection,
+                bot_id=bot_id,
+                chat_id=chat["id"],
+                message_id=message_id,
+                name=xlsx[0],
+                content=xlsx[1],
+                created_at=now,
+            )
         record_notice(connection, bot_id, COMPLETED, now)
         connection.execute(
             quota_charges.insert().values(

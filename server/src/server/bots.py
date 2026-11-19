@@ -29,6 +29,7 @@ from server.browser_action import (
 from server.dangerous import DANGEROUS_CODE, gate_state
 from server.config import development_tariff
 from server.desktops import find_working_desktop
+from server.library import attach_files, store_library_file
 from server.models import (
     bots,
     chats,
@@ -372,10 +373,11 @@ def _insert_message(
     text: str,
     code: str | None,
     updated_at: datetime,
-) -> None:
+) -> uuid.UUID:
+    message_id = uuid.uuid4()
     connection.execute(
         messages.insert().values(
-            id=uuid.uuid4(),
+            id=message_id,
             chat_id=chat_id,
             role=role,
             text=text,
@@ -383,6 +385,7 @@ def _insert_message(
             updated_at=updated_at,
         )
     )
+    return message_id
 
 
 def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, object]:
@@ -405,6 +408,7 @@ def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, 
         }
         for row in rows
     ]
+    attach_files(connection, payload, [row["id"] for row in rows])
     gated = [
         uuid.UUID(item["id"])
         for item in payload
@@ -678,7 +682,8 @@ def _deliver_message(
             messages=_adapter_messages(opened.connection, chat["id"]),
             desktop_available=desktop_available,
         )
-        if reply == "":
+        reply_text, xlsx = aggregator.split_reply(reply)
+        if reply_text == "":
             _insert_message(
                 opened.connection,
                 chat["id"],
@@ -688,14 +693,24 @@ def _deliver_message(
                 follow_at,
             )
         else:
-            _insert_message(
+            message_id = _insert_message(
                 opened.connection,
                 chat["id"],
                 "assistant",
-                reply,
+                reply_text,
                 None,
                 follow_at,
             )
+            if xlsx is not None:
+                store_library_file(
+                    opened.connection,
+                    bot_id=bot["id"],
+                    chat_id=chat["id"],
+                    message_id=message_id,
+                    name=xlsx[0],
+                    content=xlsx[1],
+                    created_at=follow_at,
+                )
             opened.connection.execute(
                 quota_charges.insert().values(
                     id=uuid.uuid4(),
