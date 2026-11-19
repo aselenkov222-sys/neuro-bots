@@ -18,8 +18,10 @@ from server.models import (
     messages,
     quota_charges,
     quota_counters,
+    routine_runs,
     subscription_periods,
 )
+from server.routines import settle_due
 from server.scenario_chat import proposed_scenario
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +33,7 @@ OLD = "старый текст"
 RULES = "Каждый день проверяй почту.\nПотом записывай итог."
 REQUEST = f"Сохрани правила:\n{RULES}"
 QUOTA_TEXT = "Квота на период закончилась."
+DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -436,3 +439,145 @@ def test_confirmation_replaces_the_scenario_and_silence_does_not(
     assert stored["code"] == "scenario_confirmed"
     assert _scenario(bot["id"]) == "текст с карточки"
     assert all("not-stored" not in row["text"] for row in _rows(messages))
+
+
+def _texts_by_id(bot_messages: list[dict]) -> dict[str, str]:
+    return {row["id"]: row["text"] for row in bot_messages}
+
+
+def test_past_messages_stay_and_the_next_one_uses_the_new_text(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict] = []
+
+    def spy(**kwargs: object) -> str:
+        seen.append(kwargs)
+        return STUB
+
+    cookie = _open_ready("scenario-next@example.com")
+    with _client(cookie) as client:
+        bot = _bot(client)
+        early = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "ранняя реплика"},
+            headers={"Origin": ORIGIN},
+        )
+        assert early.status_code == 200
+        assert [row["text"] for row in early.json()["messages"]] == [
+            "ранняя реплика",
+            STUB,
+        ]
+        proposal = _proposal(client, bot["id"])
+        monkeypatch.setattr("server.aggregator.complete", spy)
+        waiting = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "ещё без подтверждения"},
+            headers={"Origin": ORIGIN},
+        )
+        assert waiting.status_code == 200
+        assert seen[0]["scenario"] == OLD
+        before = _texts_by_id(waiting.json()["messages"])
+        confirmed = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert confirmed.status_code == 200
+        assert len(seen) == 1
+        assert _texts_by_id(confirmed.json()["messages"]) == before
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == RULES
+        nxt = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "следующее"},
+            headers={"Origin": ORIGIN},
+        )
+        assert nxt.status_code == 200
+        assert len(seen) == 2
+        assert seen[1]["scenario"] == RULES
+        assert seen[1]["messages"][-1] == {"role": "user", "text": "следующее"}
+        kept = _texts_by_id(nxt.json()["messages"])
+        for message_id, text in before.items():
+            assert kept[message_id] == text
+        assert nxt.json()["messages"][-1]["text"] == STUB
+
+
+def _settle(moment: datetime) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            settle_due(connection, moment)
+    finally:
+        engine.dispose()
+
+
+def test_the_next_routine_reads_the_confirmed_scenario(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict] = []
+
+    def spy(**kwargs: object) -> str:
+        seen.append(kwargs)
+        return STUB
+
+    cookie = _open_ready("scenario-routine@example.com")
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = _bot(client)
+        early = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "ранняя реплика"},
+            headers={"Origin": ORIGIN},
+        )
+        assert early.status_code == 200
+        created = client.post(
+            f"/api/bots/{bot['id']}/routines",
+            json={"weekdays": [1, 3, 5], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+        desktop = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert desktop.status_code == 200
+        monkeypatch.setattr("server.desktops.utc_now", lambda: DUE)
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+        _settle(DUE)
+        proposal = _proposal(client, bot["id"])
+        confirmed = client.post(
+            f"/api/bots/{bot['id']}/messages/{proposal['id']}/scenario",
+            json={"confirm": True},
+            headers={"Origin": ORIGIN},
+        )
+        assert confirmed.status_code == 200
+        before = _texts_by_id(confirmed.json()["messages"])
+        assert client.get(f"/api/bots/{bot['id']}").json()["scenario"] == RULES
+        monkeypatch.setattr("server.aggregator.complete", spy)
+        monkeypatch.setattr("server.routines.utc_now", lambda: DUE)
+        claimed = client.post(
+            f"/api/desktops/{computer}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+        assert claimed.status_code == 200
+        assert claimed.json()["bot_id"] == bot["id"]
+        listed = client.get(f"/api/bots/{bot['id']}/messages")
+        assert listed.status_code == 200
+    assert len(seen) == 1
+    assert seen[0]["scenario"] == RULES
+    assert seen[0]["scenario"] != OLD
+    kept = _texts_by_id(listed.json()["messages"])
+    for message_id, text in before.items():
+        assert kept[message_id] == text
+    runs = [
+        row
+        for row in _rows(routine_runs)
+        if str(row["routine_id"]) == created.json()["id"]
+    ]
+    assert len(runs) == 1
+    assert runs[0]["status"] == "claimed"
