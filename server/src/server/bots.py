@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
@@ -70,6 +70,10 @@ EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 COMPUTER_UNAVAILABLE_TEXT = "компьютер недоступен"
+CHAT_NOT_FOUND = "Чат не найден."
+MAIN_CHAT_KEPT = "Основной чат удалить нельзя."
+MAIN_KIND = "main"
+EXTRA_KIND = "extra"
 
 
 class Opened(NamedTuple):
@@ -85,6 +89,14 @@ def email_unconfirmed() -> JSONResponse:
 
 def not_found() -> JSONResponse:
     return error_response(404, "not_found", NOT_FOUND)
+
+
+def chat_not_found() -> JSONResponse:
+    return error_response(404, "not_found", CHAT_NOT_FOUND)
+
+
+def main_chat_kept() -> JSONResponse:
+    return error_response(400, "main_chat", MAIN_CHAT_KEPT)
 
 
 def bot_document(row: RowMapping) -> dict[str, object]:
@@ -260,11 +272,56 @@ class QuotaCounterMissing(RuntimeError):
     pass
 
 
-def _load_chat(connection: Connection, bot_id: uuid.UUID) -> RowMapping:
+def main_chat(connection: Connection, bot_id: uuid.UUID) -> RowMapping:
     return (
-        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        connection.execute(
+            select(chats).where(
+                chats.c.bot_id == bot_id,
+                chats.c.kind == MAIN_KIND,
+            )
+        )
         .mappings()
         .one()
+    )
+
+
+def _owned_chat(
+    connection: Connection, chat_id: uuid.UUID, bot_id: uuid.UUID
+) -> RowMapping | None:
+    return (
+        connection.execute(
+            select(chats).where(
+                chats.c.id == chat_id,
+                chats.c.bot_id == bot_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+def chat_document(row: RowMapping) -> dict[str, object]:
+    return {
+        "id": str(row["id"]),
+        "kind": row["kind"],
+        "created_at": format_utc(row["created_at"]),
+        "updated_at": format_utc(row["updated_at"]),
+    }
+
+
+def _bot_chats(connection: Connection, bot_id: uuid.UUID) -> list[RowMapping]:
+    rows = (
+        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
+        .mappings()
+        .all()
+    )
+    return sorted(
+        rows,
+        key=lambda row: (
+            0 if row["kind"] == MAIN_KIND else 1,
+            row["created_at"],
+            row["id"],
+        ),
     )
 
 
@@ -426,6 +483,8 @@ async def create_bot(request: Request) -> JSONResponse:
                 id=uuid.uuid4(),
                 bot_id=bot_id,
                 updated_at=opened.now,
+                kind=MAIN_KIND,
+                created_at=opened.now,
             )
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
@@ -494,9 +553,140 @@ def list_messages(request: Request, bot_id: str) -> JSONResponse:
         bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
         if bot is None:
             return not_found()
-        chat = _load_chat(opened.connection, parsed_id)
+        chat = main_chat(opened.connection, parsed_id)
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+def _deliver_message(
+    opened: Opened, bot: RowMapping, chat: RowMapping, text: str
+) -> JSONResponse:
+    counter = _lock_quota_counter(opened.connection, opened.account["id"])
+    _insert_message(
+        opened.connection,
+        chat["id"],
+        "user",
+        text,
+        None,
+        opened.now,
+    )
+    follow_at = opened.now + timedelta(microseconds=1)
+    desktop = find_working_desktop(opened.connection, opened.account["id"])
+    desktop_available = (
+        desktop is not None and desktop["last_pulse_at"] is not None
+    )
+    address = named_address(text)
+    chosen_url = None
+    if (
+        desktop is not None
+        and desktop_available
+        and counter["used"] < development_tariff.model_requests
+    ):
+        chosen_url = take_login_choice(
+            account_id=opened.account["id"],
+            computer_id=desktop["computer_id"],
+            bot_id=bot["id"],
+            text=text,
+        )
+    if counter["used"] >= development_tariff.model_requests:
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "error",
+            QUOTA_EXHAUSTED_TEXT,
+            None,
+            follow_at,
+        )
+    elif address is not None and not desktop_available:
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "error",
+            COMPUTER_UNAVAILABLE_TEXT,
+            None,
+            follow_at,
+        )
+    elif chosen_url is not None:
+        assert desktop is not None
+        enqueue_open(
+            account_id=opened.account["id"],
+            computer_id=desktop["computer_id"],
+            url=chosen_url,
+            bot_id=bot["id"],
+            chat_id=chat["id"],
+            login=text,
+        )
+        follow_at = opened.now
+    elif (
+        desktop is not None
+        and address is None
+        and bot_holds_browser(
+            opened.account["id"], desktop["computer_id"], bot["id"]
+        )
+    ):
+        hold_text(opened.account["id"], bot["id"], chat["id"], text)
+        follow_at = opened.now
+    elif address is not None:
+        assert desktop is not None
+        enqueue_open(
+            account_id=opened.account["id"],
+            computer_id=desktop["computer_id"],
+            url=address,
+            bot_id=bot["id"],
+            chat_id=chat["id"],
+        )
+        follow_at = opened.now
+    elif desktop is not None and not desktop_available:
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "error",
+            COMPUTER_UNAVAILABLE_TEXT,
+            None,
+            follow_at,
+        )
+    else:
+        reply = aggregator.complete(
+            description=bot["description"],
+            scenario=bot["scenario"],
+            messages=_adapter_messages(opened.connection, chat["id"]),
+            desktop_available=desktop_available,
+        )
+        if reply == "":
+            _insert_message(
+                opened.connection,
+                chat["id"],
+                "error",
+                EMPTY_MODEL_TEXT,
+                EMPTY_MODEL_CODE,
+                follow_at,
+            )
+        else:
+            _insert_message(
+                opened.connection,
+                chat["id"],
+                "assistant",
+                reply,
+                None,
+                follow_at,
+            )
+            opened.connection.execute(
+                quota_charges.insert().values(
+                    id=uuid.uuid4(),
+                    period_id=counter["period_id"],
+                    created_at=opened.now,
+                )
+            )
+            opened.connection.execute(
+                quota_counters.update()
+                .where(quota_counters.c.id == counter["id"])
+                .values(used=counter["used"] + 1)
+            )
+    opened.connection.execute(
+        chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
+    )
+    touch_session(opened.connection, opened.session["id"], opened.now)
+    return JSONResponse(_messages_document(opened.connection, chat["id"]))
 
 
 @router.post("/api/bots/{bot_id}/messages")
@@ -513,132 +703,122 @@ async def create_message(request: Request, bot_id: str) -> JSONResponse:
         text = await read_message_text(request)
         if isinstance(text, JSONResponse):
             return text
-        counter = _lock_quota_counter(opened.connection, opened.account["id"])
-        chat = _load_chat(opened.connection, parsed_id)
-        _insert_message(
-            opened.connection,
-            chat["id"],
-            "user",
-            text,
-            None,
-            opened.now,
+        return _deliver_message(
+            opened, bot, main_chat(opened.connection, parsed_id), text
         )
-        follow_at = opened.now + timedelta(microseconds=1)
-        desktop = find_working_desktop(opened.connection, opened.account["id"])
-        desktop_available = (
-            desktop is not None and desktop["last_pulse_at"] is not None
-        )
-        address = named_address(text)
-        chosen_url = None
-        if (
-            desktop is not None
-            and desktop_available
-            and counter["used"] < development_tariff.model_requests
-        ):
-            chosen_url = take_login_choice(
-                account_id=opened.account["id"],
-                computer_id=desktop["computer_id"],
-                bot_id=parsed_id,
-                text=text,
-            )
-        if counter["used"] >= development_tariff.model_requests:
-            _insert_message(
-                opened.connection,
-                chat["id"],
-                "error",
-                QUOTA_EXHAUSTED_TEXT,
-                None,
-                follow_at,
-            )
-        elif address is not None and not desktop_available:
-            _insert_message(
-                opened.connection,
-                chat["id"],
-                "error",
-                COMPUTER_UNAVAILABLE_TEXT,
-                None,
-                follow_at,
-            )
-        elif chosen_url is not None:
-            assert desktop is not None
-            enqueue_open(
-                account_id=opened.account["id"],
-                computer_id=desktop["computer_id"],
-                url=chosen_url,
-                bot_id=parsed_id,
-                chat_id=chat["id"],
-                login=text,
-            )
-            follow_at = opened.now
-        elif (
-            desktop is not None
-            and address is None
-            and bot_holds_browser(
-                opened.account["id"], desktop["computer_id"], parsed_id
-            )
-        ):
-            hold_text(opened.account["id"], parsed_id, text)
-            follow_at = opened.now
-        elif address is not None:
-            assert desktop is not None
-            enqueue_open(
-                account_id=opened.account["id"],
-                computer_id=desktop["computer_id"],
-                url=address,
-                bot_id=parsed_id,
-                chat_id=chat["id"],
-            )
-            follow_at = opened.now
-        elif desktop is not None and not desktop_available:
-            _insert_message(
-                opened.connection,
-                chat["id"],
-                "error",
-                COMPUTER_UNAVAILABLE_TEXT,
-                None,
-                follow_at,
-            )
-        else:
-            reply = aggregator.complete(
-                description=bot["description"],
-                scenario=bot["scenario"],
-                messages=_adapter_messages(opened.connection, chat["id"]),
-                desktop_available=desktop_available,
-            )
-            if reply == "":
-                _insert_message(
-                    opened.connection,
-                    chat["id"],
-                    "error",
-                    EMPTY_MODEL_TEXT,
-                    EMPTY_MODEL_CODE,
-                    follow_at,
-                )
-            else:
-                _insert_message(
-                    opened.connection,
-                    chat["id"],
-                    "assistant",
-                    reply,
-                    None,
-                    follow_at,
-                )
-                opened.connection.execute(
-                    quota_charges.insert().values(
-                        id=uuid.uuid4(),
-                        period_id=counter["period_id"],
-                        created_at=opened.now,
-                    )
-                )
-                opened.connection.execute(
-                    quota_counters.update()
-                    .where(quota_counters.c.id == counter["id"])
-                    .values(used=counter["used"] + 1)
-                )
+
+
+@router.post("/api/bots/{bot_id}/chats/{chat_id}/messages")
+async def create_chat_message(
+    request: Request, bot_id: str, chat_id: str
+) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_chat = parse_id(chat_id)
+        if parsed_chat is None:
+            return chat_not_found()
+        chat = _owned_chat(opened.connection, parsed_chat, parsed_id)
+        if chat is None:
+            return chat_not_found()
+        text = await read_message_text(request)
+        if isinstance(text, JSONResponse):
+            return text
+        return _deliver_message(opened, bot, chat, text)
+
+
+@router.delete("/api/bots/{bot_id}/chats/{chat_id}")
+def delete_chat(request: Request, bot_id: str, chat_id: str) -> Response:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_chat = parse_id(chat_id)
+        if parsed_chat is None:
+            return chat_not_found()
+        chat = _owned_chat(opened.connection, parsed_chat, parsed_id)
+        if chat is None:
+            return chat_not_found()
+        if chat["kind"] == MAIN_KIND:
+            return main_chat_kept()
         opened.connection.execute(
-            chats.update()
-            .where(chats.c.id == chat["id"])
-            .values(updated_at=follow_at)
+            messages.delete().where(messages.c.chat_id == chat["id"])
         )
+        opened.connection.execute(chats.delete().where(chats.c.id == chat["id"]))
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return Response(status_code=204)
+
+
+@router.get("/api/bots/{bot_id}/chats")
+def list_chats(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        rows = _bot_chats(opened.connection, parsed_id)
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse({"chats": [chat_document(row) for row in rows]})
+
+
+@router.post("/api/bots/{bot_id}/chats")
+def create_extra_chat(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        chat_id = uuid.uuid4()
+        opened.connection.execute(
+            chats.insert().values(
+                id=chat_id,
+                bot_id=parsed_id,
+                updated_at=opened.now,
+                kind=EXTRA_KIND,
+                created_at=opened.now,
+            )
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        row = _owned_chat(opened.connection, chat_id, parsed_id)
+        assert row is not None
+        return JSONResponse(chat_document(row))
+
+
+@router.get("/api/bots/{bot_id}/chats/{chat_id}/messages")
+def list_chat_messages(request: Request, bot_id: str, chat_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_chat = parse_id(chat_id)
+        if parsed_chat is None:
+            return chat_not_found()
+        chat = _owned_chat(opened.connection, parsed_chat, parsed_id)
+        if chat is None:
+            return chat_not_found()
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))

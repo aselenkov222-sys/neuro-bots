@@ -101,6 +101,11 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
         assert 'id="composer"' in chat
         assert 'data-form="send"' in chat
         assert 'type="text"' in chat
+        assert "Новый чат" in chat
+        assert "Основной чат. Его нельзя удалить." in chat
+        assert "Дополнительный чат. История основного сюда не копируется." in chat
+        assert "Чат пустой. История из основного сюда не копируется." in chat
+        assert 'data-action="delete-chat"' in chat
         for piece in ("рутин", "Рутин", "Проверить сейчас"):
             assert piece not in tariff
             assert piece not in bots

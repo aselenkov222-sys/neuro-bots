@@ -103,6 +103,18 @@ chats = Table(
     Column("id", Uuid(), primary_key=True),
     Column("bot_id", Uuid(), ForeignKey("bots.id"), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column("kind", String(16), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "kind IN ('main', 'extra')",
+        name="chats_kind_check",
+    ),
+    Index(
+        "chats_one_main",
+        "bot_id",
+        unique=True,
+        postgresql_where=text("kind = 'main'"),
+    ),
 )
 
 messages = Table(

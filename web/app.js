@@ -51,7 +51,9 @@ const state = {
   routine: null,
   routineTime: "09:00",
   routineHold: null,
-  messages: []
+  messages: [],
+  chats: [],
+  activeChatId: null
 };
 
 function esc(value) {
@@ -516,16 +518,51 @@ function messageHtml(message, bot) {
   return `<article class="bubble bot">${avatar}<div><p>${text}</p>${link}<p class="meta">${when}</p></div></article>`;
 }
 
+function activeChat() {
+  return state.chats.find((item) => item.id === state.activeChatId) || null;
+}
+
+function chatLabel(chat) {
+  return chat.kind === "main" ? "Основной" : "Дополнительный";
+}
+
+function messagesPath() {
+  const chat = activeChat();
+  if (!state.activeId || !chat) return "";
+  return `/api/bots/${state.activeId}/chats/${chat.id}/messages`;
+}
+
 function chatScreen() {
   const bot = state.card || { name: "", color: "#c85a12", icon: "spark" };
-  const thread = state.messages.map((message) => messageHtml(message, bot)).join("");
+  const chat = activeChat();
+  const extra = chat !== null && chat.kind === "extra";
+  const tabs = state.chats.map((item) => `
+    <button type="button" class="chat-tab ${chat && item.id === chat.id ? "is-on" : ""}" role="tab" data-action="open-chat" data-id="${esc(item.id)}" aria-selected="${chat && item.id === chat.id ? "true" : "false"}">${esc(chatLabel(item))}</button>`).join("");
+  const thread = state.messages.length
+    ? state.messages.map((message) => messageHtml(message, bot)).join("")
+    : extra
+      ? '<p class="empty">Чат пустой. История из основного сюда не копируется.</p>'
+      : "";
+  const meta = !chat
+    ? ""
+    : chat.kind === "main"
+      ? "Основной чат. Его нельзя удалить."
+      : "Дополнительный чат. История основного сюда не копируется.";
   return `
     ${topbar("Чаты", "", logoutControl())}
     ${noticeHtml()}
     <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
       <div class="thread-head">
-        <h2 class="thread-title">${esc(bot.name)}</h2>
-        <a class="btn-quiet" href="#bot">Карточка</a>
+        <div class="thread-titles">
+          <h2 class="thread-title">${esc(bot.name)}</h2>
+          <div class="chat-tabs" role="tablist" aria-label="Чаты этого бота">${tabs}</div>
+          ${meta ? `<p class="meta">${meta}</p>` : ""}
+        </div>
+        <div class="thread-tools">
+          <button type="button" class="btn-quiet" data-action="add-chat">Новый чат</button>
+          ${extra ? '<button type="button" class="btn-quiet" data-action="delete-chat">Удалить чат</button>' : ""}
+          <a class="btn-quiet" href="#bot">Карточка</a>
+        </div>
       </div>
       <div class="messages">${thread}</div>
       <form class="composer" data-form="send">
@@ -704,10 +741,28 @@ async function saveRoutine(body, routineId) {
   render();
 }
 
+async function loadChats() {
+  if (!state.activeId) return false;
+  const result = await api(`/api/bots/${state.activeId}/chats`);
+  if (!result.ok || !result.data || !Array.isArray(result.data.chats)) {
+    note(result);
+    return false;
+  }
+  state.chats = result.data.chats;
+  const selected = state.chats.find((item) => item.id === state.activeChatId);
+  if (!selected) {
+    const main = state.chats.find((item) => item.kind === "main") || state.chats[0];
+    state.activeChatId = main ? main.id : null;
+  }
+  return state.activeChatId !== null;
+}
+
 async function loadMessages() {
   if (!state.activeId) return;
   if (!state.card || state.card.id !== state.activeId) await loadCard();
-  const result = await api(`/api/bots/${state.activeId}/messages`);
+  const ready = await loadChats();
+  if (!ready) return;
+  const result = await api(messagesPath());
   note(result);
   if (result.ok && result.data) state.messages = result.data.messages;
 }
@@ -794,11 +849,42 @@ async function submitCreate() {
   render();
 }
 
+async function deleteChat() {
+  const chat = activeChat();
+  if (!state.activeId || !chat || chat.kind !== "extra") return;
+  const result = await api(`/api/bots/${state.activeId}/chats/${chat.id}`, {
+    method: "DELETE"
+  });
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
+  state.activeChatId = null;
+  state.messages = [];
+  await loadMessages();
+  render();
+}
+
+async function addChat() {
+  if (!state.activeId) return;
+  const result = await api(`/api/bots/${state.activeId}/chats`, { method: "POST" });
+  note(result);
+  if (!result.ok || !result.data || typeof result.data.id !== "string") {
+    render();
+    return;
+  }
+  state.activeChatId = result.data.id;
+  state.messages = [];
+  await loadMessages();
+  render();
+}
+
 async function submitMessage() {
   const input = document.getElementById("composer");
   const text = input.value.trim();
-  if (!text || !state.activeId) return;
-  const result = await api(`/api/bots/${state.activeId}/messages`, {
+  if (!text || !state.activeId || !activeChat()) return;
+  const result = await api(messagesPath(), {
     method: "POST",
     body: { text }
   });
@@ -811,7 +897,7 @@ async function submitMessage() {
   let listed = result;
   while (Date.now() - started <= BROWSER_WAIT_MS) {
     await finishBrowserTask();
-    const next = await api(`/api/bots/${state.activeId}/messages`);
+    const next = await api(messagesPath());
     if (next.ok && next.data) listed = next;
     const messages = listed.data && listed.data.messages;
     if (!messages || !replyPending(messages, text)) break;
@@ -931,7 +1017,24 @@ app.addEventListener("click", (event) => {
     state.routine = null;
     state.routineTime = "09:00";
     state.routineHold = null;
+    state.chats = [];
+    state.activeChatId = null;
+    state.messages = [];
     location.hash = "#bot";
+    return;
+  }
+  if (action === "add-chat") {
+    addChat();
+    return;
+  }
+  if (action === "delete-chat") {
+    deleteChat();
+    return;
+  }
+  if (action === "open-chat") {
+    state.activeChatId = target.dataset.id;
+    state.messages = [];
+    showCurrent();
     return;
   }
   if (action === "save-scenario") {
@@ -956,7 +1059,13 @@ async function answerGate(messageId, answer) {
     body: { answer }
   });
   note(result);
-  if (result.ok && result.data && Array.isArray(result.data.messages)) {
+  if (
+    activeChat() &&
+    activeChat().kind === "main" &&
+    result.ok &&
+    result.data &&
+    Array.isArray(result.data.messages)
+  ) {
     state.messages = result.data.messages;
   }
   render();
@@ -971,6 +1080,7 @@ async function checkNow() {
     render();
     return;
   }
+  state.activeChatId = null;
   if (location.hash !== "#chat") location.hash = "#chat";
   else showCurrent();
 }
@@ -1037,6 +1147,8 @@ async function signOut() {
   state.routineTime = "09:00";
   state.routineHold = null;
   state.messages = [];
+  state.chats = [];
+  state.activeChatId = null;
   if (location.hash !== "#login") location.hash = "#login";
   else render();
 }
@@ -1083,7 +1195,8 @@ window.addEventListener("message", (event) => {
     body: { login: "saved", site: data.site }
   }).then((result) => {
     if (!result.ok || !state.activeId) return null;
-    return api(`/api/bots/${state.activeId}/messages`);
+    if (!activeChat()) return null;
+    return api(messagesPath());
   }).then((listed) => {
     if (!listed || !listed.ok || !listed.data) return;
     state.messages = listed.data.messages;
@@ -1101,6 +1214,8 @@ window.addEventListener("neuro-open-chat", () => {
   const id = window.__neuroOpenChat;
   if (typeof id !== "string" || !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)) return;
   state.activeId = id;
+  state.activeChatId = null;
+  state.chats = [];
   if (location.hash === "#chat") showCurrent();
   else location.hash = "#chat";
 });

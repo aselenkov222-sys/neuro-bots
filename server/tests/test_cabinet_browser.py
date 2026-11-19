@@ -708,3 +708,89 @@ def test_browser_yes_and_no_come_from_the_chat_buttons(database: None) -> None:
             browser.close()
     finally:
         _stop(process, journal)
+
+
+def test_browser_opens_an_empty_extra_chat(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"cabinet-{uuid.uuid4()}@example.com"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/#register")
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Архив")
+            page.click("#save-bot")
+            page.wait_for_selector(".bot-card")
+            page.click(".bot-card")
+            page.wait_for_selector("#scenario")
+            page.fill("#scenario", "один сценарий")
+            page.click("text=Сохранить сценарий")
+            page.wait_for_selector("text=Сценарий сохранён")
+            page.click("text=В чат")
+            page.wait_for_selector("#composer")
+            page.fill("#composer", "история основного")
+            page.click("button[aria-label='Отправить']")
+            page.wait_for_selector(f"text={STUB}")
+            assert page.locator("text=Основной чат. Его нельзя удалить.").count() == 1
+            page.click("text=Новый чат")
+            page.wait_for_selector("text=Чат пустой. История из основного сюда не копируется.")
+            assert page.locator("text=Дополнительный чат. История основного сюда не копируется.").count() == 1
+            assert page.locator(f"text={STUB}").count() == 0
+            assert page.locator("#composer").is_enabled()
+            page.fill("#composer", "разовое поручение")
+            page.click("button[aria-label='Отправить']")
+            page.wait_for_selector("text=разовое поручение")
+            assert page.locator(".bubble").filter(has_text=STUB).count() == 1
+            assert page.locator(".bubble").filter(has_text="история основного").count() == 0
+            assert page.locator("text=Удалить чат").count() == 1
+            page.click("role=tab[name='Основной']")
+            page.wait_for_selector(".bubble:has-text('история основного')")
+            assert page.locator(".bubble").filter(has_text="история основного").count() == 1
+            assert page.locator(".bubble").filter(has_text="разовое поручение").count() == 0
+            assert page.locator("#scenario").count() == 0
+            assert page.locator("text=Удалить чат").count() == 0
+            page.click("role=tab[name='Дополнительный']")
+            page.wait_for_selector("text=Удалить чат")
+            page.click("text=Удалить чат")
+            page.wait_for_selector("text=Основной чат. Его нельзя удалить.")
+            assert page.locator("text=Удалить чат").count() == 0
+            assert page.locator(f"text={STUB}").count() == 1
+            assert page.locator("role=tab").count() == 1
+            browser.close()
+    finally:
+        _stop(process, journal)

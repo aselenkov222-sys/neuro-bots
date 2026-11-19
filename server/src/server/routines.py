@@ -39,6 +39,7 @@ from server.bots import (
     _insert_message,
     _lock_quota_counter,
     _messages_document,
+    main_chat,
     not_found,
     open_confirmed,
     parse_id,
@@ -220,11 +221,7 @@ def _write_chat_error(
     code: str,
     text: str,
 ) -> None:
-    chat = (
-        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
-        .mappings()
-        .one()
-    )
+    chat = main_chat(connection, bot_id)
     connection.execute(
         messages.insert().values(
             id=uuid.uuid4(),
@@ -892,9 +889,7 @@ def _enqueue_lines(
     desktop = find_working_desktop(connection, account_id)
     if desktop is None:
         return
-    chat_id = connection.execute(
-        select(chats.c.id).where(chats.c.bot_id == bot_id)
-    ).scalar_one()
+    chat_id = main_chat(connection, bot_id)["id"]
     for line in lines:
         address = named_address(line)
         if address is None:
@@ -1063,11 +1058,7 @@ def _speak_scenario(
     scenario = bot["scenario"]
     if not isinstance(scenario, str) or scenario_insufficient(scenario):
         return
-    chat = (
-        connection.execute(select(chats).where(chats.c.bot_id == bot_id))
-        .mappings()
-        .one()
-    )
+    chat = main_chat(connection, bot_id)
     counter = _lock_quota_counter(connection, account_id)
     if counter["used"] >= development_tariff.model_requests:
         _insert_message(
@@ -1281,13 +1272,7 @@ def check_now(request: Request, bot_id: str) -> JSONResponse:
             return not_found()
         if scenario_insufficient(bot["scenario"]):
             return _scenario_required()
-        chat = (
-            opened.connection.execute(
-                select(chats).where(chats.c.bot_id == parsed_id)
-            )
-            .mappings()
-            .one()
-        )
+        chat = main_chat(opened.connection, parsed_id)
         queued = (
             _earliest_claimable_run(
                 opened.connection, opened.account["id"], opened.now
@@ -1566,9 +1551,7 @@ def _perform_released(
     desktop = find_working_desktop(connection, account_id)
     address = named_address(step["action"])
     if desktop is not None and address is not None:
-        chat_id = connection.execute(
-            select(chats.c.id).where(chats.c.bot_id == step["bot_id"])
-        ).scalar_one()
+        chat_id = main_chat(connection, step["bot_id"])["id"]
         enqueue_open(
             account_id=account_id,
             computer_id=desktop["computer_id"],
@@ -1727,13 +1710,7 @@ async def post_dangerous_answer(
                     run_id=step["run_id"],
                     check_id=step["check_id"],
                 )
-        chat = (
-            opened.connection.execute(
-                select(chats).where(chats.c.bot_id == parsed_bot)
-            )
-            .mappings()
-            .one()
-        )
+        chat = main_chat(opened.connection, parsed_bot)
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(
             _messages_document(opened.connection, chat["id"])
