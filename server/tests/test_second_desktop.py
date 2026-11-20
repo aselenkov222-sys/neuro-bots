@@ -639,3 +639,60 @@ def test_a_run_without_a_computer_stays_with_the_working_desktop(
         assert _runs(routine.json()["id"])[0]["computer_id"] is None
     finally:
         clear_opens()
+
+
+def test_logout_on_the_second_desktop_leaves_the_working_one_running(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB)
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    email = f"second-logout-{uuid.uuid4()}@example.com"
+    cookie, account_id = _open_account(email)
+    old = uuid.uuid4()
+    new = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = client.post(
+            "/api/bots",
+            json={"name": "Почта", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        assert bot.status_code == 200
+        routine = client.post(
+            f"/api/bots/{bot.json()['id']}/routines",
+            json={"weekdays": [3], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert routine.status_code == 200
+        assert _post_desktop(client, old).json()["working"] is True
+        assert (
+            client.post(
+                f"/api/desktops/{old}/pulse",
+                json={"timezone": "Europe/Moscow"},
+                headers={"Origin": ORIGIN},
+            ).status_code
+            == 200
+        )
+    second_cookie = _login(email)
+    with _client(second_cookie) as client:
+        assert _post_desktop(client, new).json()["working"] is False
+        signed_out = client.post("/api/logout", headers={"Origin": ORIGIN})
+        assert signed_out.status_code == 200
+    stored = {
+        row["computer_id"]: row
+        for row in _rows(desktops)
+        if row["account_id"] == account_id
+    }
+    assert stored[old]["working"] is True
+    assert stored[old]["routines_stopped"] is False
+    assert stored[old]["session_id"] == uuid.UUID(cookie)
+    assert stored[new]["working"] is False
+    claimed = _routine_run(cookie, old)
+    assert claimed.status_code == 200
+    assert claimed.json()["bot_id"] == bot.json()["id"]
+    assert _runs(routine.json()["id"])[0]["status"] == "claimed"
+    assert all(
+        row["code"] != "routine_skipped" for row in _bot_messages(bot.json()["id"])
+    )
+    with _client(cookie) as client:
+        still = client.get("/api/me")
+    assert still.status_code == 200
