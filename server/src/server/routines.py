@@ -14,6 +14,7 @@ from sqlalchemy.engine import Connection, RowMapping
 import server.aggregator as aggregator
 from server.accounts import format_utc, touch_session, utc_now
 from server.browser_action import _same_host, enqueue_open, named_address
+from server.chief import report_routine
 from server.dangerous import (
     first_gate,
     not_done_text,
@@ -246,6 +247,7 @@ def _write_chat_error(
 def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
     _write_chat_error(connection, bot_id, now, SKIP_CODE, SKIP_TEXT)
     record_notice(connection, bot_id, SKIPPED, now)
+    report_routine(connection, bot_id, SKIPPED, now)
 
 
 def queue_text(name: str) -> str:
@@ -1157,6 +1159,8 @@ def _maybe_wait(
             .values(status="awaiting")
         )
     record_notice(connection, bot_id, WAITING, now)
+    if run_id is not None:
+        report_routine(connection, bot_id, WAITING, now)
     return True
 
 
@@ -1217,6 +1221,7 @@ def _continue_after(
         bot_id,
         now,
         desktop_available=True,
+        routine_run=run_id is not None,
     )
 
 
@@ -1252,6 +1257,7 @@ def _complete_claimed_run(
         bot_id,
         now,
         desktop_available=True,
+        routine_run=True,
     )
 
 
@@ -1262,6 +1268,7 @@ def _speak_scenario(
     now: datetime,
     *,
     desktop_available: bool,
+    routine_run: bool = False,
 ) -> None:
     bot = (
         connection.execute(select(bots).where(bots.c.id == bot_id))
@@ -1324,6 +1331,8 @@ def _speak_scenario(
                 created_at=now,
             )
         record_notice(connection, bot_id, COMPLETED, now)
+        if routine_run:
+            report_routine(connection, bot_id, COMPLETED, now)
         connection.execute(
             quota_charges.insert().values(
                 id=uuid.uuid4(),
