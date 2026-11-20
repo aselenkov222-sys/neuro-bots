@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +26,13 @@ from server.accounts import (
 from server.app import app
 from server.auth import begin
 from server.browser_action import enqueue_open, finish_open
+from server.config import (
+    configured_tariff_name,
+    configured_tariff_price,
+    development_tariff,
+    payment_required,
+)
+from server.confirmation import issue_confirmation_link
 from server.db import create_db_engine
 from server.models import (
     accounts,
@@ -492,6 +500,44 @@ def test_payment_refuses_a_missing_origin_session_confirmation_or_price(
             "name": name if name else None,
             "price": price if price else None,
         }
+
+
+def test_absent_name_and_price_confirm_a_development_period(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    field_names = {field.name for field in fields(development_tariff)}
+    assert development_tariff.model_requests == 500
+    assert development_tariff.routines == 5
+    assert field_names == {"model_requests", "routines"}
+    moment = datetime(2026, 11, 16, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr("server.auth.utc_now", lambda: moment)
+    for name, price in ((None, None), ("", "")):
+        _price_env(monkeypatch, name, price)
+        assert configured_tariff_name() is None
+        assert configured_tariff_price() is None
+        assert payment_required() is False
+        email = f"pay-dev-{uuid.uuid4()}@example.com"
+        account_id, cookie = _open_account(email, None)
+        with begin() as connection:
+            token = issue_confirmation_link(connection, account_id)
+        with _client(cookie) as client:
+            confirmed = client.get("/api/confirm-email", params={"token": token})
+            me = client.get("/api/me")
+            refused = _pay(client, {})
+        assert confirmed.status_code == 200
+        assert confirmed.json()["email_confirmed"] is True
+        stored = _periods(account_id)
+        assert len(stored) == 1
+        assert stored[0]["active"] is True
+        assert stored[0]["started_at"] == moment
+        assert stored[0]["ends_at"] == calendar_month_end(moment)
+        assert _used(stored[0]["id"]) == 0
+        assert me.status_code == 200
+        assert me.json()["tariff"] == {"name": None, "price": None}
+        assert me.json()["quota_counter"] == 0
+        assert refused.status_code == 400
+        assert refused.json() == PRICE_UNSET
+        assert _periods(account_id) == stored
 
 
 def _refuse_aggregator(monkeypatch: pytest.MonkeyPatch) -> None:
