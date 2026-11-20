@@ -416,14 +416,26 @@ def confirm_email(request: Request) -> Response:
         current = current_account(connection, request, now)
         if token is None:
             account_id = None
+            awaits_payment = False
         else:
             account_id = apply_confirmation(connection, token, now)
+            awaits_payment = (
+                account_id is not None
+                and payment_required()
+                and find_stored_period(connection, account_id) is None
+            )
     if account_id is not None:
         same_account = current is not None and current[1]["id"] == account_id
+        if same_account and awaits_payment:
+            destination = "tariff"
+        elif same_account:
+            destination = "bots"
+        else:
+            destination = "login"
         return JSONResponse(
             {
                 "email_confirmed": True,
-                "destination": "bots" if same_account else "login",
+                "destination": destination,
             }
         )
     return JSONResponse(

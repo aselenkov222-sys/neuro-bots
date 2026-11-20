@@ -178,6 +178,27 @@ def _used(period_id: uuid.UUID) -> int:
     return used
 
 
+def _counters(account_id: uuid.UUID) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(quota_counters)
+                    .join(
+                        subscription_periods,
+                        subscription_periods.c.id == quota_counters.c.period_id,
+                    )
+                    .where(subscription_periods.c.account_id == account_id)
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
 def _clear_periods(account_id: uuid.UUID) -> None:
     engine = create_db_engine()
     try:
@@ -538,6 +559,88 @@ def test_absent_name_and_price_confirm_a_development_period(
         assert refused.status_code == 400
         assert refused.json() == PRICE_UNSET
         assert _periods(account_id) == stored
+
+
+def test_priced_confirmation_leaves_the_period_to_payment(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _price_env(monkeypatch, TARIFF_NAME, TARIFF_PRICE)
+    moment = datetime(2026, 11, 16, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr("server.auth.utc_now", lambda: moment)
+    monkeypatch.setattr("server.payment.utc_now", lambda: moment)
+    email = f"pay-confirm-{uuid.uuid4()}@example.com"
+    account_id, cookie = _open_account(email, None)
+    with begin() as connection:
+        token = issue_confirmation_link(connection, account_id)
+    with _client(cookie) as client:
+        confirmed = client.get("/api/confirm-email", params={"token": token})
+        me = client.get("/api/me")
+    assert confirmed.status_code == 200
+    assert confirmed.json() == {"email_confirmed": True, "destination": "tariff"}
+    assert me.status_code == 200
+    assert me.json()["email_confirmed"] is True
+    assert me.json()["period"] is None
+    assert _periods(account_id) == []
+    assert _counters(account_id) == []
+    with _client(cookie) as client:
+        paid = _pay(client, {})
+    assert paid.status_code == 200
+    stored = _periods(account_id)
+    assert len(stored) == 1
+    assert stored[0]["active"] is True
+    assert stored[0]["started_at"] == moment
+    assert stored[0]["ends_at"] == calendar_month_end(moment)
+    assert _used(stored[0]["id"]) == 0
+    assert len(_counters(account_id)) == 1
+    assert paid.json()["period"] == {
+        "started_at": format_utc(moment),
+        "ends_at": format_utc(calendar_month_end(moment)),
+        "active": True,
+    }
+    assert paid.json()["quota_counter"] == 0
+    stranger = f"pay-confirm-anon-{uuid.uuid4()}@example.com"
+    stranger_id, _cookie = _open_account(stranger, None)
+    with begin() as connection:
+        stranger_token = issue_confirmation_link(connection, stranger_id)
+    with _client() as anonymous:
+        opened = anonymous.get(
+            "/api/confirm-email", params={"token": stranger_token}
+        )
+    assert opened.status_code == 200
+    assert opened.json() == {"email_confirmed": True, "destination": "login"}
+    assert _periods(stranger_id) == []
+    assert _counters(stranger_id) == []
+
+
+def test_one_tariff_value_still_confirms_a_development_period(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    moment = datetime(2026, 11, 16, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr("server.auth.utc_now", lambda: moment)
+    cases = (
+        (TARIFF_NAME, None),
+        (TARIFF_NAME, ""),
+        (None, TARIFF_PRICE),
+        ("", TARIFF_PRICE),
+    )
+    for name, price in cases:
+        _price_env(monkeypatch, name, price)
+        assert payment_required() is False
+        email = f"pay-half-{uuid.uuid4()}@example.com"
+        account_id, cookie = _open_account(email, None)
+        with begin() as connection:
+            token = issue_confirmation_link(connection, account_id)
+        with _client(cookie) as client:
+            confirmed = client.get("/api/confirm-email", params={"token": token})
+        assert confirmed.status_code == 200
+        assert confirmed.json() == {"email_confirmed": True, "destination": "bots"}
+        stored = _periods(account_id)
+        assert len(stored) == 1
+        assert stored[0]["active"] is True
+        assert stored[0]["started_at"] == moment
+        assert stored[0]["ends_at"] == calendar_month_end(moment)
+        assert _used(stored[0]["id"]) == 0
+        assert len(_counters(account_id)) == 1
 
 
 def _refuse_aggregator(monkeypatch: pytest.MonkeyPatch) -> None:
