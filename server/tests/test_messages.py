@@ -242,13 +242,14 @@ def test_adapter_receives_the_chat_and_not_the_model_name(
     cookie, _account_id = _open_ready("adapter-call@example.com")
     seen: list[dict] = []
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool, page_text: str) -> str:
         seen.append(
             {
                 "description": description,
                 "scenario": scenario,
                 "messages": messages,
                 "desktop_available": desktop_available,
+                "page_text": page_text,
             }
         )
         return "ответ"
@@ -268,10 +269,12 @@ def test_adapter_receives_the_chat_and_not_the_model_name(
         "scenario",
         "messages",
         "desktop_available",
+        "page_text",
     }
     assert seen[0]["description"] == "описание"
     assert seen[0]["scenario"] == ""
     assert seen[0]["desktop_available"] is False
+    assert seen[0]["page_text"] == ""
     assert seen[0]["messages"] == [{"role": "user", "text": "первый"}]
     assert "hidden-model" not in str(seen[0])
     assert posted.json()["messages"][1]["text"] == "ответ"
@@ -285,7 +288,7 @@ def test_turn_after_an_error_skips_that_error(
     replies = iter(["первый ответ", "", "третий"])
     seen: list[list[dict[str, str]]] = []
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool, page_text: str) -> str:
         seen.append(messages)
         return next(replies)
 
@@ -324,7 +327,7 @@ def test_empty_adapter_text_does_not_charge(
 ) -> None:
     cookie, account_id = _open_ready("empty-adapter@example.com")
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool, page_text: str) -> str:
         return ""
 
     monkeypatch.setattr("server.aggregator.complete", complete)
@@ -354,7 +357,7 @@ def test_exhausted_quota_saves_the_user_and_skips_the_adapter(
     _set_used(account_id, development_tariff.model_requests)
     called = False
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool, page_text: str) -> str:
         nonlocal called
         called = True
         return "не должен"
@@ -381,7 +384,7 @@ def test_invalid_message_writes_nothing_and_skips_the_adapter(
 ) -> None:
     cookie, account_id = _open_ready("invalid-message@example.com")
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool, page_text: str) -> str:
         raise AssertionError("adapter was called")
 
     monkeypatch.setattr("server.aggregator.complete", complete)
@@ -423,13 +426,14 @@ def test_silent_working_desktop_tells_the_chat_and_a_pulse_opens_the_adapter(
     cookie, account_id = _open_ready("silent-desktop@example.com")
     seen: list[dict] = []
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool, page_text: str) -> str:
         seen.append(
             {
                 "description": description,
                 "scenario": scenario,
                 "messages": messages,
                 "desktop_available": desktop_available,
+                "page_text": page_text,
             }
         )
         return "ответ"
@@ -492,6 +496,7 @@ def test_silent_working_desktop_tells_the_chat_and_a_pulse_opens_the_adapter(
                 {"role": "user", "text": "теперь"},
             ],
             "desktop_available": True,
+            "page_text": "",
         }
     ]
     assert opened.json()["messages"][-1]["role"] == "assistant"

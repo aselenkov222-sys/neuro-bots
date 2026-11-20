@@ -197,6 +197,7 @@ def test_xlsx_from_the_adapter_lands_in_the_bot_library(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         seen.append(messages)
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
@@ -261,6 +262,7 @@ def test_xlsx_asked_in_an_extra_chat_stays_there(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> str | CompleteResult:
         if messages[-1]["text"] == "разовое":
             return CompleteResult("файл дополнительного", (XLSX_NAME, XLSX_BYTES))
@@ -351,6 +353,7 @@ def test_empty_text_with_xlsx_does_not_charge_or_store(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult("", (XLSX_NAME, XLSX_BYTES))
 
@@ -390,6 +393,7 @@ def test_a_name_that_is_not_xlsx_stores_text_only(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult("Готовый текст.", ("письма.csv", XLSX_BYTES))
 
@@ -429,6 +433,7 @@ def test_analysis_comes_back_as_text_without_a_file(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> str:
         return reply
 
@@ -467,6 +472,7 @@ def test_translation_comes_back_as_text_without_a_file(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> str:
         return reply
 
@@ -521,6 +527,7 @@ def test_user_opens_the_stored_xlsx(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         if messages[-1]["text"] == "ещё таблица":
             return CompleteResult("Второй лист.", (SECOND_NAME, SECOND_BYTES))
@@ -583,6 +590,7 @@ def test_user_deletes_the_file_and_the_chat_text_stays(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
 
@@ -649,6 +657,7 @@ def test_a_later_reply_does_not_delete_the_file(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> str | CompleteResult:
         calls.append(messages[-1]["text"])
         if messages[-1]["text"] == "собери таблицу":
@@ -705,6 +714,7 @@ def test_another_account_cannot_open_or_delete_the_file(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
 
@@ -754,6 +764,7 @@ def test_delete_without_origin_keeps_the_file(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
 
@@ -812,6 +823,7 @@ def test_another_login_downloads_the_same_xlsx_and_the_vault_stays_clear(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
 
@@ -924,6 +936,7 @@ def test_deleting_an_extra_chat_keeps_its_xlsx(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> str | CompleteResult:
         if messages[-1]["text"] == "таблица в дополнительном":
             return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
@@ -994,6 +1007,7 @@ def test_refusing_to_delete_the_main_chat_keeps_the_xlsx(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
 
@@ -1041,6 +1055,7 @@ def test_deleting_the_bot_removes_its_library_and_leaves_the_other(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         if messages[-1]["text"] == "вторая таблица":
             return CompleteResult("Второй лист.", (SECOND_NAME, SECOND_BYTES))
@@ -1121,6 +1136,7 @@ def test_another_account_and_a_missing_origin_cannot_delete_the_bot(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> CompleteResult:
         return CompleteResult(REPLY, (XLSX_NAME, XLSX_BYTES))
 

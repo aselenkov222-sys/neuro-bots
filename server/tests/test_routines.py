@@ -2434,6 +2434,7 @@ def test_check_now_runs_the_scenario_and_spends_quota(
             "scenario": "сценарий проверки",
             "messages": [],
             "desktop_available": False,
+            "page_text": "",
         }
     ]
     assert _used(account_id) == 1

@@ -346,64 +346,102 @@ def test_page_text_is_not_stored_and_errors_stay_out_of_the_adapter(
     computer = uuid.uuid4()
     seen: list[dict] = []
 
-    def complete(*, description: str, scenario: str, messages: list, desktop_available: bool) -> str:
+    def complete(
+        *,
+        description: str,
+        scenario: str,
+        messages: list,
+        desktop_available: bool,
+        page_text: str,
+    ) -> str:
         seen.append(
             {
                 "description": description,
                 "scenario": scenario,
                 "messages": messages,
                 "desktop_available": desktop_available,
+                "page_text": page_text,
             }
         )
         return "ответ"
 
     monkeypatch.setattr("server.aggregator.complete", complete)
-    with _client(cookie) as client:
-        _claim(client, computer)
-        bot = _bot(client)
-        blocked = _post_message(client, bot["id"], f"сначала {ADDRESS}")
-        assert blocked.json()["messages"][-1]["text"] == COMPUTER_UNAVAILABLE
-        _pulse(client, computer)
-        posted = _post_message(client, bot["id"], f"теперь {ADDRESS}")
-        assert posted.json()["messages"][-1]["role"] == "user"
-        task = client.get(f"/api/desktops/{computer}/browser-task")
-        assert task.json() == {"url": ADDRESS}
-        finished = client.post(
-            f"/api/desktops/{computer}/browser-task",
-            json={"text": PAGE},
-            headers={"Origin": ORIGIN},
-        )
-        assert finished.status_code == 200
-        assert finished.json()["messages"][-1] == {
-            **finished.json()["messages"][-1],
-            "role": "assistant",
-            "text": "ответ",
-            "code": None,
-        }
-    assert seen == [
-        {
-            "description": "описание",
-            "scenario": "сценарий",
-            "messages": [
-                {"role": "user", "text": f"сначала {ADDRESS}"},
-                {"role": "user", "text": f"теперь {ADDRESS}"},
-            ],
-            "desktop_available": True,
-        }
+    grab = _Grab()
+    loggers = [
+        logging.getLogger(name)
+        for name in ("", "uvicorn", "uvicorn.access", "uvicorn.error", "server")
     ]
-    assert PAGE not in str(seen)
+    for logger in loggers:
+        logger.addHandler(grab)
+    try:
+        with _client(cookie) as client:
+            _claim(client, computer)
+            bot = _bot(client)
+            blocked = _post_message(client, bot["id"], f"сначала {ADDRESS}")
+            assert blocked.json()["messages"][-1]["text"] == COMPUTER_UNAVAILABLE
+            _pulse(client, computer)
+            posted = _post_message(client, bot["id"], f"теперь {ADDRESS}")
+            assert posted.json()["messages"][-1]["role"] == "user"
+            task = client.get(f"/api/desktops/{computer}/browser-task")
+            assert task.json() == {"url": ADDRESS}
+            finished = client.post(
+                f"/api/desktops/{computer}/browser-task",
+                json={"text": PAGE},
+                headers={"Origin": ORIGIN},
+            )
+            assert finished.status_code == 200
+            assert finished.json()["messages"][-1] == {
+                **finished.json()["messages"][-1],
+                "role": "assistant",
+                "text": "ответ",
+                "code": None,
+            }
+            assert seen == [
+                {
+                    "description": "описание",
+                    "scenario": "сценарий",
+                    "messages": [
+                        {"role": "user", "text": f"сначала {ADDRESS}"},
+                        {"role": "user", "text": f"теперь {ADDRESS}"},
+                    ],
+                    "desktop_available": True,
+                    "page_text": PAGE,
+                }
+            ]
+            assert seen[0]["page_text"] == PAGE
+            assert _quota(account_id)[0]["used"] == 1
+            follow = _post_message(client, bot["id"], "что дальше")
+            assert follow.status_code == 200
+            assert follow.json()["messages"][-1]["role"] == "assistant"
+            assert follow.json()["messages"][-1]["text"] == "ответ"
+    finally:
+        for logger in loggers:
+            logger.removeHandler(grab)
+    assert seen[1] == {
+        "description": "описание",
+        "scenario": "сценарий",
+        "messages": [
+            {"role": "user", "text": f"сначала {ADDRESS}"},
+            {"role": "user", "text": f"теперь {ADDRESS}"},
+            {"role": "assistant", "text": "ответ"},
+            {"role": "user", "text": "что дальше"},
+        ],
+        "desktop_available": True,
+        "page_text": "",
+    }
     assert COMPUTER_UNAVAILABLE not in str(seen)
     assert "error" not in str(seen)
     stored = _database_text()
     assert PAGE not in stored
+    journal = "\n".join(grab.lines)
+    assert PAGE not in journal
     chat_id = [row for row in _rows(chats) if row["bot_id"] == uuid.UUID(bot["id"])][0]["id"]
     roles = [
         row["role"]
         for row in _rows(messages)
         if row["chat_id"] == chat_id
     ]
-    assert roles == ["user", "error", "user", "assistant"]
-    assert _quota(account_id)[0]["used"] == 1
+    assert roles == ["user", "error", "user", "assistant", "user", "assistant"]
 
 
 def test_empty_stub_does_not_charge(database: None, monkeypatch: pytest.MonkeyPatch) -> None:

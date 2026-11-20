@@ -1416,6 +1416,7 @@ def _speak_scenario(
         scenario=scenario,
         messages=_adapter_messages(connection, chat["id"]),
         desktop_available=desktop_available,
+        page_text="",
     )
     text, xlsx = aggregator.split_reply(reply)
     if text == "":

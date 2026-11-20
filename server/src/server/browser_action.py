@@ -473,6 +473,7 @@ def finish_open(
                 scenario=bot["scenario"],
                 messages=_adapter_messages(connection, pending.chat_id),
                 desktop_available=_pulse_live(connection, account_id),
+                page_text=page_text,
             )
             text, xlsx = aggregator.split_reply(reply)
             if text == "":
@@ -591,6 +592,7 @@ def _answer_held(
                 scenario=bot["scenario"],
                 messages=_adapter_messages(connection, chat_id),
                 desktop_available=_pulse_live(connection, account_id),
+                page_text="",
             )
             text, xlsx = aggregator.split_reply(reply)
             if text == "":
