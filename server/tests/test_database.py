@@ -194,8 +194,9 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert ("c2d8f4a91e73", "e7a1c4b82d60") in chain
     assert ("d9b4e2a71c58", "c2d8f4a91e73") in chain
     assert ("e2b7c4a91f06", "d9b4e2a71c58") in chain
-    assert chain[-1] == ("e2b7c4a91f06", "d9b4e2a71c58")
-    assert chain[-1][1] == "d9b4e2a71c58"
+    assert ("a9c3e7b14d82", "e2b7c4a91f06") in chain
+    assert chain[-1] == ("a9c3e7b14d82", "e2b7c4a91f06")
+    assert chain[-1][1] == "e2b7c4a91f06"
     assert chain[-1][0] != "d9b4e2a71c58"
     assert chain[-1][0] != "c2d8f4a91e73"
     assert chain[-1][0] != "e7a1c4b82d60"
@@ -213,6 +214,7 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert chain[-1][0] != "78372be7d547"
     assert chain[-1][0] != "c54ff0c6fb42"
     assert chain[-1][0] != "048ee727aa3e"
+    assert chain[-1][0] != "e2b7c4a91f06"
     assert chain[-1][0] != "ff582d8bc7fb"
 
 
@@ -262,8 +264,9 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert ("c2d8f4a91e73", "e7a1c4b82d60") in chain
         assert ("d9b4e2a71c58", "c2d8f4a91e73") in chain
         assert ("e2b7c4a91f06", "d9b4e2a71c58") in chain
-        assert chain[-1] == ("e2b7c4a91f06", "d9b4e2a71c58")
-        assert chain[-1][1] == "d9b4e2a71c58"
+        assert ("a9c3e7b14d82", "e2b7c4a91f06") in chain
+        assert chain[-1] == ("a9c3e7b14d82", "e2b7c4a91f06")
+        assert chain[-1][1] == "e2b7c4a91f06"
         assert chain[-1][0] != "d9b4e2a71c58"
         assert chain[-1][0] != "c2d8f4a91e73"
         assert chain[-1][0] != "e7a1c4b82d60"
@@ -281,6 +284,7 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert chain[-1][0] != "78372be7d547"
         assert chain[-1][0] != "c54ff0c6fb42"
         assert chain[-1][0] != "048ee727aa3e"
+        assert chain[-1][0] != "e2b7c4a91f06"
         assert chain[-1][0] != "ff582d8bc7fb"
         assert "Running upgrade" in upgrade.stderr + upgrade.stdout
 
