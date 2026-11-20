@@ -18,6 +18,10 @@ def configured_mail_sink() -> str | None:
     return configured
 
 
+def stand_configured() -> bool:
+    return os.environ.get("NEURO_BOTS_STAND") == "1"
+
+
 def configured_tariff_name() -> str | None:
     configured = os.environ.get("NEURO_BOTS_TARIFF_NAME")
     if configured is None or configured == "":

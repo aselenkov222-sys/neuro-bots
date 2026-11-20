@@ -36,6 +36,7 @@ from server.config import (
     configured_tariff_price,
     development_tariff,
     payment_required,
+    stand_configured,
 )
 from server.confirmation import (
     apply_confirmation,
@@ -195,15 +196,29 @@ def opened_session(
             at,
         )
     )
+    _write_session_cookie(response, session_id)
+    return response
+
+
+def _write_session_cookie(response: JSONResponse, session_id: object) -> None:
     response.set_cookie(
         key="session",
         value=str(session_id),
         path="/",
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=stand_configured(),
     )
-    return response
+
+
+def _clear_session_cookie(response: JSONResponse) -> None:
+    response.delete_cookie(
+        key="session",
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=stand_configured(),
+    )
 
 
 @contextmanager
@@ -516,13 +531,7 @@ async def delete_me(request: Request) -> JSONResponse:
 
     forget_account(removed)
     response = JSONResponse({})
-    response.delete_cookie(
-        key="session",
-        path="/",
-        httponly=True,
-        samesite="lax",
-        secure=False,
-    )
+    _clear_session_cookie(response)
     return response
 
 
@@ -547,11 +556,5 @@ def logout(request: Request) -> JSONResponse:
     if not removed:
         return unauthenticated()
     response = JSONResponse({})
-    response.delete_cookie(
-        key="session",
-        path="/",
-        httponly=True,
-        samesite="lax",
-        secure=False,
-    )
+    _clear_session_cookie(response)
     return response
