@@ -317,6 +317,7 @@ def test_one_off_reply_stays_in_the_extra_chat(
         scenario: str,
         messages: list,
         desktop_available: bool,
+        page_text: str,
     ) -> str:
         seen.append(
             {

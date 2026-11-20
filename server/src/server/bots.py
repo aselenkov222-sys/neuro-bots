@@ -772,6 +772,7 @@ def _deliver_message(
             scenario=bot["scenario"],
             messages=_adapter_messages(opened.connection, chat["id"]),
             desktop_available=desktop_available,
+            page_text="",
         )
         reply_text, xlsx = aggregator.split_reply(reply)
         if reply_text == "":

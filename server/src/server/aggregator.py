@@ -12,6 +12,7 @@ def complete(
     scenario: str,
     messages: list[dict[str, str]],
     desktop_available: bool,
+    page_text: str,
 ) -> str:
     return "Сейчас я на заглушке агрегатора и не вызываю модель."
 
