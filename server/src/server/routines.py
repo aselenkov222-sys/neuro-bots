@@ -174,14 +174,28 @@ def routine_may_start(row: Mapping[str, object], stopped: bool) -> bool:
     return starts_when_due(row) and not stopped
 
 
-def period_is_active(connection: Connection, account_id: uuid.UUID) -> bool:
-    period = connection.execute(
-        select(subscription_periods.c.id).where(
-            subscription_periods.c.account_id == account_id,
-            subscription_periods.c.active.is_(True),
+def period_is_active(
+    connection: Connection, account_id: uuid.UUID, now: datetime
+) -> bool:
+    period = (
+        connection.execute(
+            select(
+                subscription_periods.c.active,
+                subscription_periods.c.ends_at,
+            )
+            .where(subscription_periods.c.account_id == account_id)
+            .order_by(
+                subscription_periods.c.started_at.desc(),
+                subscription_periods.c.id.desc(),
+            )
+            .limit(1)
         )
-    ).first()
-    return period is not None
+        .mappings()
+        .first()
+    )
+    if period is None:
+        return False
+    return period["active"] is True and now < period["ends_at"]
 
 
 def _aware(moment: datetime) -> datetime:
@@ -736,7 +750,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
         account_id = row["account_id"]
         allowed = routine_may_start(
             row, working_routines_stopped(connection, account_id)
-        ) and period_is_active(connection, account_id)
+        ) and period_is_active(connection, account_id, moment)
         zone, claimable = _schedule_desktop(connection, account_id, moment)
         if zone is None:
             continue

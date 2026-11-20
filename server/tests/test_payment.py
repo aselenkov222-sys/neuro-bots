@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -22,13 +22,24 @@ from server.accounts import (
     format_utc,
 )
 from server.app import app
+from server.auth import begin
 from server.db import create_db_engine
-from server.models import accounts, quota_counters, subscription_periods
+from server.models import (
+    accounts,
+    chats,
+    messages,
+    quota_counters,
+    routine_runs,
+    subscription_periods,
+)
+from server.payment import record_cancellation, record_renewal_failed
+from server.routines import settle_due
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
 ORIGIN = "http://testserver"
 ACCEPTED = "abcdef1!"
+DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
 TARIFF_NAME = "Месяц"
 TARIFF_PRICE = "900 ₽"
 CONFIRMED_AT = datetime(2026, 11, 16, tzinfo=timezone.utc)
@@ -476,6 +487,311 @@ def test_payment_refuses_a_missing_origin_session_confirmation_or_price(
             "name": name if name else None,
             "price": price if price else None,
         }
+
+
+def _refuse_aggregator(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_complete(*args: object, **kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", fail_complete)
+
+
+def _settle(moment: datetime) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            settle_due(connection, moment)
+    finally:
+        engine.dispose()
+
+
+def _runs_for(routine_id: str) -> list[dict]:
+    parsed = uuid.UUID(routine_id)
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(routine_runs).where(routine_runs.c.routine_id == parsed)
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
+def _chat_messages(bot_id: uuid.UUID) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            chat_ids = (
+                connection.execute(
+                    select(chats.c.id).where(chats.c.bot_id == bot_id)
+                )
+                .scalars()
+                .all()
+            )
+            rows = (
+                connection.execute(
+                    select(messages).where(messages.c.chat_id.in_(chat_ids))
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
+def _prepare_due_routine(
+    email: str,
+) -> tuple[str, uuid.UUID, uuid.UUID, dict, dict]:
+    started = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    account_id, cookie = _open_account(email, started)
+    _insert_open_period(account_id, started, calendar_month_end(started))
+    computer = uuid.uuid4()
+    with _client(cookie) as client:
+        created_bot = client.post(
+            "/api/bots",
+            json={"name": "Искра", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created_bot.status_code == 200
+        bot = created_bot.json()
+        created = client.post(
+            f"/api/bots/{bot['id']}/routines",
+            json={"weekdays": [1, 3, 5], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+        posted = client.post(
+            "/api/desktops",
+            json={"id": str(computer)},
+            headers={"Origin": ORIGIN},
+        )
+        assert posted.status_code == 200
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    return cookie, account_id, computer, bot, created.json()
+
+
+def _pulse_at(
+    cookie: str,
+    computer: uuid.UUID,
+    moment: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("server.desktops.utc_now", lambda: moment)
+    with _client(cookie) as client:
+        pulsed = client.post(
+            f"/api/desktops/{computer}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+
+
+def _set_ends_at(account_id: uuid.UUID, ends_at: datetime) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                subscription_periods.update()
+                .where(subscription_periods.c.account_id == account_id)
+                .values(ends_at=ends_at)
+            )
+    finally:
+        engine.dispose()
+
+
+def _insert_open_period(
+    account_id: uuid.UUID, started_at: datetime, ends_at: datetime
+) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            period_id = uuid.uuid4()
+            connection.execute(
+                subscription_periods.insert().values(
+                    id=period_id,
+                    account_id=account_id,
+                    started_at=started_at,
+                    ends_at=ends_at,
+                    active=True,
+                )
+            )
+            connection.execute(
+                quota_counters.insert().values(
+                    id=uuid.uuid4(),
+                    period_id=period_id,
+                    used=0,
+                )
+            )
+    finally:
+        engine.dispose()
+
+
+def test_cancellation_before_the_end_keeps_the_period_and_opens_the_minute(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        f"cancel-open-{uuid.uuid4()}@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    stored = _periods(account_id)
+    assert len(stored) == 1
+    ends_at = stored[0]["ends_at"]
+    assert DUE < ends_at
+    with begin() as connection:
+        record_cancellation(connection, account_id, DUE)
+    kept = _periods(account_id)
+    assert len(kept) == 1
+    assert kept[0]["active"] is True
+    assert kept[0]["ends_at"] == ends_at
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    assert opened[0]["due_at"] == DUE
+    assert _chat_messages(bot_id) == []
+
+
+def test_settling_at_the_period_end_does_not_open_while_the_flag_stays_true(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        f"cancel-end-{uuid.uuid4()}@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_ends_at(account_id, DUE)
+    with begin() as connection:
+        record_cancellation(connection, account_id, DUE - timedelta(seconds=1))
+    kept = _periods(account_id)
+    assert len(kept) == 1
+    assert kept[0]["active"] is True
+    assert kept[0]["ends_at"] == DUE
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert len(runs) == 1
+    assert runs[0]["status"] != "pending"
+    assert runs[0]["due_at"] == DUE
+    assert _chat_messages(bot_id) == []
+    assert _periods(account_id)[0]["active"] is True
+    with begin() as connection:
+        record_cancellation(connection, account_id, DUE)
+    closed = _periods(account_id)
+    assert len(closed) == 1
+    assert closed[0]["active"] is False
+    assert closed[0]["ends_at"] == DUE
+
+
+def test_failed_renewal_before_the_end_still_opens_the_minute(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        f"renew-open-{uuid.uuid4()}@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    ends_at = _periods(account_id)[0]["ends_at"]
+    assert DUE < ends_at
+    with begin() as connection:
+        record_renewal_failed(connection, account_id, DUE)
+    kept = _periods(account_id)
+    assert len(kept) == 1
+    assert kept[0]["active"] is True
+    assert kept[0]["ends_at"] == ends_at
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "pending"
+    assert opened[0]["due_at"] == DUE
+    assert _chat_messages(bot_id) == []
+
+
+def test_failed_renewal_at_the_end_does_not_start_the_routine(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[object] = []
+
+    def spy(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "called"
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    cookie, account_id, computer, bot, created = _prepare_due_routine(
+        f"renew-end-{uuid.uuid4()}@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_ends_at(account_id, DUE)
+    with begin() as connection:
+        record_renewal_failed(connection, account_id, DUE)
+    closed = _periods(account_id)
+    assert len(closed) == 1
+    assert closed[0]["active"] is False
+    assert closed[0]["ends_at"] == DUE
+    _pulse_at(cookie, computer, DUE, monkeypatch)
+    _settle(DUE)
+    runs = _runs_for(created["id"])
+    assert runs
+    assert all(row["status"] != "pending" for row in runs)
+    assert calls == []
+    assert _chat_messages(bot_id) == []
+
+
+def test_missing_period_is_left_alone_by_cancellation_and_failed_renewal(
+    database: None,
+) -> None:
+    email = f"pay-empty-{uuid.uuid4()}@example.com"
+    account_id, _cookie = _open_account(email, CONFIRMED_AT)
+    with begin() as connection:
+        record_cancellation(connection, account_id, DUE)
+        record_renewal_failed(connection, account_id, DUE)
+    assert _periods(account_id) == []
+
+
+def test_me_reports_inactive_at_the_period_end_without_writing_the_flag(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    email = f"pay-read-{uuid.uuid4()}@example.com"
+    started = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    ends_at = calendar_month_end(started)
+    account_id, cookie = _open_account(email, started)
+    _insert_open_period(account_id, started, ends_at)
+    monkeypatch.setattr("server.auth.utc_now", lambda: ends_at)
+    with _client(cookie) as client:
+        at_end = client.get("/api/me")
+        logged_in = client.post(
+            "/api/login",
+            json={"email": email, "password": ACCEPTED},
+            headers={"Origin": ORIGIN},
+        )
+    assert at_end.status_code == 200
+    assert at_end.json()["period"]["active"] is False
+    assert at_end.json()["period"]["ends_at"] == format_utc(ends_at)
+    assert logged_in.status_code == 200
+    assert logged_in.json()["period"]["active"] is False
+    assert _periods(account_id)[0]["active"] is True
+    monkeypatch.setattr(
+        "server.auth.utc_now", lambda: ends_at + timedelta(seconds=1)
+    )
+    with _client(cookie) as client:
+        after = client.get("/api/me")
+    assert after.status_code == 200
+    assert after.json()["period"]["active"] is False
+    assert _periods(account_id)[0]["active"] is True
+    assert _periods(account_id)[0]["ends_at"] == ends_at
 
 
 def test_payment_rejects_password_and_cookie_keys_without_logging_them(

@@ -4,6 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
 from server.accounts import calendar_month_end, touch_session, utc_now
@@ -21,6 +22,47 @@ from server.config import payment_required
 from server.models import quota_counters, subscription_periods
 
 router = APIRouter()
+
+
+def _latest_period(connection: Connection, account_id: uuid.UUID):
+    return (
+        connection.execute(
+            select(subscription_periods)
+            .where(subscription_periods.c.account_id == account_id)
+            .order_by(
+                subscription_periods.c.started_at.desc(),
+                subscription_periods.c.id.desc(),
+            )
+            .limit(1)
+        )
+        .mappings()
+        .first()
+    )
+
+
+def _deactivate_latest_at_end(
+    connection: Connection, account_id: uuid.UUID, at: datetime
+) -> None:
+    period = _latest_period(connection, account_id)
+    if period is None or at < period["ends_at"]:
+        return
+    connection.execute(
+        subscription_periods.update()
+        .where(subscription_periods.c.id == period["id"])
+        .values(active=False)
+    )
+
+
+def record_cancellation(
+    connection: Connection, account_id: uuid.UUID, at: datetime
+) -> None:
+    _deactivate_latest_at_end(connection, account_id, at)
+
+
+def record_renewal_failed(
+    connection: Connection, account_id: uuid.UUID, at: datetime
+) -> None:
+    _deactivate_latest_at_end(connection, account_id, at)
 
 
 def record_success(connection: Connection, account_id: uuid.UUID, at: datetime) -> None:
@@ -86,6 +128,7 @@ async def pay(request: Request) -> JSONResponse:
                     account["name"],
                     account["email_confirmed_at"],
                     find_stored_period(connection, account["id"]),
+                    now,
                 )
     if document is None:
         return unauthenticated()

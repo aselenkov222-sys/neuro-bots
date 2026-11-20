@@ -127,6 +127,7 @@ def account_document(
     name: str,
     email_confirmed_at: datetime | None,
     stored_period: StoredPeriod | None = None,
+    at: datetime | None = None,
 ) -> dict[str, object]:
     tariff_name = configured_tariff_name()
     tariff_price = configured_tariff_price()
@@ -150,10 +151,13 @@ def account_document(
         quota_counter = None
         confirmed = True
     else:
+        active = stored_period.active
+        if at is not None and at >= stored_period.ends_at:
+            active = False
         period = {
             "started_at": format_utc(stored_period.started_at),
             "ends_at": format_utc(stored_period.ends_at),
-            "active": stored_period.active,
+            "active": active,
         }
         quota = development_tariff.model_requests - stored_period.used
         quota_counter = stored_period.used
@@ -179,6 +183,7 @@ def opened_session(
     session_id: object,
     email_confirmed_at: datetime | None,
     stored_period: StoredPeriod | None = None,
+    at: datetime | None = None,
 ) -> JSONResponse:
     response = JSONResponse(
         account_document(
@@ -187,6 +192,7 @@ def opened_session(
             name,
             email_confirmed_at,
             stored_period,
+            at,
         )
     )
     response.set_cookie(
@@ -236,7 +242,9 @@ async def register(request: Request) -> JSONResponse:
     except IntegrityError:
         return error_response(400, "email_taken", "Эта почта уже зарегистрирована")
     log_confirmation_link(str(request.base_url), token, stored_email)
-    return opened_session(account_id, stored_email, "", session_id, None)
+    return opened_session(
+        account_id, stored_email, "", session_id, None, at=utc_now()
+    )
 
 
 @router.post("/api/login")
@@ -248,6 +256,7 @@ async def login(request: Request) -> JSONResponse:
     if isinstance(credentials, JSONResponse):
         return credentials
     email, password = credentials
+    now = utc_now()
     with begin() as connection:
         account = find_account_by_email(connection, email)
         if account is None or not verify_password(password, account["password_hash"]):
@@ -281,6 +290,7 @@ async def login(request: Request) -> JSONResponse:
         session_id,
         confirmed_at,
         stored_period,
+        now,
     )
 
 
@@ -389,6 +399,7 @@ def me(request: Request) -> JSONResponse:
                 account["name"],
                 confirmed_at,
                 stored_period,
+                now,
             )
     if document is None:
         return unauthenticated()
