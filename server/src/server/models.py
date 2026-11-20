@@ -290,3 +290,19 @@ library_files = Table(
         name="library_files_name_check",
     ),
 )
+
+catalog_apps = Table(
+    "catalog_apps",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column(
+        "account_id",
+        Uuid(),
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("name", Text(), nullable=False),
+    Column("address", Text(), nullable=False),
+    Column("description", Text(), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+)

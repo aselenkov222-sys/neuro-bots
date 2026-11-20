@@ -98,6 +98,7 @@ NOTICE_REVISION = "f3a8c1d27e05"
 GATE_REVISION = "b3c7e9a41d52"
 CHAT_REVISION = "e7a1c4b82d60"
 LIBRARY_REVISION = "c2d8f4a91e73"
+CATALOG_REVISION = "d9b4e2a71c58"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -132,6 +133,14 @@ LIBRARY_NAME_SQL = (
 LIBRARY_NAME_CHECK = (
     "CHECK (((name ~~ '%.xlsx'::text) AND (strpos(name, '/'::text) = 0) AND "
     "(strpos(name, chr(92)) = 0) AND (char_length(name) >= 5)))"
+)
+CATALOG_APP_COLUMNS = (
+    "id",
+    "account_id",
+    "name",
+    "address",
+    "description",
+    "created_at",
 )
 DANGEROUS_STEP_COLUMNS = (
     "id",
@@ -258,8 +267,10 @@ def _revision_chain() -> list[str]:
     assert links[GATE_REVISION] == NOTICE_REVISION
     assert links[CHAT_REVISION] == GATE_REVISION
     assert links[LIBRARY_REVISION] == CHAT_REVISION
-    assert links[chain[-1]] == CHAT_REVISION
-    assert chain[-1] == LIBRARY_REVISION
+    assert links[CATALOG_REVISION] == LIBRARY_REVISION
+    assert links[chain[-1]] == LIBRARY_REVISION
+    assert chain[-1] == CATALOG_REVISION
+    assert chain[-1] != LIBRARY_REVISION
     assert chain[-1] != CHAT_REVISION
     assert chain[-1] != GATE_REVISION
     assert chain[-1] != NOTICE_REVISION
@@ -537,6 +548,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     desktop_notices = metadata.tables["desktop_notices"]
     dangerous_steps = metadata.tables["dangerous_steps"]
     library_files = metadata.tables["library_files"]
+    catalog_apps = metadata.tables["catalog_apps"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -554,6 +566,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "desktop_notices",
         "dangerous_steps",
         "library_files",
+        "catalog_apps",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -571,6 +584,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert desktop_notices is server.models.desktop_notices
     assert dangerous_steps is server.models.dangerous_steps
     assert library_files is server.models.library_files
+    assert catalog_apps is server.models.catalog_apps
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -587,6 +601,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(desktop_notices.columns.keys()) == NOTICE_COLUMNS
     assert tuple(dangerous_steps.columns.keys()) == DANGEROUS_STEP_COLUMNS
     assert tuple(library_files.columns.keys()) == LIBRARY_FILE_COLUMNS
+    assert tuple(catalog_apps.columns.keys()) == CATALOG_APP_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -1081,6 +1096,31 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     ] == [("library_files_name_check", LIBRARY_NAME_SQL)]
     assert list(library_files.indexes) == []
 
+    assert [column.name for column in catalog_apps.primary_key] == ["id"]
+    _assert_model_column(catalog_apps.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        catalog_apps.c.account_id,
+        Uuid,
+        nullable=False,
+        foreign_table="accounts",
+        ondelete="CASCADE",
+    )
+    _assert_model_column(catalog_apps.c.name, Text, nullable=False)
+    _assert_model_column(catalog_apps.c.address, Text, nullable=False)
+    _assert_model_column(catalog_apps.c.description, Text, nullable=False)
+    _assert_model_column(
+        catalog_apps.c.created_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in catalog_apps.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == []
+    assert list(catalog_apps.indexes) == []
+
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
     assert down.returncode == 0, down.stderr
@@ -1127,6 +1167,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "desktop_notices",
                     "dangerous_steps",
                     "library_files",
+                    "catalog_apps",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1757,6 +1798,37 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     ),
                     ("c", LIBRARY_NAME_CHECK),
                 }
+                catalog_columns = _columns(connection, "catalog_apps")
+                assert tuple(catalog_columns) == CATALOG_APP_COLUMNS
+                _assert_catalog_column(
+                    catalog_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    catalog_columns, "account_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    catalog_columns, "name", "text", "text", not_null=True
+                )
+                _assert_catalog_column(
+                    catalog_columns, "address", "text", "text", not_null=True
+                )
+                _assert_catalog_column(
+                    catalog_columns, "description", "text", "text", not_null=True
+                )
+                _assert_catalog_column(
+                    catalog_columns,
+                    "created_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "catalog_apps") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE",
+                    ),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1778,6 +1850,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "desktop_notices",
                     "dangerous_steps",
                     "library_files",
+                    "catalog_apps",
                 ):
                     assert (
                         connection.execute(
