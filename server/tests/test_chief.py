@@ -10,6 +10,7 @@ from sqlalchemy import select, text
 
 from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
+from server.browser_action import clear_opens
 from server.db import create_db_engine
 from server.models import (
     accounts,
@@ -490,6 +491,56 @@ def test_a_chief_assignment_starts_the_other_bots_turn(
         assert self_task.json()["message"] == "Поручение уходит другому боту."
         assert _chat_messages(chief["id"]) == []
     assert seen == [worker_scenario]
+
+
+def test_the_other_bots_question_stays_in_its_main_chat(
+    database: None,
+) -> None:
+    clear_opens()
+    cookie, _account_id = _open_confirmed("chief-question@example.com")
+    question = "Какую запись использовать для example.com? Аня или Борис."
+    with _client(cookie) as client:
+        chief = _create(client, "Старший")
+        worker = _create(client, "Почта")
+        _appoint(client, chief["id"])
+        patched = client.patch(
+            f"/api/bots/{worker['id']}",
+            json={"scenario": "Читать входящие."},
+            headers={"Origin": ORIGIN},
+        )
+        assert patched.status_code == 200
+        computer = _desktop(client)
+        assigned = client.post(
+            f"/api/bots/{chief['id']}/assignments",
+            json={
+                "bot_id": worker["id"],
+                "text": "Открой https://example.com/inbox",
+            },
+            headers={"Origin": ORIGIN},
+        )
+        assert assigned.status_code == 200
+        assert [row["role"] for row in assigned.json()["messages"]] == ["user"]
+        asked = client.post(
+            f"/api/desktops/{computer}/browser-task",
+            json={
+                "text": "страница входа",
+                "login": "choose",
+                "site": "example.com",
+                "choices": ["Аня", "Борис"],
+            },
+            headers={"Origin": ORIGIN},
+        )
+        assert asked.status_code == 200
+        texts = [row["text"] for row in asked.json()["messages"]]
+        assert question in texts
+        assert _scenario(worker["id"]) == "Читать входящие."
+        chief_texts = [row["text"] for row in _chat_messages(chief["id"])]
+        assert question not in chief_texts
+        assert "Аня или Борис" not in "\n".join(chief_texts)
+        listed = client.get(f"/api/bots/{worker['id']}/messages")
+        assert listed.status_code == 200
+        assert question in [row["text"] for row in listed.json()["messages"]]
+    clear_opens()
 
 
 def test_a_report_is_a_chat_message_and_not_a_digest(
