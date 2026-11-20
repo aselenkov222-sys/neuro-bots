@@ -696,3 +696,78 @@ def test_logout_on_the_second_desktop_leaves_the_working_one_running(
     with _client(cookie) as client:
         still = client.get("/api/me")
     assert still.status_code == 200
+
+
+def test_later_save_replaces_the_earlier_one_and_there_is_no_compare_screen(
+    database: None,
+) -> None:
+    script = (REPO_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    page = (REPO_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+    styles = (REPO_ROOT / "web" / "styles.css").read_text(encoding="utf-8")
+    for source in (script, page, styles):
+        assert "Сравнить версии" not in source
+        assert "сравнен" not in source
+        assert "слиян" not in source
+    email = f"later-save-{uuid.uuid4()}@example.com"
+    cookie, _account_id = _open_account(email)
+    other = _login(email)
+    with _client(cookie) as client:
+        created = client.post(
+            "/api/bots",
+            json={"name": "Черновик", "description": "пусто", "scenario": "старт"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+        bot_id = created.json()["id"]
+        routine = client.post(
+            f"/api/bots/{bot_id}/routines",
+            json={"weekdays": [3], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert routine.status_code == 200
+        routine_id = routine.json()["id"]
+        first = client.patch(
+            f"/api/bots/{bot_id}",
+            json={
+                "name": "Альфа",
+                "description": "первая",
+                "scenario": "первый текст",
+            },
+            headers={"Origin": ORIGIN},
+        )
+    assert first.status_code == 200
+    with _client(other) as client:
+        second = client.patch(
+            f"/api/bots/{bot_id}",
+            json={
+                "name": "Бета",
+                "description": "вторая",
+                "scenario": "второй текст",
+            },
+            headers={"Origin": ORIGIN},
+        )
+        moved = client.patch(
+            f"/api/bots/{bot_id}/routines/{routine_id}",
+            json={"weekdays": [1, 3], "time": "18:30"},
+            headers={"Origin": ORIGIN},
+        )
+    assert second.status_code == 200
+    assert second.json()["updated_at"] >= first.json()["updated_at"]
+    assert moved.status_code == 200
+    with _client(cookie) as client:
+        card = client.get(f"/api/bots/{bot_id}")
+        listed = client.get(f"/api/bots/{bot_id}/routines")
+    assert card.status_code == 200
+    assert card.json()["name"] == "Бета"
+    assert card.json()["description"] == "вторая"
+    assert card.json()["scenario"] == "второй текст"
+    assert card.json()["updated_at"] == second.json()["updated_at"]
+    assert listed.json() == [
+        {
+            "id": routine_id,
+            "weekdays": [1, 3],
+            "time": "18:30",
+            "paused": False,
+            "created_at": routine.json()["created_at"],
+        }
+    ]
