@@ -1035,3 +1035,55 @@ def test_a_connection_does_not_close_another_address(
     assert len(errors) == 1
     assert errors[0]["code"] == "catalog_not_connected"
     assert errors[0]["text"] == CATALOG_CLOSED
+
+
+def test_deleting_a_bot_keeps_everyone_and_drops_only_its_link(
+    database: None,
+) -> None:
+    cookie, account_id = _open_ready("catalog-delete-bot@example.com")
+    with _client(cookie) as client:
+        shared = _item(client, "Всем")
+        picked = _post(
+            client,
+            {
+                "name": "Банк",
+                "address": "https://bank.example/pay",
+                "description": "счета",
+            },
+        )
+        assert picked.status_code == 200
+        picked_body = picked.json()
+        kept = _bot(client, "Остаётся")
+        gone = _bot(client, "Уходит")
+        everyone = _connect(client, shared["id"], {"everyone": True})
+        assert everyone.status_code == 200
+        assert everyone.json()["everyone"] is True
+        assert everyone.json()["bot_ids"] == []
+        selected = _connect(
+            client,
+            picked_body["id"],
+            {"everyone": False, "bot_ids": [kept["id"], gone["id"]]},
+        )
+        assert selected.status_code == 200
+        deleted = client.delete(
+            f"/api/bots/{gone['id']}",
+            headers={"Origin": ORIGIN},
+        )
+        assert deleted.status_code == 204
+        listed = client.get("/api/catalog")
+    assert listed.status_code == 200
+    items = {item["id"]: item for item in listed.json()["items"]}
+    assert set(items) == {shared["id"], picked_body["id"]}
+    assert items[shared["id"]]["everyone"] is True
+    assert items[shared["id"]]["bot_ids"] == []
+    assert items[picked_body["id"]]["everyone"] is False
+    assert items[picked_body["id"]]["bot_ids"] == [kept["id"]]
+    stored = {row["id"]: row for row in _account_items(account_id)}
+    assert set(stored) == {
+        uuid.UUID(shared["id"]),
+        uuid.UUID(picked_body["id"]),
+    }
+    assert stored[uuid.UUID(shared["id"])]["everyone"] is True
+    assert stored[uuid.UUID(picked_body["id"])]["everyone"] is False
+    assert _item_links(uuid.UUID(shared["id"])) == []
+    assert _item_links(uuid.UUID(picked_body["id"])) == [uuid.UUID(kept["id"])]
