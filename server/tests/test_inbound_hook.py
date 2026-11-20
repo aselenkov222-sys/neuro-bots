@@ -21,6 +21,8 @@ from server.models import (
     messages,
     quota_charges,
     quota_counters,
+    routine_runs,
+    routines,
     sessions,
     subscription_periods,
 )
@@ -33,6 +35,7 @@ FOREIGN = "http://evil.example"
 MARKER = "hook-header-marker"
 UNKNOWN = "unknown-hook-token"
 STUB = "Сейчас я на заглушке агрегатора и не вызываю модель."
+INACTIVE_TEXT = "Подписка неактивна."
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -166,6 +169,27 @@ def _chat_messages(bot_id: str) -> list[dict]:
     return sorted(rows, key=lambda row: (row["updated_at"], row["id"]))
 
 
+def _bot_routines(bot_id: str) -> list[dict]:
+    return [row for row in _rows(routines) if row["bot_id"] == uuid.UUID(bot_id)]
+
+
+def _runs(routine_ids: set[uuid.UUID]) -> list[dict]:
+    return [row for row in _rows(routine_runs) if row["routine_id"] in routine_ids]
+
+
+def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                subscription_periods.update()
+                .where(subscription_periods.c.account_id == account_id)
+                .values(active=active)
+            )
+    finally:
+        engine.dispose()
+
+
 def _secret(address: str) -> str:
     prefix = "/api/hooks/"
     assert address.startswith(prefix)
@@ -270,6 +294,116 @@ def test_hook_writes_the_main_chat_without_a_session_or_origin(
     assert posted.json()["messages"][-1]["text"] == STUB
     assert posted.json()["messages"][-2]["text"] == "обычная реплика"
     assert _session(cookie)["last_request_at"] > seen
+
+
+def test_hook_does_not_create_or_start_a_routine_and_pause_does_not_stop_it(
+    database: None,
+) -> None:
+    cookie, account_id = _open_ready("hook-routine@example.com")
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+    assert created.status_code == 200
+    bot_id = created.json()["id"]
+    path = created.json()["inbound_webhook"]
+    with _client() as caller:
+        first = _hook(caller, "POST", path, content=b"hello")
+    assert first.status_code == 200
+    assert first.json() == {"ok": True}
+    assert _bot_routines(bot_id) == []
+    assert _rows(routine_runs) == []
+    spoken = _chat_messages(bot_id)
+    assert [row["role"] for row in spoken] == ["user", "assistant"]
+    assert spoken[0]["text"] == "POST\nhello"
+    assert spoken[1]["text"] == STUB
+    with _client(cookie) as owner:
+        routine = owner.post(
+            f"/api/bots/{bot_id}/routines",
+            json={"weekdays": [1, 3, 5], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert routine.status_code == 200
+        assert routine.json()["paused"] is False
+        routine_id = routine.json()["id"]
+        paused = owner.patch(
+            f"/api/bots/{bot_id}/routines/{routine_id}",
+            json={"paused": True},
+            headers={"Origin": ORIGIN},
+        )
+    assert paused.status_code == 200
+    assert paused.json()["paused"] is True
+    stored = _bot_routines(bot_id)
+    assert [str(row["id"]) for row in stored] == [routine_id]
+    assert stored[0]["paused"] is True
+    assert _runs({uuid.UUID(routine_id)}) == []
+    before = _quota(account_id)
+    with _client() as caller:
+        second = _hook(caller, "GET", path)
+    assert second.status_code == 200
+    assert second.json() == {"ok": True}
+    assert STUB not in second.text
+    after = _bot_routines(bot_id)
+    assert [str(row["id"]) for row in after] == [routine_id]
+    assert after[0]["paused"] is True
+    assert _runs({uuid.UUID(routine_id)}) == []
+    again = _chat_messages(bot_id)
+    assert [row["role"] for row in again] == ["user", "assistant", "user", "assistant"]
+    assert again[2]["text"] == "GET"
+    assert again[3]["text"] == STUB
+    counter, charges = _quota(account_id)
+    assert counter["used"] == before[0]["used"] + 1
+    assert len(charges) == len(before[1]) + 1
+
+
+def test_inactive_subscription_accepts_the_hook_without_the_model(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_complete(**kwargs: object) -> str:
+        raise AssertionError("aggregator was called")
+
+    monkeypatch.setattr("server.aggregator.complete", fail_complete)
+    cookie, account_id = _open_ready("hook-inactive@example.com")
+    _set_period_active(account_id, False)
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+        bot_id = created.json()["id"]
+        path = created.json()["inbound_webhook"]
+        posted = owner.post(
+            f"/api/bots/{bot_id}/messages",
+            json={"text": "обычная реплика"},
+            headers={"Origin": ORIGIN},
+        )
+    assert posted.status_code == 200
+    ordinary = posted.json()["messages"]
+    assert [row["role"] for row in ordinary] == ["user", "error"]
+    assert ordinary[1]["text"] == INACTIVE_TEXT
+    assert ordinary[1]["code"] is None
+    with _client() as caller:
+        hooked = _hook(caller, "POST", path, content=b"hello")
+    assert hooked.status_code == 200
+    assert hooked.json() == {"ok": True}
+    assert INACTIVE_TEXT not in hooked.text
+    assert STUB not in hooked.text
+    stored = _chat_messages(bot_id)
+    assert [row["role"] for row in stored] == ["user", "error", "user", "error"]
+    assert stored[0]["text"] == "обычная реплика"
+    assert stored[2]["text"] == "POST\nhello"
+    assert stored[1]["role"] == stored[3]["role"] == "error"
+    assert stored[1]["text"] == stored[3]["text"] == INACTIVE_TEXT
+    assert stored[1]["code"] is None and stored[3]["code"] is None
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 0
+    assert charges == []
+    assert _bot_routines(bot_id) == []
+    assert _rows(routine_runs) == []
 
 
 class _Journal:
