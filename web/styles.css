@@ -787,7 +787,7 @@ html[data-theme="dark"] .chat-item.is-on {
   line-height: 1.45;
 }
 
-.bubble p { overflow-wrap: anywhere; }
+.bubble p { overflow-wrap: anywhere; white-space: pre-wrap; }
 
 .bubble.user {
   align-self: flex-end;
