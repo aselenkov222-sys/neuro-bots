@@ -568,3 +568,74 @@ def test_open_run_follows_the_old_desktop_pulse(
         assert refused.json() == NOT_FOUND
     finally:
         clear_opens()
+
+
+def test_a_run_without_a_computer_stays_with_the_working_desktop(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_opens()
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB)
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    email = f"transfer-blank-{uuid.uuid4()}@example.com"
+    cookie, account_id = _open_account(email)
+    old = uuid.uuid4()
+    new = uuid.uuid4()
+    try:
+        with _client(cookie) as client:
+            bot = client.post(
+                "/api/bots",
+                json={"name": "Почта", "scenario": "Отправить ответ."},
+                headers={"Origin": ORIGIN},
+            )
+            assert bot.status_code == 200
+            routine = client.post(
+                f"/api/bots/{bot.json()['id']}/routines",
+                json={"weekdays": [3], "time": "09:00"},
+                headers={"Origin": ORIGIN},
+            )
+            assert routine.status_code == 200
+            assert _post_desktop(client, old).json()["working"] is True
+            assert (
+                client.post(
+                    f"/api/desktops/{old}/pulse",
+                    json={"timezone": "Europe/Moscow"},
+                    headers={"Origin": ORIGIN},
+                ).status_code
+                == 200
+            )
+        assert _routine_run(cookie, old).status_code == 200
+        run = _runs(routine.json()["id"])[0]
+        assert run["status"] == "awaiting"
+        engine = create_db_engine()
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    routine_runs.update()
+                    .where(routine_runs.c.id == run["id"])
+                    .values(computer_id=None)
+                )
+        finally:
+            engine.dispose()
+        second_cookie = _login(email)
+        with _client(second_cookie) as client:
+            assert _post_desktop(client, new).json()["working"] is False
+        gate = next(
+            row
+            for row in _bot_messages(bot.json()["id"])
+            if row["code"] == "dangerous_action"
+        )
+        with _client(cookie) as client:
+            answered = client.post(
+                f"/api/bots/{bot.json()['id']}/messages/{gate['id']}/answer",
+                json={"answer": "yes"},
+                headers={"Origin": ORIGIN},
+            )
+        assert answered.status_code == 200
+        missed = _routine_run(second_cookie, new)
+        assert missed.status_code == 404
+        released = _routine_run(cookie, old)
+        assert released.status_code == 200
+        assert released.json()["action"] == "Отправить ответ."
+        assert _runs(routine.json()["id"])[0]["computer_id"] is None
+    finally:
+        clear_opens()

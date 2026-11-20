@@ -1894,7 +1894,10 @@ def _released_document(
         return None
     if step["run_id"] is not None:
         holder = run_holder(connection, step["run_id"])
-        if holder != computer_id:
+        if holder is None:
+            if not allow_checks:
+                return None
+        elif holder != computer_id:
             return None
     elif not allow_checks:
         return None
