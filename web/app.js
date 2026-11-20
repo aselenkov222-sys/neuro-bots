@@ -56,7 +56,8 @@ const state = {
   activeChatId: null,
   library: [],
   catalog: [],
-  confirmAccountRemoval: false
+  confirmAccountRemoval: false,
+  desktopWorking: null
 };
 
 function esc(value) {
@@ -100,10 +101,17 @@ function claimDesktop() {
   const bridge = window.__neuroDesktop;
   if (!state.me || !bridge || typeof bridge.id !== "string") return;
   api("/api/desktops", { method: "POST", body: { id: bridge.id } }).then((result) => {
-    if (!result.ok || !result.data || result.data.working !== true) return;
+    if (!result.ok || !result.data || typeof result.data.working !== "boolean") return;
+    state.desktopWorking = result.data.working === true;
+    const onProfile = desiredScreen() === "profile";
+    if (result.data.working !== true) {
+      if (onProfile) render();
+      return;
+    }
     const current = window.__neuroDesktop;
     if (!current || typeof current.id !== "string" || typeof current.timezone !== "string") return;
     startPulse();
+    if (onProfile) render();
   }).catch(() => {});
 }
 
@@ -465,6 +473,7 @@ function profileScreen() {
         </label>
       </div>
     </section>
+    ${desktopRole()}
     ${accountRemoval()}`;
 }
 
@@ -528,6 +537,25 @@ function catalogScreen() {
 function routineLocked() {
   const bot = state.card;
   return !bot || typeof bot.scenario !== "string" || bot.scenario.trim() === "";
+}
+
+function desktopRole() {
+  const bridge = window.__neuroDesktop;
+  if (!bridge || typeof bridge.id !== "string") return "";
+  if (state.desktopWorking !== true && state.desktopWorking !== false) return "";
+  if (state.desktopWorking === true) {
+    return `
+    <section class="panel sheet" id="desktop-role">
+      <p class="hint">Этот компьютер запускает рутины.</p>
+    </section>`;
+  }
+  return `
+    <section class="panel sheet" id="desktop-role">
+      <p class="hint">Рутины запускает другой компьютер.</p>
+      <div class="actions">
+        <button type="button" class="btn-orange" data-action="transfer-role">Перенести роль сюда</button>
+      </div>
+    </section>`;
 }
 
 function routineBlock() {
@@ -1268,6 +1296,10 @@ app.addEventListener("click", (event) => {
     signOut();
     return;
   }
+  if (action === "transfer-role") {
+    transferRole();
+    return;
+  }
   if (action === "ask-delete-account") {
     state.confirmAccountRemoval = true;
     render();
@@ -1479,6 +1511,24 @@ function resetCabinet() {
   state.library = [];
   state.catalog = [];
   state.confirmAccountRemoval = false;
+  state.desktopWorking = null;
+}
+
+async function transferRole() {
+  const bridge = window.__neuroDesktop;
+  if (!state.me || !bridge || typeof bridge.id !== "string") return;
+  const result = await api(`/api/desktops/${bridge.id}/working`, {
+    method: "POST",
+    body: {}
+  });
+  note(result);
+  if (!result.ok || !result.data || result.data.working !== true) {
+    render();
+    return;
+  }
+  state.desktopWorking = true;
+  if (typeof bridge.timezone === "string") startPulse();
+  render();
 }
 
 async function noteAccountRemoved() {

@@ -49,6 +49,38 @@ def find_working_desktop(
     return _working_desktop(connection, account_id)
 
 
+def find_account_desktop(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> RowMapping | None:
+    return _find_desktop(connection, account_id, computer_id)
+
+
+def transfer_working_role(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> RowMapping | None:
+    target = _find_desktop(connection, account_id, computer_id)
+    if target is None:
+        return None
+    if target["working"] is True:
+        return target
+    current = _working_desktop(connection, account_id)
+    if current is not None:
+        connection.execute(
+            desktops.update()
+            .where(desktops.c.id == current["id"])
+            .values(working=False)
+        )
+    connection.execute(
+        desktops.update()
+        .where(desktops.c.id == target["id"])
+        .values(working=True, routines_stopped=False)
+    )
+    stored = _find_desktop(connection, account_id, computer_id)
+    if stored is None:
+        raise RuntimeError("desktop row was not stored")
+    return stored
+
+
 def _working_desktop(
     connection: Connection, account_id: uuid.UUID
 ) -> RowMapping | None:
@@ -240,11 +272,24 @@ async def post_pulse(request: Request, computer_id: str) -> JSONResponse:
             return desktop_not_found()
         session, account = current
         row = _find_desktop(connection, account["id"], parsed)
-        if row is None or row["working"] is not True:
+        if row is None:
             return desktop_not_found()
+        if row["working"] is not True:
+            from server.routines import holds_open_run
+
+            if not holds_open_run(connection, account["id"], parsed):
+                return desktop_not_found()
         timezone_name = await read_timezone(request)
         if isinstance(timezone_name, JSONResponse):
             return timezone_name
+        if row["working"] is not True:
+            connection.execute(
+                desktops.update()
+                .where(desktops.c.id == row["id"])
+                .values(last_pulse_at=now)
+            )
+            touch_session(connection, session["id"], now)
+            return JSONResponse({"timezone": timezone_name})
         was_stopped = row["routines_stopped"] is True
         connection.execute(
             desktops.update()
@@ -338,3 +383,44 @@ async def post_notices(request: Request, computer_id: str) -> Response:
         mark_delivered(connection, account["id"], notice_ids, now)
         touch_session(connection, session["id"], now)
     return Response(status_code=204)
+
+
+INVALID_OBJECT = "Нужен JSON-объект."
+
+
+async def _empty_or_object(request: Request) -> JSONResponse | None:
+    raw = await request.body()
+    if raw.strip() == b"":
+        return None
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(400, "invalid_request", INVALID_OBJECT)
+    if not isinstance(body, dict) or "password" in body or "cookie" in body:
+        return error_response(400, "invalid_request", INVALID_OBJECT)
+    return None
+
+
+@router.post("/api/desktops/{computer_id}/working")
+async def post_working(request: Request, computer_id: str) -> JSONResponse:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    invalid = await _empty_or_object(request)
+    if invalid is not None:
+        return invalid
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            return unauthenticated()
+        parsed = parse_path_computer_id(computer_id)
+        if parsed is None:
+            return desktop_not_found()
+        session, account = current
+        row = transfer_working_role(connection, account["id"], parsed)
+        if row is None:
+            return desktop_not_found()
+        touch_session(connection, session["id"], now)
+        document = {"id": str(row["computer_id"]), "working": row["working"] is True}
+    return JSONResponse(document)

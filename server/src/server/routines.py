@@ -49,6 +49,7 @@ from server.bots import (
 from server.config import development_tariff
 from server.desktops import (
     desktop_not_found,
+    find_account_desktop,
     find_working_desktop,
     parse_path_computer_id,
     timezone_name_accepted,
@@ -60,6 +61,7 @@ from server.models import (
     catalog_app_bots,
     catalog_apps,
     chats,
+    dangerous_steps,
     desktops,
     messages,
     quota_charges,
@@ -192,6 +194,24 @@ def _accepted_zone(value: object) -> str | None:
     if not isinstance(value, str) or not timezone_name_accepted(value):
         return None
     return value
+
+
+def _holder_alive(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID | None,
+    now: datetime,
+) -> bool:
+    if computer_id is not None:
+        pulsed = connection.execute(
+            select(desktops.c.last_pulse_at).where(
+                desktops.c.account_id == account_id,
+                desktops.c.computer_id == computer_id,
+            )
+        ).scalar_one_or_none()
+        return _process_alive(pulsed, now)
+    desktop = find_working_desktop(connection, account_id)
+    return desktop is not None and _process_alive(desktop["last_pulse_at"], now)
 
 
 def _process_alive(last_pulse_at: datetime | None, now: datetime) -> bool:
@@ -635,6 +655,7 @@ def settle_asleep(connection: Connection, now: datetime) -> None:
         connection.execute(
             select(
                 routine_runs.c.id,
+                routine_runs.c.computer_id,
                 routines.c.bot_id,
                 bots.c.account_id,
             )
@@ -646,11 +667,7 @@ def settle_asleep(connection: Connection, now: datetime) -> None:
         .all()
     )
     for row in runs:
-        desktop = find_working_desktop(connection, row["account_id"])
-        alive = desktop is not None and _process_alive(
-            desktop["last_pulse_at"], moment
-        )
-        if alive:
+        if _holder_alive(connection, row["account_id"], row["computer_id"], moment):
             continue
         _mark_failed(
             connection,
@@ -919,8 +936,51 @@ def _enqueue_named_addresses(
     return queued
 
 
+def _holds_run(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    status: str,
+) -> bool:
+    found = connection.execute(
+        select(routine_runs.c.id)
+        .join(routines, routines.c.id == routine_runs.c.routine_id)
+        .join(bots, bots.c.id == routines.c.bot_id)
+        .where(
+            bots.c.account_id == account_id,
+            routine_runs.c.computer_id == computer_id,
+            routine_runs.c.status == status,
+        )
+        .limit(1)
+    ).first()
+    return found is not None
+
+
+def holds_open_run(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> bool:
+    return _holds_run(connection, account_id, computer_id, "awaiting")
+
+
+def holds_claimed_run(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> bool:
+    return _holds_run(connection, account_id, computer_id, "claimed")
+
+
+def run_holder(connection: Connection, run_id: uuid.UUID | None) -> uuid.UUID | None:
+    if run_id is None:
+        return None
+    return connection.execute(
+        select(routine_runs.c.computer_id).where(routine_runs.c.id == run_id)
+    ).scalar_one_or_none()
+
+
 def claim_earliest_pending(
-    connection: Connection, account_id: uuid.UUID, now: datetime
+    connection: Connection,
+    account_id: uuid.UUID,
+    now: datetime,
+    computer_id: uuid.UUID,
 ) -> RowMapping | None:
     moment = _aware(now)
     settle_due(connection, moment)
@@ -960,7 +1020,7 @@ def claim_earliest_pending(
             routine_runs.c.id == pending["id"],
             routine_runs.c.status == "pending",
         )
-        .values(status="claimed", claimed_at=moment)
+        .values(status="claimed", claimed_at=moment, computer_id=computer_id)
     )
     if updated.rowcount != 1:
         return None
@@ -1066,8 +1126,8 @@ def _enqueue_lines(
     now: datetime | None = None,
     fail_from: str | None = None,
 ) -> bool:
-    desktop = find_working_desktop(connection, account_id)
-    if desktop is None:
+    computer = _computer_for_run(connection, account_id, run_id)
+    if computer is None:
         return False
     items = _catalog_rows(connection, account_id)
     linked = _linked_catalog_ids(connection, bot_id)
@@ -1093,13 +1153,26 @@ def _enqueue_lines(
             return True
         enqueue_open(
             account_id=account_id,
-            computer_id=desktop["computer_id"],
+            computer_id=computer,
             url=address,
             bot_id=bot_id,
             chat_id=chat_id,
         )
         seen.add(address)
     return False
+
+
+def _computer_for_run(
+    connection: Connection, account_id: uuid.UUID, run_id: uuid.UUID | None
+) -> uuid.UUID | None:
+    if run_id is not None:
+        holder = run_holder(connection, run_id)
+        if holder is not None:
+            return holder
+    desktop = find_working_desktop(connection, account_id)
+    if desktop is None:
+        return None
+    return desktop["computer_id"]
 
 
 def _maybe_wait(
@@ -1781,7 +1854,7 @@ def _perform_released(
     step = take_perform(connection, account_id, step_id, now)
     if step is None:
         return
-    desktop = find_working_desktop(connection, account_id)
+    computer = _computer_for_run(connection, account_id, step["run_id"])
     address = named_address(step["action"])
     if (
         step["run_id"] is not None
@@ -1798,11 +1871,11 @@ def _perform_released(
             CATALOG_NOT_CONNECTED_TEXT,
         )
         return
-    if desktop is not None and address is not None:
+    if computer is not None and address is not None:
         chat_id = main_chat(connection, step["bot_id"])["id"]
         enqueue_open(
             account_id=account_id,
-            computer_id=desktop["computer_id"],
+            computer_id=computer,
             url=address,
             bot_id=step["bot_id"],
             chat_id=chat_id,
@@ -1825,10 +1898,23 @@ def _perform_released(
 
 
 def _released_document(
-    connection: Connection, account_id: uuid.UUID
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    *,
+    allow_checks: bool,
 ) -> dict[str, str] | None:
     step = released_step(connection, account_id)
     if step is None:
+        return None
+    if step["run_id"] is not None:
+        holder = run_holder(connection, step["run_id"])
+        if holder is None:
+            if not allow_checks:
+                return None
+        elif holder != computer_id:
+            return None
+    elif not allow_checks:
         return None
     if step["run_id"] is not None:
         routine_id = connection.execute(
@@ -1851,6 +1937,49 @@ def _released_document(
     }
 
 
+def _perform_allowed(
+    connection: Connection,
+    account_id: uuid.UUID,
+    step_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    is_working: bool,
+) -> bool:
+    row = (
+        connection.execute(
+            select(dangerous_steps.c.run_id)
+            .join(bots, bots.c.id == dangerous_steps.c.bot_id)
+            .where(
+                dangerous_steps.c.id == step_id,
+                bots.c.account_id == account_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return False
+    if row["run_id"] is None:
+        return is_working
+    holder = run_holder(connection, row["run_id"])
+    if holder is None:
+        return is_working
+    return holder == computer_id
+
+
+def _failure_allowed(
+    connection: Connection,
+    run_id: uuid.UUID | None,
+    computer_id: uuid.UUID,
+    is_working: bool,
+) -> bool:
+    if run_id is None:
+        return is_working
+    holder = run_holder(connection, run_id)
+    if holder is None:
+        return is_working
+    return holder == computer_id
+
+
 @router.post("/api/desktops/{computer_id}/routine-run")
 async def post_routine_run(request: Request, computer_id: str) -> Response:
     rejected = origin_rejected(request)
@@ -1866,26 +1995,40 @@ async def post_routine_run(request: Request, computer_id: str) -> Response:
         if parsed is None:
             return desktop_not_found()
         session, account = current
-        desktop = find_working_desktop(connection, account["id"])
-        if desktop is None or desktop["computer_id"] != parsed:
+        desktop = find_account_desktop(connection, account["id"], parsed)
+        if desktop is None:
+            return desktop_not_found()
+        working = find_working_desktop(connection, account["id"])
+        is_working = working is not None and working["computer_id"] == parsed
+        holds = holds_open_run(
+            connection, account["id"], parsed
+        ) or holds_claimed_run(connection, account["id"], parsed)
+        if not is_working and not holds:
             return desktop_not_found()
         settle_asleep(connection, now)
         if isinstance(report, JSONResponse):
             return report
         if isinstance(report, tuple) and report[0] == "performed":
-            _perform_released(connection, account["id"], report[1], now)
+            if _perform_allowed(connection, account["id"], report[1], parsed, is_working):
+                _perform_released(connection, account["id"], report[1], now)
             touch_session(connection, session["id"], now)
             return Response(status_code=204)
         if report is not None:
             run_id, reason = report
-            report_run_failure(connection, account["id"], run_id, reason, now)
+            if _failure_allowed(connection, run_id, parsed, is_working):
+                report_run_failure(connection, account["id"], run_id, reason, now)
             touch_session(connection, session["id"], now)
             return Response(status_code=204)
-        released = _released_document(connection, account["id"])
+        released = _released_document(
+            connection, account["id"], parsed, allow_checks=is_working
+        )
         if released is not None:
             touch_session(connection, session["id"], now)
             return JSONResponse(released)
-        claimed = claim_earliest_pending(connection, account["id"], now)
+        if not is_working:
+            touch_session(connection, session["id"], now)
+            return Response(status_code=204)
+        claimed = claim_earliest_pending(connection, account["id"], now, parsed)
         touch_session(connection, session["id"], now)
         if claimed is None:
             return Response(status_code=204)

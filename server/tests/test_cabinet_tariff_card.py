@@ -84,8 +84,13 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
         assert "Своего текста у рутины нет." in card
         start = script.index(card)
         remainder = script[:start] + script[start + len(card):]
+        role = _screen(script, "desktopRole", "function routineBlock(")
+        remainder = remainder.replace(role, "", 1)
         for piece in ("рутин", "Рутин"):
             assert piece not in remainder
+        assert "Этот компьютер запускает рутины." in role
+        assert "Рутины запускает другой компьютер." in role
+        assert "Перенести роль сюда" in role
         assert "pick-color" in script
         assert "pick-icon" in script
         assert "#c85a12" in script

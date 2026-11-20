@@ -201,6 +201,7 @@ routine_runs = Table(
     Column("due_at", DateTime(timezone=True), nullable=False),
     Column("status", String(16), nullable=False),
     Column("claimed_at", DateTime(timezone=True), nullable=True),
+    Column("computer_id", Uuid(), nullable=True),
     CheckConstraint(
         "status IN ('pending', 'claimed', 'skipped', 'cancelled', 'failed', "
         "'awaiting', 'finished')",

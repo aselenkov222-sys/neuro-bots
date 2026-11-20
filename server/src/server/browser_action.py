@@ -204,6 +204,14 @@ def _email_unconfirmed() -> JSONResponse:
     return error_response(403, "email_unconfirmed", "Почта ещё не подтверждена.")
 
 
+def _may_finish_browser(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> bool:
+    if _working(connection, account_id, computer_id):
+        return True
+    return peek_open(account_id, computer_id) is not None
+
+
 def _working(
     connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
 ) -> bool:
@@ -753,7 +761,7 @@ def get_browser_task(request: Request, computer_id: str) -> Response:
         if account["email_confirmed_at"] is None:
             return _email_unconfirmed()
         parsed = _parse_computer_id(computer_id)
-        if parsed is None or not _working(connection, account["id"], parsed):
+        if parsed is None or not _may_finish_browser(connection, account["id"], parsed):
             return _desktop_not_found()
         item = _first_open(account["id"], parsed)
         touch_session(connection, session["id"], now)
@@ -782,7 +790,7 @@ async def post_browser_task(request: Request, computer_id: str) -> Response:
         if account["email_confirmed_at"] is None:
             return _email_unconfirmed()
         parsed = _parse_computer_id(computer_id)
-        if parsed is None or not _working(connection, account["id"], parsed):
+        if parsed is None or not _may_finish_browser(connection, account["id"], parsed):
             return _desktop_not_found()
         if report.kind == "page":
             document = finish_open(connection, account["id"], parsed, now, report.text)
