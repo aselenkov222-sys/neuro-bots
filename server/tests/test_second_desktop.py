@@ -1,7 +1,7 @@
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,7 +12,14 @@ from server.accounts import calendar_month_end, create_account, create_session
 from server.aggregator import CompleteResult
 from server.app import app
 from server.db import create_db_engine
-from server.models import accounts, quota_counters, subscription_periods
+from server.models import (
+    accounts,
+    chats,
+    messages,
+    quota_counters,
+    routine_runs,
+    subscription_periods,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -23,6 +30,10 @@ REPLY = "Таблица готова."
 XLSX_NAME = "письма.xlsx"
 XLSX_BYTES = b"PK\x03\x04\x00second-desktop-xlsx"
 SCENARIO = "Открыть почту и собрать таблицу."
+DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+CLAIM_AT = DUE + timedelta(seconds=59)
+NOT_FOUND = {"code": "not_found", "message": "Десктоп не найден."}
+REPO_ROOT = PROJECT_ROOT.parent
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -125,6 +136,12 @@ def _login(email: str) -> str:
     cookie = fresh.cookies.get("session")
     assert isinstance(cookie, str)
     return cookie
+
+
+def _bot_messages(bot_id: str) -> list[dict]:
+    parsed = uuid.UUID(bot_id)
+    chat_ids = {row["id"] for row in _rows(chats) if row["bot_id"] == parsed}
+    return [row for row in _rows(messages) if row["chat_id"] in chat_ids]
 
 
 def _post_desktop(client: TestClient, computer: uuid.UUID):
@@ -233,3 +250,63 @@ def test_second_desktop_reads_bots_chats_scenarios_routines_and_library(
     assert XLSX_BYTES not in bots.content
     assert "password" not in card.json()
     assert "cookie" not in card.json()
+
+
+def test_cabinet_does_not_poll_routines_until_this_desktop_is_working() -> None:
+    script = (REPO_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    claim = script.split("function claimDesktop()", 1)[1].split(
+        "function sendPulse()", 1
+    )[0]
+    assert "result.data.working !== true" in claim
+    assert claim.index("working !== true") < claim.index("startPulse()")
+
+
+def test_second_desktop_does_not_claim_a_routine(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    email = f"second-claim-{uuid.uuid4()}@example.com"
+    cookie, _account_id = _open_account(email)
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    working = uuid.uuid4()
+    idle = uuid.uuid4()
+    with _client(cookie) as client:
+        bot = client.post(
+            "/api/bots",
+            json={"name": "Почта", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        assert bot.status_code == 200
+        routine = client.post(
+            f"/api/bots/{bot.json()['id']}/routines",
+            json={"weekdays": [3], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert routine.status_code == 200
+        assert _post_desktop(client, working).json()["working"] is True
+        pulsed = client.post(
+            f"/api/desktops/{working}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+        assert _post_desktop(client, idle).json()["working"] is False
+        refused = client.post(
+            f"/api/desktops/{idle}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+    assert refused.status_code == 404
+    assert refused.json() == NOT_FOUND
+    routine_id = uuid.UUID(routine.json()["id"])
+    assert [row for row in _rows(routine_runs) if row["routine_id"] == routine_id] == []
+    assert _bot_messages(bot.json()["id"]) == []
+    with _client(cookie) as client:
+        claimed = client.post(
+            f"/api/desktops/{working}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+    assert claimed.status_code == 200
+    assert claimed.json()["bot_id"] == bot.json()["id"]
+    runs = [row for row in _rows(routine_runs) if row["routine_id"] == routine_id]
+    assert len(runs) == 1
+    assert runs[0]["status"] == "claimed"
+    assert [row["text"] for row in _bot_messages(bot.json()["id"])] == [STUB]
