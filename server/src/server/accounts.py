@@ -5,11 +5,28 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
-from server.models import accounts, sessions
+from server.models import (
+    accounts,
+    bots,
+    catalog_apps,
+    confirmation_links,
+    desktop_notices,
+    desktops,
+    quota_charges,
+    quota_counters,
+    sessions,
+    subscription_periods,
+)
 from server.passwords import PasswordNotAccepted, hash_password, password_accepted
 
 EMAIL_MAX_LENGTH = 254
+PROFILE_NAME_MAX_LENGTH = 80
 SESSION_LIFETIME = timedelta(days=30)
+
+
+class ProfileNameRejected(ValueError):
+    def __init__(self) -> None:
+        super().__init__("profile name is longer than 80 characters")
 
 
 class EmailTooLong(ValueError):
@@ -103,6 +120,52 @@ def touch_session(connection: Connection, session_id: uuid.UUID, now: datetime) 
 
 def delete_session(connection: Connection, session_id: uuid.UUID) -> None:
     connection.execute(sessions.delete().where(sessions.c.id == session_id))
+
+
+def delete_account(connection: Connection, account_id: uuid.UUID) -> None:
+    from server.bots import _remove_bot
+
+    bot_ids = connection.execute(
+        select(bots.c.id).where(bots.c.account_id == account_id)
+    ).scalars()
+    for bot_id in bot_ids:
+        _remove_bot(connection, bot_id)
+    period_ids = select(subscription_periods.c.id).where(
+        subscription_periods.c.account_id == account_id
+    )
+    connection.execute(
+        quota_charges.delete().where(quota_charges.c.period_id.in_(period_ids))
+    )
+    connection.execute(
+        quota_counters.delete().where(quota_counters.c.period_id.in_(period_ids))
+    )
+    connection.execute(
+        subscription_periods.delete().where(
+            subscription_periods.c.account_id == account_id
+        )
+    )
+    connection.execute(
+        catalog_apps.delete().where(catalog_apps.c.account_id == account_id)
+    )
+    connection.execute(
+        desktop_notices.delete().where(desktop_notices.c.account_id == account_id)
+    )
+    connection.execute(
+        confirmation_links.delete().where(
+            confirmation_links.c.account_id == account_id
+        )
+    )
+    connection.execute(desktops.delete().where(desktops.c.account_id == account_id))
+    connection.execute(sessions.delete().where(sessions.c.account_id == account_id))
+    connection.execute(accounts.delete().where(accounts.c.id == account_id))
+
+
+def update_account_name(connection: Connection, account_id: uuid.UUID, name: str) -> None:
+    if len(name) > PROFILE_NAME_MAX_LENGTH:
+        raise ProfileNameRejected
+    connection.execute(
+        accounts.update().where(accounts.c.id == account_id).values(name=name)
+    )
 
 
 def find_account_by_email(connection: Connection, email: str) -> RowMapping | None:

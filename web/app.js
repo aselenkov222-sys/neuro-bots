@@ -55,7 +55,8 @@ const state = {
   chats: [],
   activeChatId: null,
   library: [],
-  catalog: []
+  catalog: [],
+  confirmAccountRemoval: false
 };
 
 function esc(value) {
@@ -420,10 +421,51 @@ function botsScreen() {
     ${form}`;
 }
 
+function profileName() {
+  const account = state.me && state.me.account;
+  if (!account || typeof account.name !== "string") return "";
+  return account.name;
+}
+
+function profileCounter() {
+  if (!state.me || !Number.isInteger(state.me.quota_counter)) return "";
+  return String(state.me.quota_counter);
+}
+
+function accountRemoval() {
+  if (state.confirmAccountRemoval === true) {
+    return `
+      <p class="hint">Удаление не отменяется.</p>
+      <div class="actions">
+        <button type="button" class="btn-orange" data-action="confirm-delete-account">Удалить</button>
+        <button type="button" class="btn-quiet" data-action="cancel-delete-account">Оставить</button>
+      </div>`;
+  }
+  return `
+    <div class="actions">
+      <button type="button" class="btn-quiet" data-action="ask-delete-account">Удалить аккаунт</button>
+    </div>`;
+}
+
 function profileScreen() {
   return `
     ${topbar("Профиль", "", '<a class="btn-quiet" href="#catalog">Каталог</a>' + logoutControl())}
-    ${noticeHtml()}`;
+    ${noticeHtml()}
+    <section class="identity raised">
+      <div class="identity-main">
+        <label class="ink-label" for="profile-name">Имя</label>
+        <input class="name-input" id="profile-name" type="text" maxlength="80" value="${esc(profileName())}" autocomplete="nickname">
+      </div>
+    </section>
+    <article class="tariff sheet" aria-label="Тариф"></article>
+    <section class="panel sheet">
+      <div class="fields">
+        <label class="field" for="quota-counter">Счётчик квоты
+          <input id="quota-counter" type="text" readonly value="${esc(profileCounter())}">
+        </label>
+      </div>
+    </section>
+    ${accountRemoval()}`;
 }
 
 function catalogForm() {
@@ -887,6 +929,7 @@ async function showCurrent() {
     return;
   }
   if (desired === "bots") await loadBots();
+  if (desired === "profile") await loadMe();
   if (desired === "catalog") {
     await loadBots();
     await loadCatalog();
@@ -897,6 +940,12 @@ async function showCurrent() {
     await loadLibrary();
   }
   render();
+}
+
+async function loadMe() {
+  const result = await api("/api/me");
+  if (result.ok && result.data) state.me = result.data;
+  else note(result);
 }
 
 async function loadCatalog() {
@@ -1159,6 +1208,9 @@ app.addEventListener("input", (event) => {
 
 app.addEventListener("change", (event) => {
   const target = event.target;
+  if (target.id === "profile-name" && state.me && state.me.account) {
+    if (target.value !== profileName()) saveProfileName(target.value);
+  }
   if (target.id === "bot-name" && state.card) {
     const next = target.value.trim();
     if (!next) target.value = state.card.name;
@@ -1214,6 +1266,20 @@ app.addEventListener("click", (event) => {
   }
   if (action === "logout") {
     signOut();
+    return;
+  }
+  if (action === "ask-delete-account") {
+    state.confirmAccountRemoval = true;
+    render();
+    return;
+  }
+  if (action === "cancel-delete-account") {
+    state.confirmAccountRemoval = false;
+    render();
+    return;
+  }
+  if (action === "confirm-delete-account") {
+    removeAccount();
     return;
   }
   if (action === "open-create") {
@@ -1380,6 +1446,13 @@ async function togglePause() {
   saveRoutine({ paused: routine.paused !== true }, routine.id);
 }
 
+async function saveProfileName(name) {
+  const result = await api("/api/me", { method: "PATCH", body: { name } });
+  note(result);
+  if (result.ok && result.data) state.me = result.data;
+  render();
+}
+
 async function sendConfirmation() {
   const result = await api("/api/confirmation", { method: "POST" });
   note(result);
@@ -1387,10 +1460,8 @@ async function sendConfirmation() {
   render();
 }
 
-async function signOut() {
+function resetCabinet() {
   stopPulse();
-  const result = await api("/api/logout", { method: "POST" });
-  note(result);
   state.me = null;
   state.holdTariff = false;
   state.activeId = null;
@@ -1405,7 +1476,47 @@ async function signOut() {
   state.messages = [];
   state.chats = [];
   state.activeChatId = null;
+  state.library = [];
   state.catalog = [];
+  state.confirmAccountRemoval = false;
+}
+
+async function noteAccountRemoved() {
+  const bridge = window.__neuroDesktop;
+  if (!bridge || typeof bridge.openUrl !== "string" || typeof bridge.openToken !== "string") return;
+  try {
+    await fetch(`${bridge.openUrl.replace(/\/$/, "")}/account-removed`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Desktop-Open": bridge.openToken
+      },
+      body: "{}"
+    });
+  } catch (error) {
+    return;
+  }
+}
+
+async function removeAccount() {
+  stopPulse();
+  const result = await api("/api/me", { method: "DELETE", body: { confirm: true } });
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
+  await noteAccountRemoved();
+  resetCabinet();
+  if (location.hash !== "#register") location.hash = "#register";
+  else render();
+}
+
+async function signOut() {
+  stopPulse();
+  const result = await api("/api/logout", { method: "POST" });
+  note(result);
+  resetCabinet();
   if (location.hash !== "#login") location.hash = "#login";
   else render();
 }

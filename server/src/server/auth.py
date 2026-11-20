@@ -15,9 +15,11 @@ from sqlalchemy.exc import IntegrityError
 from server.accounts import (
     EMAIL_MAX_LENGTH,
     EmailTooLong,
+    ProfileNameRejected,
     calendar_month_end,
     create_account,
     create_session,
+    delete_account,
     delete_session,
     find_account_by_email,
     find_account_by_id,
@@ -26,6 +28,7 @@ from server.accounts import (
     normalize_email,
     session_is_current,
     touch_session,
+    update_account_name,
     utc_now,
 )
 from server.config import development_tariff
@@ -119,6 +122,7 @@ def account_document(
     if email_confirmed_at is None:
         period = None
         quota = None
+        quota_counter = None
         confirmed = False
     elif stored_period is None:
         period = {
@@ -127,6 +131,7 @@ def account_document(
             "active": True,
         }
         quota = None
+        quota_counter = None
         confirmed = True
     else:
         period = {
@@ -135,6 +140,7 @@ def account_document(
             "active": stored_period.active,
         }
         quota = development_tariff.model_requests - stored_period.used
+        quota_counter = stored_period.used
         confirmed = True
     return {
         "account": {
@@ -145,6 +151,7 @@ def account_document(
         "email_confirmed": confirmed,
         "period": period,
         "quota": quota,
+        "quota_counter": quota_counter,
     }
 
 
@@ -289,6 +296,60 @@ def unauthenticated() -> JSONResponse:
     return error_response(401, "unauthenticated", "Нужна сессия.")
 
 
+async def read_profile_name(request: Request) -> str | JSONResponse:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(400, "invalid_request", "Нужен JSON-объект.")
+    if not isinstance(body, dict) or set(body) != {"name"}:
+        return error_response(400, "invalid_request", "Нужен JSON-объект.")
+    name = body.get("name")
+    if not isinstance(name, str) or len(name) > 80:
+        return error_response(400, "invalid_name", "Имя профиля — до 80 символов.")
+    return name
+
+
+@router.patch("/api/me")
+async def update_me(request: Request) -> JSONResponse:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    name = await read_profile_name(request)
+    if isinstance(name, JSONResponse):
+        return name
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            document = None
+        else:
+            session, account = current
+            try:
+                update_account_name(connection, account["id"], name)
+            except ProfileNameRejected:
+                document = "rejected"
+            else:
+                touch_session(connection, session["id"], now)
+                confirmed_at = account["email_confirmed_at"]
+                stored_period = (
+                    None
+                    if confirmed_at is None
+                    else find_stored_period(connection, account["id"])
+                )
+                document = account_document(
+                    account["id"],
+                    account["email"],
+                    name,
+                    confirmed_at,
+                    stored_period,
+                )
+    if document is None:
+        return unauthenticated()
+    if document == "rejected":
+        return error_response(400, "invalid_name", "Имя профиля — до 80 символов.")
+    return JSONResponse(document)
+
+
 @router.get("/api/me")
 def me(request: Request) -> JSONResponse:
     now = utc_now()
@@ -375,6 +436,54 @@ def request_confirmation(request: Request) -> JSONResponse:
     account_id, email, name, token = issued
     log_confirmation_link(str(request.base_url), token, email)
     return JSONResponse(account_document(account_id, email, name, None))
+
+
+async def read_account_removal(request: Request) -> JSONResponse | None:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(400, "invalid_request", "Нужен JSON-объект.")
+    if not isinstance(body, dict) or set(body) != {"confirm"}:
+        return error_response(400, "invalid_request", "Нужен JSON-объект.")
+    if body.get("confirm") is not True:
+        return error_response(
+            400,
+            "confirmation_required",
+            "Удаление нужно подтвердить.",
+        )
+    return None
+
+
+@router.delete("/api/me")
+async def delete_me(request: Request) -> JSONResponse:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    refusal = await read_account_removal(request)
+    if refusal is not None:
+        return refusal
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            removed = None
+        else:
+            removed = current[1]["id"]
+            delete_account(connection, removed)
+    if removed is None:
+        return unauthenticated()
+    from server.browser_action import forget_account
+
+    forget_account(removed)
+    response = JSONResponse({})
+    response.delete_cookie(
+        key="session",
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
+    return response
 
 
 @router.post("/api/logout")

@@ -395,7 +395,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path not in {"/open", "/sign-in", "/bot-names", "/notify"} or not self._loopback_host():
+        if (
+            parsed.path not in {"/open", "/sign-in", "/bot-names", "/notify", "/account-removed"}
+            or not self._loopback_host()
+        ):
             self._text(404, "")
             return
         if not self._cabinet_origin():
@@ -444,6 +447,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/notify":
             self._notify(body)
+            return
+        if parsed.path == "/account-removed":
+            self._account_removed(body)
             return
         if not self._allowed():
             self._text(403, "")
@@ -676,6 +682,34 @@ class _Handler(BaseHTTPRequestHandler):
             safe["choices"] = result["choices"]
         encoded = json.dumps(safe, ensure_ascii=False).encode("utf-8")
         self._open_bytes(200, encoded)
+
+    def _account_removed(self, body: bytes | None) -> None:
+        if not self._loopback_host() or not self._cabinet_origin():
+            self._text(403, "")
+            return
+        if self.headers.get("X-Desktop-Open") != self.server.open_token:
+            self._open_bytes(403, b"")
+            return
+        if body is None:
+            self._open_bytes(400, b"")
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._open_bytes(400, b"")
+            return
+        if (
+            not isinstance(payload, dict)
+            or payload
+            or "password" in payload
+            or "cookie" in payload
+        ):
+            self._open_bytes(400, b"")
+            return
+        from desktop.removal import mark_account_removed
+
+        mark_account_removed()
+        self._open_bytes(204, b"")
 
     def _notify(self, body: bytes | None) -> None:
         if not self._loopback_host() or not self._cabinet_origin():

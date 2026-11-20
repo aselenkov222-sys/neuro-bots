@@ -199,6 +199,14 @@ def _view(record: dict) -> dict[str, str | bool | None]:
     }
 
 
+def clear_local_vault(run=None) -> None:
+    for record in _load():
+        _delete_secret(record["id"], run)
+    path = _catalog_path()
+    if path.is_file():
+        path.unlink()
+
+
 def _catalog_path() -> Path:
     return default_state_dir() / _CATALOG
 
