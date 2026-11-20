@@ -36,6 +36,11 @@ MARKER = "hook-header-marker"
 UNKNOWN = "unknown-hook-token"
 STUB = "Сейчас я на заглушке агрегатора и не вызываю модель."
 INACTIVE_TEXT = "Подписка неактивна."
+PAYLOAD_TOO_LARGE = {
+    "code": "payload_too_large",
+    "message": "Сообщение длиннее 8 000 символов.",
+}
+INVALID_BODY = {"code": "invalid_body", "message": "Тело запроса не текст."}
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -404,6 +409,60 @@ def test_inactive_subscription_accepts_the_hook_without_the_model(
     assert charges == []
     assert _bot_routines(bot_id) == []
     assert _rows(routine_runs) == []
+
+
+def test_hook_body_of_8000_characters_is_accepted_and_longer_or_non_utf8_is_refused(
+    database: None,
+) -> None:
+    cookie, account_id = _open_ready("hook-body@example.com")
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра"},
+            headers={"Origin": ORIGIN},
+        )
+    assert created.status_code == 200
+    bot_id = created.json()["id"]
+    path = created.json()["inbound_webhook"]
+    accepted_body = "я" * 8000
+    with _client() as caller:
+        accepted = _hook(
+            caller, "POST", f"{path}?q=1", content=accepted_body.encode("utf-8")
+        )
+    assert accepted.status_code == 200
+    assert accepted.json() == {"ok": True}
+    spoken = _chat_messages(bot_id)
+    assert [row["role"] for row in spoken] == ["user", "assistant"]
+    assert spoken[0]["text"] == "POST\nq=1\n" + accepted_body
+    assert len(spoken[0]["text"]) > 8000
+    assert spoken[1]["text"] == STUB
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 1
+    assert len(charges) == 1
+    with _client() as caller:
+        too_long = _hook(
+            caller, "POST", path, content=("я" * 8001).encode("utf-8")
+        )
+        invalid = _hook(caller, "POST", path, content=b"\xff")
+        plain_unknown = caller.get(f"/api/hooks/{UNKNOWN}")
+        bad_unknown = caller.request(
+            "POST", f"/api/hooks/{UNKNOWN}", content=b"\xff"
+        )
+    assert too_long.status_code == 400
+    assert too_long.json() == PAYLOAD_TOO_LARGE
+    assert tuple(too_long.json()) == ("code", "message")
+    assert invalid.status_code == 400
+    assert invalid.json() == INVALID_BODY
+    assert tuple(invalid.json()) == ("code", "message")
+    assert STUB not in too_long.text
+    assert STUB not in invalid.text
+    assert _chat_messages(bot_id) == spoken
+    again, again_charges = _quota(account_id)
+    assert again["used"] == counter["used"]
+    assert len(again_charges) == len(charges)
+    assert bad_unknown.status_code == plain_unknown.status_code
+    assert bad_unknown.content == plain_unknown.content
+    assert UNKNOWN not in bad_unknown.text
 
 
 class _Journal:

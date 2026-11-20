@@ -78,6 +78,8 @@ INVALID_OBJECT = "Нужен JSON-объект."
 NOT_FOUND = "Бот не найден."
 MESSAGE_LIMIT = 8000
 INVALID_MESSAGE = "Сообщение — от 1 до 8 000 символов."
+PAYLOAD_TOO_LARGE = "Сообщение длиннее 8 000 символов."
+INVALID_BODY = "Тело запроса не текст."
 EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
@@ -147,6 +149,16 @@ def hook_message(method: str, query: str, body: str) -> str:
     if body != "":
         lines.append(body)
     return "\n".join(lines)
+
+
+def _decoded_hook_body(raw: bytes) -> str | JSONResponse:
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return error_response(400, "invalid_body", INVALID_BODY)
+    if len(body) > MESSAGE_LIMIT:
+        return error_response(400, "payload_too_large", PAYLOAD_TOO_LARGE)
+    return body
 
 
 class _DropHookAccess(logging.Filter):
@@ -877,8 +889,7 @@ def _raw_query(request: Request) -> str:
 async def receive_hook(request: Request, token: str) -> Response:
     _install_hook_log_filter()
     query = _raw_query(request)
-    body = (await request.body()).decode("utf-8")
-    text = hook_message(request.method, query, body)
+    raw = await request.body()
     now = utc_now()
     with begin() as connection:
         bot = (
@@ -891,11 +902,14 @@ async def receive_hook(request: Request, token: str) -> Response:
         account = find_account_by_id(connection, bot["account_id"])
         if account is None:
             return Response(status_code=404)
+        body = _decoded_hook_body(raw)
+        if isinstance(body, JSONResponse):
+            return body
         _deliver_message(
             Opened(connection, None, account, now),
             bot,
             main_chat(connection, bot["id"]),
-            text,
+            hook_message(request.method, query, body),
         )
     return JSONResponse({"ok": True})
 
