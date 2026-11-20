@@ -885,13 +885,14 @@ def test_unconnected_routine_stops_and_a_named_message_still_opens(
     assert _runs_for(quiet_routine["id"]) == stopped_run
 
 
-def test_a_routine_without_a_catalog_address_is_not_closed(
+def test_a_routine_opens_an_address_outside_the_catalog(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = _record_aggregator(monkeypatch)
     cookie, account_id = _open_period("catalog-foreign-host@example.com")
     monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
-    scenario = "Открой https://other.example/home"
+    outside = "https://other.example/home"
+    scenario = f"Открой {outside}\nещё раз {outside}"
     with _client(cookie) as client:
         _item(client)
         bot = _bot_with_scenario(client, "Чужой", scenario)
@@ -904,9 +905,21 @@ def test_a_routine_without_a_catalog_address_is_not_closed(
     spoken = _chat_messages(uuid.UUID(bot["id"]))
     assert [row["code"] for row in spoken] == [None]
     assert spoken[0]["text"] == STUB_TEXT
+    assert all(row["code"] != "catalog_not_connected" for row in spoken)
+    assert peek_open(account_id, computer) == outside
+    pop_open(account_id, computer)
     assert peek_open(account_id, computer) is None
     assert len(calls) == 1
     assert _used(account_id) == 1
+    with _client(cookie) as client:
+        sent = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": f"Открой {outside}"},
+            headers={"Origin": ORIGIN},
+        )
+    assert sent.status_code == 200
+    assert peek_open(account_id, computer) == outside
+    assert len(calls) == 1
 
 
 def test_connected_routine_opens_a_catalog_address_once_before_a_gate(

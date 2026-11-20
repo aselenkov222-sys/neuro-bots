@@ -860,7 +860,7 @@ def _catalog_closed(
     return False
 
 
-def _enqueue_connected_catalog(
+def _enqueue_named_addresses(
     connection: Connection,
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
@@ -870,16 +870,16 @@ def _enqueue_connected_catalog(
     addresses = _scenario_addresses(scenario)
     if not addresses:
         return queued
-    items = _catalog_rows(connection, account_id)
-    if not items:
-        return queued
     desktop = find_working_desktop(connection, account_id)
     if desktop is None:
         return queued
+    items = _catalog_rows(connection, account_id)
     linked = _linked_catalog_ids(connection, bot_id)
     chat_id = main_chat(connection, bot_id)["id"]
     for address in addresses:
-        if not _connected_to_host(items, linked, address):
+        if _items_for_host(items, address) and not _connected_to_host(
+            items, linked, address
+        ):
             continue
         enqueue_open(
             account_id=account_id,
@@ -938,7 +938,7 @@ def claim_earliest_pending(
     if updated.rowcount != 1:
         return None
     _note_queue(connection, account_id, pending["bot_id"], moment)
-    opened = _enqueue_connected_catalog(
+    opened = _enqueue_named_addresses(
         connection, account_id, pending["bot_id"], pending["scenario"]
     )
     _complete_claimed_run(
