@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
@@ -420,6 +420,74 @@ def test_no_chief_and_the_chiefs_own_routine_write_no_report(
     own = _chat_messages(alone["id"])
     assert [row["code"] for row in own].count("routine_skipped") == 2
     assert all(row["code"] != REPORT_CODE for row in own)
+
+
+def test_a_report_is_a_chat_message_and_not_a_digest(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_confirmed("chief-digest@example.com")
+    seen: list[dict[str, object]] = []
+
+    def spy(**kwargs: object) -> str:
+        seen.append(kwargs)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    digest = "Собери дайджест из отчётов."
+    with _client(cookie) as client:
+        chief = _create(client, "Старший")
+        worker = _create(client, "Почта")
+        _appoint(client, chief["id"])
+        patched = client.patch(
+            f"/api/bots/{chief['id']}",
+            json={"scenario": digest},
+            headers={"Origin": ORIGIN},
+        )
+        assert patched.status_code == 200
+        _desktop(client)
+        _routine(client, worker["id"], "план")
+    _settle(SKIP_AT)
+    assert seen == []
+    before = _chat_messages(chief["id"])
+    assert [row["code"] for row in before] == [REPORT_CODE]
+    assert _scenario(chief["id"]) == digest
+    assert _scenario(worker["id"]) == "план"
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            names = connection.execute(
+                text(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                )
+            ).scalars().all()
+    finally:
+        engine.dispose()
+    assert all("digest" not in name for name in names)
+    with _client(cookie) as client:
+        spoken = client.post(
+            f"/api/bots/{chief['id']}/messages",
+            json={"text": "Что в отчётах?"},
+            headers={"Origin": ORIGIN},
+        )
+        assert spoken.status_code == 200
+    assert len(seen) == 1
+    assert seen[0]["scenario"] == digest
+    handed = seen[0]["messages"]
+    assert isinstance(handed, list)
+    assert [item["text"] for item in handed] == [
+        "Рутина бота «Почта» пропущена.",
+        "Что в отчётах?",
+    ]
+    after = _chat_messages(chief["id"])
+    assert [row["text"] for row in after] == [
+        "Рутина бота «Почта» пропущена.",
+        "Что в отчётах?",
+        STUB_TEXT,
+    ]
+    assert [row["code"] for row in after] == [REPORT_CODE, None, None]
+    assert _scenario(chief["id"]) == digest
+    assert _scenario(worker["id"]) == "план"
+    assert _chat_messages(worker["id"])[0]["code"] == "routine_skipped"
 
 
 def test_cabinet_assigns_the_chief_on_the_bot_card() -> None:
