@@ -936,8 +936,11 @@ def _enqueue_named_addresses(
     return queued
 
 
-def holds_open_run(
-    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+def _holds_run(
+    connection: Connection,
+    account_id: uuid.UUID,
+    computer_id: uuid.UUID,
+    status: str,
 ) -> bool:
     found = connection.execute(
         select(routine_runs.c.id)
@@ -946,11 +949,23 @@ def holds_open_run(
         .where(
             bots.c.account_id == account_id,
             routine_runs.c.computer_id == computer_id,
-            routine_runs.c.status == "awaiting",
+            routine_runs.c.status == status,
         )
         .limit(1)
     ).first()
     return found is not None
+
+
+def holds_open_run(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> bool:
+    return _holds_run(connection, account_id, computer_id, "awaiting")
+
+
+def holds_claimed_run(
+    connection: Connection, account_id: uuid.UUID, computer_id: uuid.UUID
+) -> bool:
+    return _holds_run(connection, account_id, computer_id, "claimed")
 
 
 def run_holder(connection: Connection, run_id: uuid.UUID | None) -> uuid.UUID | None:
@@ -1985,7 +2000,9 @@ async def post_routine_run(request: Request, computer_id: str) -> Response:
             return desktop_not_found()
         working = find_working_desktop(connection, account["id"])
         is_working = working is not None and working["computer_id"] == parsed
-        holds = holds_open_run(connection, account["id"], parsed)
+        holds = holds_open_run(
+            connection, account["id"], parsed
+        ) or holds_claimed_run(connection, account["id"], parsed)
         if not is_working and not holds:
             return desktop_not_found()
         settle_asleep(connection, now)

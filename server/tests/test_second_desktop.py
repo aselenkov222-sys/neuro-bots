@@ -45,6 +45,7 @@ REPO_ROOT = PROJECT_ROOT.parent
 INBOX = "https://example.com/inbox"
 SEND_URL = "https://example.com/send"
 ASLEEP_TEXT = "Запуск завершён: рабочий десктоп уснул."
+SITE_FAILURE = "Запуск завершён: сайт не открылся."
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -489,6 +490,96 @@ def test_transfer_finishes_the_open_run_on_the_old_desktop(
         assert stored[new]["routines_stopped"] is False
     finally:
         clear_opens()
+
+
+def test_transfer_finishes_the_claimed_run_on_the_old_desktop(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB)
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    email = f"transfer-claimed-{uuid.uuid4()}@example.com"
+    cookie, account_id = _open_account(email)
+    old = uuid.uuid4()
+    new = uuid.uuid4()
+    with _client(cookie) as client:
+        first = client.post(
+            "/api/bots",
+            json={"name": "Почта", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        second = client.post(
+            "/api/bots",
+            json={"name": "Таблица", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        earlier = client.post(
+            f"/api/bots/{first.json()['id']}/routines",
+            json={"weekdays": [3], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        later = client.post(
+            f"/api/bots/{second.json()['id']}/routines",
+            json={"weekdays": [3], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert earlier.status_code == 200
+        assert later.status_code == 200
+        assert _post_desktop(client, old).json()["working"] is True
+        pulsed = client.post(
+            f"/api/desktops/{old}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pulsed.status_code == 200
+    claimed = _routine_run(cookie, old)
+    assert claimed.status_code == 200
+    assert _runs(earlier.json()["id"])[0]["status"] == "claimed"
+    assert _runs(earlier.json()["id"])[0]["computer_id"] == old
+    assert _runs(later.json()["id"])[0]["status"] == "pending"
+    second_cookie = _login(email)
+    with _client(second_cookie) as client:
+        assert _post_desktop(client, new).json()["working"] is False
+        moved = client.post(
+            f"/api/desktops/{new}/working",
+            json={},
+            headers={"Origin": ORIGIN},
+        )
+        assert moved.status_code == 200
+        stale = client.post(
+            f"/api/desktops/{old}/pulse",
+            json={"timezone": "Europe/Moscow"},
+            headers={"Origin": ORIGIN},
+        )
+    assert stale.status_code == 404
+    assert stale.json() == NOT_FOUND
+    run_id = _runs(earlier.json()["id"])[0]["id"]
+    stolen = _routine_run(
+        second_cookie, new, {"id": str(run_id), "reason": "site_not_opened"}
+    )
+    assert stolen.status_code == 204
+    assert _runs(earlier.json()["id"])[0]["status"] == "claimed"
+    reported = _routine_run(
+        cookie, old, {"id": str(run_id), "reason": "site_not_opened"}
+    )
+    assert reported.status_code == 204
+    assert _runs(earlier.json()["id"])[0]["status"] == "failed"
+    assert _runs(earlier.json()["id"])[0]["computer_id"] == old
+    texts = [row["text"] for row in _bot_messages(first.json()["id"])]
+    assert texts == [STUB, SITE_FAILURE]
+    nxt = _routine_run(second_cookie, new)
+    assert nxt.status_code == 200
+    assert nxt.json()["bot_id"] == second.json()["id"]
+    assert _runs(later.json()["id"])[0]["status"] == "claimed"
+    assert _runs(later.json()["id"])[0]["computer_id"] == new
+    stored = {
+        row["computer_id"]: row
+        for row in _rows(desktops)
+        if row["account_id"] == account_id
+    }
+    assert stored[old]["working"] is False
+    assert stored[new]["working"] is True
 
 
 def test_open_run_follows_the_old_desktop_pulse(
