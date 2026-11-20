@@ -420,10 +420,22 @@ function botsScreen() {
     ${form}`;
 }
 
+function profileName() {
+  const account = state.me && state.me.account;
+  if (!account || typeof account.name !== "string") return "";
+  return account.name;
+}
+
 function profileScreen() {
   return `
     ${topbar("Профиль", "", '<a class="btn-quiet" href="#catalog">Каталог</a>' + logoutControl())}
-    ${noticeHtml()}`;
+    ${noticeHtml()}
+    <section class="identity raised">
+      <div class="identity-main">
+        <label class="ink-label" for="profile-name">Имя</label>
+        <input class="name-input" id="profile-name" type="text" maxlength="80" value="${esc(profileName())}" autocomplete="nickname">
+      </div>
+    </section>`;
 }
 
 function catalogForm() {
@@ -1159,6 +1171,9 @@ app.addEventListener("input", (event) => {
 
 app.addEventListener("change", (event) => {
   const target = event.target;
+  if (target.id === "profile-name" && state.me && state.me.account) {
+    if (target.value !== profileName()) saveProfileName(target.value);
+  }
   if (target.id === "bot-name" && state.card) {
     const next = target.value.trim();
     if (!next) target.value = state.card.name;
@@ -1378,6 +1393,13 @@ async function togglePause() {
   const routine = state.routine;
   if (!state.card || !routine || routineLocked()) return;
   saveRoutine({ paused: routine.paused !== true }, routine.id);
+}
+
+async function saveProfileName(name) {
+  const result = await api("/api/me", { method: "PATCH", body: { name } });
+  note(result);
+  if (result.ok && result.data) state.me = result.data;
+  render();
 }
 
 async function sendConfirmation() {

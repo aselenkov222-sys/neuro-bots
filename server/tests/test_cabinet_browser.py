@@ -938,7 +938,8 @@ def test_browser_opens_catalog_from_profile(database: None) -> None:
             assert page.locator("h1").inner_text() == "Профиль"
             assert page.locator("a", has_text="Каталог").count() == 1
             assert page.locator("button", has_text="Выход").count() == 1
-            assert page.locator("input").count() == 0
+            assert page.locator("#profile-name").count() == 1
+            assert page.locator("#profile-name").input_value() == ""
             assert page.locator("text=Хранилище").count() == 0
             assert page.locator("text=Удалить").count() == 0
             assert page.locator("text=Рабочий десктоп").count() == 0

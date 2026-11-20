@@ -9,7 +9,13 @@ from server.models import accounts, sessions
 from server.passwords import PasswordNotAccepted, hash_password, password_accepted
 
 EMAIL_MAX_LENGTH = 254
+PROFILE_NAME_MAX_LENGTH = 80
 SESSION_LIFETIME = timedelta(days=30)
+
+
+class ProfileNameRejected(ValueError):
+    def __init__(self) -> None:
+        super().__init__("profile name is longer than 80 characters")
 
 
 class EmailTooLong(ValueError):
@@ -103,6 +109,14 @@ def touch_session(connection: Connection, session_id: uuid.UUID, now: datetime) 
 
 def delete_session(connection: Connection, session_id: uuid.UUID) -> None:
     connection.execute(sessions.delete().where(sessions.c.id == session_id))
+
+
+def update_account_name(connection: Connection, account_id: uuid.UUID, name: str) -> None:
+    if len(name) > PROFILE_NAME_MAX_LENGTH:
+        raise ProfileNameRejected
+    connection.execute(
+        accounts.update().where(accounts.c.id == account_id).values(name=name)
+    )
 
 
 def find_account_by_email(connection: Connection, email: str) -> RowMapping | None:
