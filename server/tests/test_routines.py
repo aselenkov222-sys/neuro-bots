@@ -2133,6 +2133,15 @@ def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
         engine.dispose()
 
 
+def _inactive_note(rows: list[dict]) -> bool:
+    return (
+        len(rows) == 1
+        and rows[0]["role"] == "error"
+        and rows[0]["code"] is None
+        and rows[0]["text"] == "Подписка неактивна."
+    )
+
+
 def test_inactive_period_cancels_the_minute_and_writes_no_skip(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2156,10 +2165,10 @@ def test_inactive_period_cancels_the_minute_and_writes_no_skip(
     assert runs[0]["status"] == "cancelled"
     assert runs[0]["due_at"] == DUE
     assert runs[0]["local_date"] == date(2026, 11, 18)
-    assert _chat_messages(bot_id) == []
+    assert _inactive_note(_chat_messages(bot_id))
     _settle(SKIP_AT)
     assert _runs_for(created["id"])[0]["status"] == "cancelled"
-    assert _chat_messages(bot_id) == []
+    assert _inactive_note(_chat_messages(bot_id))
 
 
 def test_active_period_from_confirmation_still_opens_the_minute(

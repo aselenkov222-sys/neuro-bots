@@ -41,6 +41,7 @@ _NOT_FOUND_BOT = "Бот не найден."
 _EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 _EMPTY_MODEL_CODE = "empty_model_response"
 _QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
+SUBSCRIPTION_INACTIVE_TEXT = "Подписка неактивна."
 
 _lock = threading.Lock()
 _opens: dict[tuple[uuid.UUID, uuid.UUID], list["_Open"]] = {}
@@ -395,6 +396,12 @@ def _insert_message(
     return message_id
 
 
+def _period_open(connection: Connection, account_id: uuid.UUID, now: datetime) -> bool:
+    from server.routines import period_is_active
+
+    return period_is_active(connection, account_id, now)
+
+
 def _reply_at(connection: Connection, chat_id: uuid.UUID, now: datetime) -> datetime:
     latest = connection.execute(
         select(func.max(messages.c.updated_at)).where(messages.c.chat_id == chat_id)
@@ -440,64 +447,74 @@ def finish_open(
     if chat is None:
         return _bot_not_found()
     reply_at = _reply_at(connection, pending.chat_id, now)
-    counter = _lock_quota(connection, account_id)
-    if counter is None or counter["used"] >= development_tariff.model_requests:
+    if not _period_open(connection, account_id, now):
         _insert_message(
             connection,
             pending.chat_id,
             "error",
-            _QUOTA_EXHAUSTED_TEXT,
+            SUBSCRIPTION_INACTIVE_TEXT,
             None,
             reply_at,
         )
     else:
-        reply = aggregator.complete(
-            description=bot["description"],
-            scenario=bot["scenario"],
-            messages=_adapter_messages(connection, pending.chat_id),
-            desktop_available=_pulse_live(connection, account_id),
-        )
-        text, xlsx = aggregator.split_reply(reply)
-        if text == "":
+        counter = _lock_quota(connection, account_id)
+        if counter is None or counter["used"] >= development_tariff.model_requests:
             _insert_message(
                 connection,
                 pending.chat_id,
                 "error",
-                _EMPTY_MODEL_TEXT,
-                _EMPTY_MODEL_CODE,
-                reply_at,
-            )
-        else:
-            message_id = _insert_message(
-                connection,
-                pending.chat_id,
-                "assistant",
-                text,
+                _QUOTA_EXHAUSTED_TEXT,
                 None,
                 reply_at,
             )
-            if xlsx is not None:
-                store_library_file(
+        else:
+            reply = aggregator.complete(
+                description=bot["description"],
+                scenario=bot["scenario"],
+                messages=_adapter_messages(connection, pending.chat_id),
+                desktop_available=_pulse_live(connection, account_id),
+            )
+            text, xlsx = aggregator.split_reply(reply)
+            if text == "":
+                _insert_message(
                     connection,
-                    bot_id=bot["id"],
-                    chat_id=pending.chat_id,
-                    message_id=message_id,
-                    name=xlsx[0],
-                    content=xlsx[1],
-                    created_at=reply_at,
+                    pending.chat_id,
+                    "error",
+                    _EMPTY_MODEL_TEXT,
+                    _EMPTY_MODEL_CODE,
+                    reply_at,
                 )
-            connection.execute(
-                quota_charges.insert().values(
-                    id=uuid.uuid4(),
-                    period_id=counter["period_id"],
-                    created_at=now,
+            else:
+                message_id = _insert_message(
+                    connection,
+                    pending.chat_id,
+                    "assistant",
+                    text,
+                    None,
+                    reply_at,
                 )
-            )
-            connection.execute(
-                quota_counters.update()
-                .where(quota_counters.c.id == counter["id"])
-                .values(used=counter["used"] + 1)
-            )
+                if xlsx is not None:
+                    store_library_file(
+                        connection,
+                        bot_id=bot["id"],
+                        chat_id=pending.chat_id,
+                        message_id=message_id,
+                        name=xlsx[0],
+                        content=xlsx[1],
+                        created_at=reply_at,
+                    )
+                connection.execute(
+                    quota_charges.insert().values(
+                        id=uuid.uuid4(),
+                        period_id=counter["period_id"],
+                        created_at=now,
+                    )
+                )
+                connection.execute(
+                    quota_counters.update()
+                    .where(quota_counters.c.id == counter["id"])
+                    .values(used=counter["used"] + 1)
+                )
     connection.execute(
         chats.update().where(chats.c.id == pending.chat_id).values(updated_at=reply_at)
     )
@@ -548,64 +565,74 @@ def _answer_held(
     if chat_id is None:
         return
     reply_at = _reply_at(connection, chat_id, now)
-    counter = _lock_quota(connection, account_id)
-    if counter is None or counter["used"] >= development_tariff.model_requests:
+    if not _period_open(connection, account_id, now):
         _insert_message(
             connection,
             chat_id,
             "error",
-            _QUOTA_EXHAUSTED_TEXT,
+            SUBSCRIPTION_INACTIVE_TEXT,
             None,
             reply_at,
         )
     else:
-        reply = aggregator.complete(
-            description=bot["description"],
-            scenario=bot["scenario"],
-            messages=_adapter_messages(connection, chat_id),
-            desktop_available=_pulse_live(connection, account_id),
-        )
-        text, xlsx = aggregator.split_reply(reply)
-        if text == "":
+        counter = _lock_quota(connection, account_id)
+        if counter is None or counter["used"] >= development_tariff.model_requests:
             _insert_message(
                 connection,
                 chat_id,
                 "error",
-                _EMPTY_MODEL_TEXT,
-                _EMPTY_MODEL_CODE,
-                reply_at,
-            )
-        else:
-            message_id = _insert_message(
-                connection,
-                chat_id,
-                "assistant",
-                text,
+                _QUOTA_EXHAUSTED_TEXT,
                 None,
                 reply_at,
             )
-            if xlsx is not None:
-                store_library_file(
+        else:
+            reply = aggregator.complete(
+                description=bot["description"],
+                scenario=bot["scenario"],
+                messages=_adapter_messages(connection, chat_id),
+                desktop_available=_pulse_live(connection, account_id),
+            )
+            text, xlsx = aggregator.split_reply(reply)
+            if text == "":
+                _insert_message(
                     connection,
-                    bot_id=bot_id,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    name=xlsx[0],
-                    content=xlsx[1],
-                    created_at=reply_at,
+                    chat_id,
+                    "error",
+                    _EMPTY_MODEL_TEXT,
+                    _EMPTY_MODEL_CODE,
+                    reply_at,
                 )
-            connection.execute(
-                quota_charges.insert().values(
-                    id=uuid.uuid4(),
-                    period_id=counter["period_id"],
-                    created_at=now,
+            else:
+                message_id = _insert_message(
+                    connection,
+                    chat_id,
+                    "assistant",
+                    text,
+                    None,
+                    reply_at,
                 )
-            )
-            connection.execute(
-                quota_counters.update()
-                .where(quota_counters.c.id == counter["id"])
-                .values(used=counter["used"] + 1)
-            )
+                if xlsx is not None:
+                    store_library_file(
+                        connection,
+                        bot_id=bot_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        name=xlsx[0],
+                        content=xlsx[1],
+                        created_at=reply_at,
+                    )
+                connection.execute(
+                    quota_charges.insert().values(
+                        id=uuid.uuid4(),
+                        period_id=counter["period_id"],
+                        created_at=now,
+                    )
+                )
+                connection.execute(
+                    quota_counters.update()
+                    .where(quota_counters.c.id == counter["id"])
+                    .values(used=counter["used"] + 1)
+                )
     connection.execute(
         chats.update().where(chats.c.id == chat_id).values(updated_at=reply_at)
     )

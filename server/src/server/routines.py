@@ -13,7 +13,12 @@ from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
 from server.accounts import format_utc, touch_session, utc_now
-from server.browser_action import _same_host, enqueue_open, named_address
+from server.browser_action import (
+    SUBSCRIPTION_INACTIVE_TEXT,
+    _same_host,
+    enqueue_open,
+    named_address,
+)
 from server.chief import report_routine
 from server.dangerous import (
     first_gate,
@@ -278,6 +283,23 @@ def _write_chat_error(
     )
 
 
+def _note_subscription_inactive(
+    connection: Connection, bot_id: uuid.UUID, now: datetime
+) -> None:
+    chat = main_chat(connection, bot_id)
+    _insert_message(
+        connection,
+        chat["id"],
+        "error",
+        SUBSCRIPTION_INACTIVE_TEXT,
+        None,
+        now,
+    )
+    connection.execute(
+        chats.update().where(chats.c.id == chat["id"]).values(updated_at=now)
+    )
+
+
 def _write_skip(connection: Connection, bot_id: uuid.UUID, now: datetime) -> None:
     _write_chat_error(connection, bot_id, now, SKIP_CODE, SKIP_TEXT)
     record_notice(connection, bot_id, SKIPPED, now)
@@ -424,7 +446,7 @@ def _ensure_cancelled(
     routine_id: uuid.UUID,
     local_date: date,
     due_at: datetime,
-) -> None:
+) -> bool:
     existing = _run_row(connection, routine_id, local_date)
     if existing is None:
         connection.execute(
@@ -436,10 +458,10 @@ def _ensure_cancelled(
                 status="cancelled",
             )
         )
-        return
+        return True
     if existing["status"] != "pending":
-        return
-    connection.execute(
+        return False
+    updated = connection.execute(
         routine_runs.update()
         .where(
             routine_runs.c.id == existing["id"],
@@ -447,6 +469,7 @@ def _ensure_cancelled(
         )
         .values(status="cancelled")
     )
+    return updated.rowcount == 1
 
 
 def _routines_for_account(
@@ -571,6 +594,7 @@ def _settle_occurrence(
     allowed: bool,
     claimable: bool,
     scenario: object,
+    subscription_inactive: bool = False,
 ) -> None:
     if routine_is_awaiting(connection, routine_id):
         if now >= due_at:
@@ -596,8 +620,11 @@ def _settle_occurrence(
                 )
         return
     if not allowed:
-        if now >= due_at:
-            _ensure_cancelled(connection, routine_id, local_date, due_at)
+        if now >= due_at and _ensure_cancelled(
+            connection, routine_id, local_date, due_at
+        ):
+            if subscription_inactive:
+                _note_subscription_inactive(connection, bot_id, now)
         return
     existing = _run_row(connection, routine_id, local_date)
     if existing is not None and existing["status"] != "pending":
@@ -748,9 +775,11 @@ def settle_due(connection: Connection, now: datetime) -> None:
     )
     for row in rows:
         account_id = row["account_id"]
-        allowed = routine_may_start(
+        may_start = routine_may_start(
             row, working_routines_stopped(connection, account_id)
-        ) and period_is_active(connection, account_id, moment)
+        )
+        period_open = period_is_active(connection, account_id, moment)
+        allowed = may_start and period_open
         zone, claimable = _schedule_desktop(connection, account_id, moment)
         if zone is None:
             continue
@@ -770,6 +799,7 @@ def settle_due(connection: Connection, now: datetime) -> None:
             allowed=allowed,
             claimable=claimable,
             scenario=row["scenario"],
+            subscription_inactive=may_start and not period_open,
         )
 
 
@@ -1593,6 +1623,16 @@ def check_now(request: Request, bot_id: str) -> JSONResponse:
         if scenario_insufficient(bot["scenario"]):
             return _scenario_required()
         chat = main_chat(opened.connection, parsed_id)
+        if not period_is_active(
+            opened.connection, opened.account["id"], opened.now
+        ):
+            _note_subscription_inactive(
+                opened.connection, parsed_id, opened.now
+            )
+            touch_session(opened.connection, opened.session["id"], opened.now)
+            return JSONResponse(
+                _messages_document(opened.connection, chat["id"])
+            )
         queued = (
             _earliest_claimable_run(
                 opened.connection, opened.account["id"], opened.now

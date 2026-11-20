@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import socket
@@ -23,12 +24,15 @@ from server.accounts import (
 )
 from server.app import app
 from server.auth import begin
+from server.browser_action import enqueue_open, finish_open
 from server.db import create_db_engine
 from server.models import (
     accounts,
     chats,
     messages,
+    quota_charges,
     quota_counters,
+    routine_checks,
     routine_runs,
     subscription_periods,
 )
@@ -53,6 +57,7 @@ EMAIL_UNCONFIRMED = {
     "message": "Почта ещё не подтверждена.",
 }
 PRICE_UNSET = {"code": "invalid_request", "message": "Оплата не задана."}
+INACTIVE_TEXT = "Подписка неактивна."
 INVALID_BODY = {"code": "invalid_request", "message": "Нужен JSON-объект."}
 BODY_MARKER = "marker-value"
 COOKIE_MARKER = "marker-cookie"
@@ -685,7 +690,7 @@ def test_settling_at_the_period_end_does_not_open_while_the_flag_stays_true(
     assert len(runs) == 1
     assert runs[0]["status"] != "pending"
     assert runs[0]["due_at"] == DUE
-    assert _chat_messages(bot_id) == []
+    _assert_inactive_chat(bot_id)
     assert _periods(account_id)[0]["active"] is True
     with begin() as connection:
         record_cancellation(connection, account_id, DUE)
@@ -747,7 +752,7 @@ def test_failed_renewal_at_the_end_does_not_start_the_routine(
     assert runs
     assert all(row["status"] != "pending" for row in runs)
     assert calls == []
-    assert _chat_messages(bot_id) == []
+    _assert_inactive_chat(bot_id)
 
 
 def test_missing_period_is_left_alone_by_cancellation_and_failed_renewal(
@@ -817,3 +822,269 @@ def test_payment_rejects_password_and_cookie_keys_without_logging_them(
         assert BODY_MARKER not in response.text
         assert COOKIE_MARKER not in response.text
     assert _periods(account_id) == []
+
+
+def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                subscription_periods.update()
+                .where(subscription_periods.c.account_id == account_id)
+                .values(active=active)
+            )
+    finally:
+        engine.dispose()
+
+
+def _charges(account_id: uuid.UUID) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            period_ids = (
+                connection.execute(
+                    select(subscription_periods.c.id).where(
+                        subscription_periods.c.account_id == account_id
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            rows = (
+                connection.execute(
+                    select(quota_charges).where(
+                        quota_charges.c.period_id.in_(period_ids)
+                    )
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
+def _checks(bot_id: uuid.UUID) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            rows = (
+                connection.execute(
+                    select(routine_checks).where(routine_checks.c.bot_id == bot_id)
+                )
+                .mappings()
+                .all()
+            )
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
+def _main_chat_id(bot_id: uuid.UUID) -> uuid.UUID:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            chat_id = connection.execute(
+                select(chats.c.id).where(chats.c.bot_id == bot_id)
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    return chat_id
+
+
+def _assert_inactive_chat(bot_id: uuid.UUID) -> None:
+    rows = _chat_messages(bot_id)
+    assert len(rows) == 1
+    assert rows[0]["role"] == "error"
+    assert rows[0]["code"] is None
+    assert rows[0]["text"] == INACTIVE_TEXT
+
+
+def _priced_bot(email: str) -> tuple[uuid.UUID, str, dict, dict]:
+    started = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    account_id, cookie = _open_account(email, started)
+    _insert_open_period(account_id, started, calendar_month_end(started))
+    with _client(cookie) as client:
+        created_bot = client.post(
+            "/api/bots",
+            json={"name": "Искра", "scenario": "план"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created_bot.status_code == 200
+        bot = created_bot.json()
+        created = client.post(
+            f"/api/bots/{bot['id']}/routines",
+            json={"weekdays": [1, 3, 5], "time": "09:00"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+    return account_id, cookie, bot, created.json()
+
+
+def test_inactive_period_keeps_reads_and_edits_open(database: None) -> None:
+    account_id, cookie, bot, routine = _priced_bot(
+        f"pay-read-edit-{uuid.uuid4()}@example.com"
+    )
+    _set_period_active(account_id, False)
+    assert _periods(account_id)[0]["active"] is False
+    with _client(cookie) as client:
+        loaded = client.get(f"/api/bots/{bot['id']}")
+        spoken = client.get(f"/api/bots/{bot['id']}/messages")
+        library = client.get(f"/api/bots/{bot['id']}/library")
+        renamed = client.patch(
+            f"/api/bots/{bot['id']}",
+            json={"name": "Новая", "scenario": "другой план"},
+            headers={"Origin": ORIGIN},
+        )
+        rescheduled = client.patch(
+            f"/api/bots/{bot['id']}/routines/{routine['id']}",
+            json={"weekdays": [2, 4], "time": "10:30"},
+            headers={"Origin": ORIGIN},
+        )
+        profile = client.patch(
+            "/api/me",
+            json={"name": "Аня"},
+            headers={"Origin": ORIGIN},
+        )
+    assert loaded.status_code == 200
+    assert loaded.json()["name"] == "Искра"
+    assert spoken.status_code == 200
+    assert spoken.json()["messages"] == []
+    assert library.status_code == 200
+    assert library.json()["files"] == []
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "Новая"
+    assert renamed.json()["scenario"] == "другой план"
+    assert rescheduled.status_code == 200
+    assert rescheduled.json()["weekdays"] == [2, 4]
+    assert rescheduled.json()["time"] == "10:30"
+    assert profile.status_code == 200
+    assert profile.json()["account"]["name"] == "Аня"
+    assert _used(_periods(account_id)[0]["id"]) == 0
+    assert _charges(account_id) == []
+
+
+def test_inactive_message_saves_the_user_and_skips_the_model(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    account_id, cookie, bot, _routine = _priced_bot(
+        f"pay-message-{uuid.uuid4()}@example.com"
+    )
+    _set_period_active(account_id, False)
+    proposal = "сохрани в сценарий: новый план"
+    with _client(cookie) as client:
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": proposal},
+            headers={"Origin": ORIGIN},
+        )
+        kept = client.get(f"/api/bots/{bot['id']}")
+    assert posted.status_code == 200
+    user, error = posted.json()["messages"]
+    assert user["role"] == "user"
+    assert user["text"] == proposal
+    assert error["role"] == "error"
+    assert error["code"] is None
+    assert error["text"] == INACTIVE_TEXT
+    assert kept.json()["scenario"] == "план"
+    assert _used(_periods(account_id)[0]["id"]) == 0
+    assert _charges(account_id) == []
+
+
+def test_ended_period_with_the_flag_still_true_does_not_charge_a_message(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    account_id, cookie, bot, _routine = _priced_bot(
+        f"pay-ended-message-{uuid.uuid4()}@example.com"
+    )
+    moment = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+    _set_ends_at(account_id, moment)
+    assert _periods(account_id)[0]["active"] is True
+    monkeypatch.setattr("server.bots.utc_now", lambda: moment)
+    with _client(cookie) as client:
+        posted = client.post(
+            f"/api/bots/{bot['id']}/messages",
+            json={"text": "ещё"},
+            headers={"Origin": ORIGIN},
+        )
+    assert posted.status_code == 200
+    user, error = posted.json()["messages"]
+    assert user["role"] == "user"
+    assert error["role"] == "error"
+    assert error["code"] is None
+    assert error["text"] == INACTIVE_TEXT
+    assert _periods(account_id)[0]["active"] is True
+    assert _used(_periods(account_id)[0]["id"]) == 0
+    assert _charges(account_id) == []
+
+
+def test_check_now_writes_inactive_and_leaves_no_check(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    account_id, cookie, bot, routine = _priced_bot(
+        f"pay-check-{uuid.uuid4()}@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    _set_period_active(account_id, False)
+    with _client(cookie) as client:
+        posted = client.post(
+            f"/api/bots/{bot['id']}/check",
+            headers={"Origin": ORIGIN},
+        )
+    assert posted.status_code == 200
+    spoken = posted.json()["messages"]
+    assert len(spoken) == 1
+    assert spoken[0]["role"] == "error"
+    assert spoken[0]["code"] is None
+    assert spoken[0]["text"] == INACTIVE_TEXT
+    assert "queued" not in posted.json()
+    assert _checks(bot_id) == []
+    assert _runs_for(routine["id"]) == []
+    assert _charges(account_id) == []
+    assert _used(_periods(account_id)[0]["id"]) == 0
+
+
+def test_finish_open_with_an_ended_period_does_not_call_the_model(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_aggregator(monkeypatch)
+    account_id, _cookie, bot, _routine = _priced_bot(
+        f"pay-open-{uuid.uuid4()}@example.com"
+    )
+    bot_id = uuid.UUID(bot["id"])
+    moment = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+    _set_ends_at(account_id, moment)
+    assert _periods(account_id)[0]["active"] is True
+    chat_id = _main_chat_id(bot_id)
+    computer = uuid.uuid4()
+    with begin() as connection:
+        connection.execute(
+            messages.insert().values(
+                id=uuid.uuid4(),
+                chat_id=chat_id,
+                role="user",
+                text="открой",
+                code=None,
+                updated_at=moment - timedelta(seconds=1),
+            )
+        )
+        enqueue_open(
+            account_id=account_id,
+            computer_id=computer,
+            url="https://example.com/page",
+            bot_id=bot_id,
+            chat_id=chat_id,
+        )
+        finished = finish_open(connection, account_id, computer, moment, "страница")
+    assert finished.status_code == 200
+    payload = json.loads(finished.body)
+    assert [row["role"] for row in payload["messages"]] == ["user", "error"]
+    error = payload["messages"][1]
+    assert error["code"] is None
+    assert error["text"] == INACTIVE_TEXT
+    assert _periods(account_id)[0]["active"] is True
+    assert _used(_periods(account_id)[0]["id"]) == 0
+    assert _charges(account_id) == []
