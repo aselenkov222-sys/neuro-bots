@@ -455,25 +455,6 @@ function accountRemoval() {
     </div>`;
 }
 
-function desktopRole() {
-  const bridge = window.__neuroDesktop;
-  if (!bridge || typeof bridge.id !== "string") return "";
-  if (state.desktopWorking !== true && state.desktopWorking !== false) return "";
-  if (state.desktopWorking === true) {
-    return `
-    <section class="panel sheet" id="desktop-role">
-      <p class="hint">Этот компьютер запускает рутины.</p>
-    </section>`;
-  }
-  return `
-    <section class="panel sheet" id="desktop-role">
-      <p class="hint">Рутины запускает другой компьютер.</p>
-      <div class="actions">
-        <button type="button" class="btn-orange" data-action="transfer-role">Перенести роль сюда</button>
-      </div>
-    </section>`;
-}
-
 function profileScreen() {
   return `
     ${topbar("Профиль", "", '<a class="btn-quiet" href="#catalog">Каталог</a>' + logoutControl())}
@@ -556,6 +537,25 @@ function catalogScreen() {
 function routineLocked() {
   const bot = state.card;
   return !bot || typeof bot.scenario !== "string" || bot.scenario.trim() === "";
+}
+
+function desktopRole() {
+  const bridge = window.__neuroDesktop;
+  if (!bridge || typeof bridge.id !== "string") return "";
+  if (state.desktopWorking !== true && state.desktopWorking !== false) return "";
+  if (state.desktopWorking === true) {
+    return `
+    <section class="panel sheet" id="desktop-role">
+      <p class="hint">Этот компьютер запускает рутины.</p>
+    </section>`;
+  }
+  return `
+    <section class="panel sheet" id="desktop-role">
+      <p class="hint">Рутины запускает другой компьютер.</p>
+      <div class="actions">
+        <button type="button" class="btn-orange" data-action="transfer-role">Перенести роль сюда</button>
+      </div>
+    </section>`;
 }
 
 function routineBlock() {

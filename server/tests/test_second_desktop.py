@@ -781,7 +781,7 @@ def test_later_save_replaces_the_earlier_one_and_there_is_no_compare_screen(
 def test_profile_holds_the_role_transfer() -> None:
     script = (REPO_ROOT / "web" / "app.js").read_text(encoding="utf-8")
     role = script.split("function desktopRole()", 1)[1].split(
-        "function profileScreen()", 1
+        "function routineBlock()", 1
     )[0]
     profile = script.split("function profileScreen()", 1)[1].split(
         "function catalogForm()", 1

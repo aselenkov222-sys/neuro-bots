@@ -102,6 +102,7 @@ LIBRARY_REVISION = "c2d8f4a91e73"
 CATALOG_REVISION = "d9b4e2a71c58"
 CONNECTION_REVISION = "e2b7c4a91f06"
 CHIEF_REVISION = "a9c3e7b14d82"
+COMPUTER_REVISION = "b6d2e8a14c70"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -174,6 +175,7 @@ ROUTINE_RUN_COLUMNS = (
     "due_at",
     "status",
     "claimed_at",
+    "computer_id",
 )
 ROUTINE_RUN_STATUS_CHECK = (
     "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
@@ -275,8 +277,10 @@ def _revision_chain() -> list[str]:
     assert links[CATALOG_REVISION] == LIBRARY_REVISION
     assert links[CONNECTION_REVISION] == CATALOG_REVISION
     assert links[CHIEF_REVISION] == CONNECTION_REVISION
-    assert links[chain[-1]] == CONNECTION_REVISION
-    assert chain[-1] == CHIEF_REVISION
+    assert links[COMPUTER_REVISION] == CHIEF_REVISION
+    assert links[chain[-1]] == CHIEF_REVISION
+    assert chain[-1] == COMPUTER_REVISION
+    assert chain[-1] != CHIEF_REVISION
     assert chain[-1] != CONNECTION_REVISION
     assert chain[-1] != CATALOG_REVISION
     assert chain[-1] != LIBRARY_REVISION
@@ -927,6 +931,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=True,
         timezone=True,
     )
+    _assert_model_column(routine_runs.c.computer_id, Uuid, nullable=True)
     assert [
         (constraint.name, str(constraint.sqltext))
         for constraint in routine_runs.constraints
@@ -1674,6 +1679,13 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "claimed_at",
                     "timestamptz",
                     "timestamp with time zone",
+                    not_null=False,
+                )
+                _assert_catalog_column(
+                    run_columns,
+                    "computer_id",
+                    "uuid",
+                    "uuid",
                     not_null=False,
                 )
                 assert _constraints(connection, "routine_runs") == {
