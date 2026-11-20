@@ -1,19 +1,35 @@
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 
-from server.accounts import create_account, create_session, format_utc
+from server.accounts import (
+    calendar_month_end,
+    create_account,
+    create_session,
+    format_utc,
+)
 from server.app import app
-from server.browser_action import named_address
+from server.browser_action import clear_opens, named_address, peek_open, pop_open
 from server.catalog import INVALID_CONNECTION, ITEM_NOT_FOUND, NEED_ADDRESS, NEED_FIELDS
 from server.db import create_db_engine
-from server.models import accounts, catalog_app_bots, catalog_apps
+from server.models import (
+    accounts,
+    catalog_app_bots,
+    catalog_apps,
+    chats,
+    desktop_notices,
+    messages,
+    quota_charges,
+    quota_counters,
+    routine_runs,
+    subscription_periods,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -49,6 +65,13 @@ UNCONFIRMED = {"code": "email_unconfirmed", "message": "Почта ещё не �
 INVALID_CONNECTION_BODY = {"code": INVALID_REQUEST, "message": INVALID_CONNECTION}
 ITEM_MISSING = {"code": "not_found", "message": ITEM_NOT_FOUND}
 BOT_MISSING = {"code": "not_found", "message": "Бот не найден."}
+DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
+CLAIM_AT = DUE + timedelta(seconds=59)
+CATALOG_ADDRESS = "https://example.com/notes"
+CATALOG_SCENARIO = "Открой https://Example.com/notes."
+CATALOG_CLOSED = "Запуск завершён: приложение не подключено."
+STUB_TEXT = "Сейчас я на заглушке агрегатора и не вызываю модель."
+WEEKDAY_MORNING = {"weekdays": [1, 3, 5], "time": "09:00"}
 _rows_after_upgrade = -1
 
 
@@ -159,6 +182,13 @@ def _open_ready(email: str, *, confirmed: bool = True) -> tuple[str, uuid.UUID]:
     finally:
         engine.dispose()
     return str(session_id), account_id
+
+
+@pytest.fixture(autouse=True)
+def _fresh_opens() -> None:
+    clear_opens()
+    yield
+    clear_opens()
 
 
 def _client(cookie: str | None = None) -> TestClient:
@@ -639,3 +669,271 @@ def test_routes_have_no_oauth_provider_or_site_api() -> None:
         if path == "/api/catalog/{item_id}/connection"
     ]
     assert connection == [frozenset({"PUT"})]
+
+
+def _rows(table) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(select(table)).mappings().all()
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
+def _open_period(email: str) -> tuple[str, uuid.UUID]:
+    confirmed_at = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            account_id = create_account(connection, email, ACCEPTED)
+            session_id = create_session(connection, account_id)
+            connection.execute(
+                accounts.update()
+                .where(accounts.c.id == account_id)
+                .values(email_confirmed_at=confirmed_at)
+            )
+            period_id = uuid.uuid4()
+            connection.execute(
+                subscription_periods.insert().values(
+                    id=period_id,
+                    account_id=account_id,
+                    started_at=confirmed_at,
+                    ends_at=calendar_month_end(confirmed_at),
+                    active=True,
+                )
+            )
+            connection.execute(
+                quota_counters.insert().values(
+                    id=uuid.uuid4(),
+                    period_id=period_id,
+                    used=0,
+                )
+            )
+    finally:
+        engine.dispose()
+    return str(session_id), account_id
+
+
+def _chat_messages(bot_id: uuid.UUID) -> list[dict]:
+    chat_ids = {row["id"] for row in _rows(chats) if row["bot_id"] == bot_id}
+    return [row for row in _rows(messages) if row["chat_id"] in chat_ids]
+
+
+def _runs_for(routine_id: str) -> list[dict]:
+    parsed = uuid.UUID(routine_id)
+    return [row for row in _rows(routine_runs) if row["routine_id"] == parsed]
+
+
+def _notices(bot_id: uuid.UUID) -> list[str]:
+    return [
+        row["kind"]
+        for row in _rows(desktop_notices)
+        if row["bot_id"] == bot_id
+    ]
+
+
+def _used(account_id: uuid.UUID) -> int:
+    period_ids = {
+        row["id"]
+        for row in _rows(subscription_periods)
+        if row["account_id"] == account_id
+    }
+    return next(
+        row["used"]
+        for row in _rows(quota_counters)
+        if row["period_id"] in period_ids
+    )
+
+
+def _charges(account_id: uuid.UUID) -> list[dict]:
+    period_ids = {
+        row["id"]
+        for row in _rows(subscription_periods)
+        if row["account_id"] == account_id
+    }
+    return [
+        row for row in _rows(quota_charges) if row["period_id"] in period_ids
+    ]
+
+
+def _bot_with_scenario(client: TestClient, name: str, scenario: str) -> dict:
+    created = client.post(
+        "/api/bots",
+        json={"name": name, "scenario": scenario},
+        headers={"Origin": ORIGIN},
+    )
+    assert created.status_code == 200
+    assert created.json()["scenario"] == scenario
+    return created.json()
+
+
+def _routine(client: TestClient, bot_id: str) -> dict:
+    created = client.post(
+        f"/api/bots/{bot_id}/routines",
+        json=WEEKDAY_MORNING,
+        headers={"Origin": ORIGIN},
+    )
+    assert created.status_code == 200
+    return created.json()
+
+
+def _working_desktop(client: TestClient) -> uuid.UUID:
+    computer = uuid.uuid4()
+    posted = client.post(
+        "/api/desktops",
+        json={"id": str(computer)},
+        headers={"Origin": ORIGIN},
+    )
+    assert posted.status_code == 200
+    pulsed = client.post(
+        f"/api/desktops/{computer}/pulse",
+        json={"timezone": "Europe/Moscow"},
+        headers={"Origin": ORIGIN},
+    )
+    assert pulsed.status_code == 200
+    return computer
+
+
+def _claim(client: TestClient, computer: uuid.UUID):
+    return client.post(
+        f"/api/desktops/{computer}/routine-run",
+        headers={"Origin": ORIGIN},
+    )
+
+
+def _record_aggregator(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    calls: list[object] = []
+
+    def spy(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    return calls
+
+
+def test_unconnected_routine_stops_and_a_named_message_still_opens(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-closed@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    with _client(cookie) as client:
+        item = _item(client)
+        quiet = _bot_with_scenario(client, "Тишина", CATALOG_SCENARIO)
+        quiet_routine = _routine(client, quiet["id"])
+        linked = _bot_with_scenario(
+            client,
+            "Связь",
+            f"{CATALOG_SCENARIO}\nещё раз https://Example.com/notes.",
+        )
+        linked_routine = _routine(client, linked["id"])
+        connected = _connect(
+            client, item["id"], {"everyone": False, "bot_ids": [linked["id"]]}
+        )
+        assert connected.status_code == 200
+        assert connected.json()["everyone"] is False
+        assert connected.json()["bot_ids"] == [linked["id"]]
+        computer = _working_desktop(client)
+        stopped = _claim(client, computer)
+    assert stopped.status_code == 204
+    quiet_id = uuid.UUID(quiet["id"])
+    stopped_run = _runs_for(quiet_routine["id"])
+    assert len(stopped_run) == 1
+    assert stopped_run[0]["status"] == "failed"
+    assert stopped_run[0]["claimed_at"] is None
+    assert stopped_run[0]["due_at"] == DUE
+    quiet_messages = _chat_messages(quiet_id)
+    assert len(quiet_messages) == 1
+    assert quiet_messages[0]["role"] == "error"
+    assert quiet_messages[0]["code"] == "catalog_not_connected"
+    assert quiet_messages[0]["text"] == CATALOG_CLOSED
+    assert _notices(quiet_id) == ["failed"]
+    assert calls == []
+    assert _used(account_id) == 0
+    assert _charges(account_id) == []
+    assert peek_open(account_id, computer) is None
+    assert _runs_for(linked_routine["id"])[0]["status"] == "pending"
+    assert _chat_messages(uuid.UUID(linked["id"])) == []
+    with _client(cookie) as client:
+        sent = client.post(
+            f"/api/bots/{quiet['id']}/messages",
+            json={"text": CATALOG_SCENARIO},
+            headers={"Origin": ORIGIN},
+        )
+    assert sent.status_code == 200
+    assert peek_open(account_id, computer) == CATALOG_ADDRESS
+    assert calls == []
+    assert _charges(account_id) == []
+    pop_open(account_id, computer)
+    with _client(cookie) as client:
+        opened = _claim(client, computer)
+    assert opened.status_code == 200
+    assert opened.json()["bot_id"] == linked["id"]
+    assert opened.json()["routine_id"] == linked_routine["id"]
+    assert _runs_for(linked_routine["id"])[0]["status"] == "claimed"
+    assert peek_open(account_id, computer) == CATALOG_ADDRESS
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    linked_messages = _chat_messages(uuid.UUID(linked["id"]))
+    assert [row["text"] for row in linked_messages] == [STUB_TEXT]
+    assert all(row["code"] != "catalog_not_connected" for row in linked_messages)
+    assert len(calls) == 1
+    assert _used(account_id) == 1
+    assert len(_charges(account_id)) == 1
+    assert _runs_for(quiet_routine["id"]) == stopped_run
+
+
+def test_a_routine_without_a_catalog_address_is_not_closed(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-foreign-host@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    scenario = "Открой https://other.example/home"
+    with _client(cookie) as client:
+        _item(client)
+        bot = _bot_with_scenario(client, "Чужой", scenario)
+        created = _routine(client, bot["id"])
+        computer = _working_desktop(client)
+        claimed = _claim(client, computer)
+    assert claimed.status_code == 200
+    assert claimed.json()["bot_id"] == bot["id"]
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    spoken = _chat_messages(uuid.UUID(bot["id"]))
+    assert [row["code"] for row in spoken] == [None]
+    assert spoken[0]["text"] == STUB_TEXT
+    assert peek_open(account_id, computer) is None
+    assert len(calls) == 1
+    assert _used(account_id) == 1
+
+
+def test_connected_routine_opens_a_catalog_address_once_before_a_gate(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-gate@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    scenario = (
+        f"{CATALOG_SCENARIO}\n"
+        "ещё раз https://Example.com/notes.\n"
+        "Отправить письмо"
+    )
+    with _client(cookie) as client:
+        item = _item(client)
+        bot = _bot_with_scenario(client, "Порог", scenario)
+        created = _routine(client, bot["id"])
+        connected = _connect(
+            client, item["id"], {"everyone": False, "bot_ids": [bot["id"]]}
+        )
+        assert connected.status_code == 200
+        computer = _working_desktop(client)
+        claimed = _claim(client, computer)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "awaiting"
+    assert peek_open(account_id, computer) == CATALOG_ADDRESS
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    assert calls == []
+    assert _charges(account_id) == []
