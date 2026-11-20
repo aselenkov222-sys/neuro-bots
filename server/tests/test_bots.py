@@ -40,6 +40,7 @@ BOT_FIELDS = (
     "description",
     "scenario",
     "updated_at",
+    "chief",
 )
 INVALID_ORIGIN = {
     "code": "invalid_origin",
@@ -192,6 +193,7 @@ def test_create_opens_one_main_chat_and_uses_the_default_avatar(
         assert body["icon"] == "spark"
         assert body["description"] == ""
         assert body["scenario"] == ""
+        assert body["chief"] is False
         bot_id = uuid.UUID(body["id"])
         assert str(bot_id) == body["id"]
         stored = [row for row in _owned(bots, account_id) if row["id"] == bot_id]
@@ -203,6 +205,7 @@ def test_create_opens_one_main_chat_and_uses_the_default_avatar(
         assert bot["icon"] == "spark"
         assert bot["description"] == ""
         assert bot["scenario"] == ""
+        assert bot["chief"] is False
         assert body["updated_at"] == format_utc(bot["updated_at"])
         assert abs(
             (datetime.now(timezone.utc) - bot["updated_at"]).total_seconds()

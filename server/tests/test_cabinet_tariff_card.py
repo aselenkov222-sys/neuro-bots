@@ -7,12 +7,10 @@ from server.app import app
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 REMOVED = (
-    "Главный",
     "Рабочий десктоп",
     "Оплатить",
     'data-action="pay"',
     "pick-tariff",
-    "main-toggle",
     "Выбор тарифа",
     "Тариф 1",
     "Тариф 2",

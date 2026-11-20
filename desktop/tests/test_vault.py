@@ -135,6 +135,29 @@ def test_shared_record_is_visible_to_two_bots(
     assert read_record_password(shared["id"], BORIS, run=security) == SECRET
 
 
+def test_the_chief_does_not_see_another_bots_personal_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("NEURO_BOTS_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(vault_module.subprocess, "run", _forbid_real_security)
+    security = FakeSecurity()
+    chief = "bot-chief"
+    worker = "bot-worker"
+    personal = add_record(
+        SITE, LOGIN, SECRET, shared=False, bot_id=worker, run=security
+    )
+    shared = add_record(SITE, "общий", OTHER_SECRET, shared=True, run=security)
+    taken = len(security.commands)
+    visible = records_for_bot(chief)
+    assert _ids(visible) == {shared["id"]}
+    assert all(item["bot_id"] is None for item in visible)
+    assert SECRET not in json.dumps(visible)
+    assert read_record_password(personal["id"], chief, run=security) is None
+    assert read_record_password(shared["id"], chief, run=security) == OTHER_SECRET
+    assert len(security.commands) == taken + 1
+    assert read_record_password(personal["id"], worker, run=security) == SECRET
+
+
 def test_personal_record_is_visible_only_to_its_bot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

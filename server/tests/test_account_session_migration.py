@@ -57,6 +57,7 @@ BOT_COLUMNS = (
     "description",
     "scenario",
     "updated_at",
+    "chief",
 )
 CHAT_COLUMNS = ("id", "bot_id", "updated_at", "kind", "created_at")
 MESSAGE_COLUMNS = ("id", "chat_id", "role", "text", "code", "updated_at")
@@ -100,6 +101,7 @@ CHAT_REVISION = "e7a1c4b82d60"
 LIBRARY_REVISION = "c2d8f4a91e73"
 CATALOG_REVISION = "d9b4e2a71c58"
 CONNECTION_REVISION = "e2b7c4a91f06"
+CHIEF_REVISION = "a9c3e7b14d82"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -272,8 +274,10 @@ def _revision_chain() -> list[str]:
     assert links[LIBRARY_REVISION] == CHAT_REVISION
     assert links[CATALOG_REVISION] == LIBRARY_REVISION
     assert links[CONNECTION_REVISION] == CATALOG_REVISION
-    assert links[chain[-1]] == CATALOG_REVISION
-    assert chain[-1] == CONNECTION_REVISION
+    assert links[CHIEF_REVISION] == CONNECTION_REVISION
+    assert links[chain[-1]] == CONNECTION_REVISION
+    assert chain[-1] == CHIEF_REVISION
+    assert chain[-1] != CONNECTION_REVISION
     assert chain[-1] != CATALOG_REVISION
     assert chain[-1] != LIBRARY_REVISION
     assert chain[-1] != CHAT_REVISION
@@ -742,6 +746,17 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=False,
         timezone=True,
     )
+    assert isinstance(bots.c.chief.type, Boolean)
+    assert bots.c.chief.nullable is False
+    assert bots.c.chief.default is None
+    assert bots.c.chief.server_default.arg.text == "false"
+    assert list(bots.c.chief.foreign_keys) == []
+    assert [index.name for index in bots.indexes] == ["bots_one_chief"]
+    chief_index = next(iter(bots.indexes))
+    assert isinstance(chief_index, Index)
+    assert chief_index.unique is True
+    assert [column.name for column in chief_index.columns] == ["account_id"]
+    assert str(chief_index.dialect_options["postgresql"]["where"]) == "chief"
 
     assert [column.name for column in chats.primary_key] == ["id"]
     _assert_model_column(chats.c.id, Uuid, nullable=False)
@@ -1428,6 +1443,20 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "timestamp with time zone",
                     not_null=True,
                 )
+                assert bot_columns["chief"]["type_name"] == "bool"
+                assert bot_columns["chief"]["format_type"] == "boolean"
+                assert bot_columns["chief"]["not_null"] is True
+                assert bot_columns["chief"]["column_default"] == "false"
+                chief_indexes = [
+                    row
+                    for row in _indexes(connection, "bots")
+                    if row["index_name"] == "bots_one_chief"
+                ]
+                assert len(chief_indexes) == 1
+                chief_row = chief_indexes[0]
+                assert chief_row["is_unique"] is True
+                assert chief_row["predicate"] == "chief"
+                assert list(chief_row["columns"]) == ["account_id"]
                 assert _constraints(connection, "bots") == {
                     ("p", "PRIMARY KEY (id)"),
                     (
