@@ -305,4 +305,27 @@ catalog_apps = Table(
     Column("address", Text(), nullable=False),
     Column("description", Text(), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    Column(
+        "everyone",
+        Boolean(),
+        nullable=False,
+        server_default=text("false"),
+    ),
+)
+
+catalog_app_bots = Table(
+    "catalog_app_bots",
+    metadata,
+    Column(
+        "catalog_app_id",
+        Uuid(),
+        ForeignKey("catalog_apps.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "bot_id",
+        Uuid(),
+        ForeignKey("bots.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
 )

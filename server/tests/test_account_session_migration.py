@@ -99,6 +99,7 @@ GATE_REVISION = "b3c7e9a41d52"
 CHAT_REVISION = "e7a1c4b82d60"
 LIBRARY_REVISION = "c2d8f4a91e73"
 CATALOG_REVISION = "d9b4e2a71c58"
+CONNECTION_REVISION = "e2b7c4a91f06"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -141,7 +142,9 @@ CATALOG_APP_COLUMNS = (
     "address",
     "description",
     "created_at",
+    "everyone",
 )
+CATALOG_APP_BOT_COLUMNS = ("catalog_app_id", "bot_id")
 DANGEROUS_STEP_COLUMNS = (
     "id",
     "run_id",
@@ -268,8 +271,10 @@ def _revision_chain() -> list[str]:
     assert links[CHAT_REVISION] == GATE_REVISION
     assert links[LIBRARY_REVISION] == CHAT_REVISION
     assert links[CATALOG_REVISION] == LIBRARY_REVISION
-    assert links[chain[-1]] == LIBRARY_REVISION
-    assert chain[-1] == CATALOG_REVISION
+    assert links[CONNECTION_REVISION] == CATALOG_REVISION
+    assert links[chain[-1]] == CATALOG_REVISION
+    assert chain[-1] == CONNECTION_REVISION
+    assert chain[-1] != CATALOG_REVISION
     assert chain[-1] != LIBRARY_REVISION
     assert chain[-1] != CHAT_REVISION
     assert chain[-1] != GATE_REVISION
@@ -549,6 +554,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     dangerous_steps = metadata.tables["dangerous_steps"]
     library_files = metadata.tables["library_files"]
     catalog_apps = metadata.tables["catalog_apps"]
+    catalog_app_bots = metadata.tables["catalog_app_bots"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -567,6 +573,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "dangerous_steps",
         "library_files",
         "catalog_apps",
+        "catalog_app_bots",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -585,6 +592,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert dangerous_steps is server.models.dangerous_steps
     assert library_files is server.models.library_files
     assert catalog_apps is server.models.catalog_apps
+    assert catalog_app_bots is server.models.catalog_app_bots
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -602,6 +610,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(dangerous_steps.columns.keys()) == DANGEROUS_STEP_COLUMNS
     assert tuple(library_files.columns.keys()) == LIBRARY_FILE_COLUMNS
     assert tuple(catalog_apps.columns.keys()) == CATALOG_APP_COLUMNS
+    assert tuple(catalog_app_bots.columns.keys()) == CATALOG_APP_BOT_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -1114,12 +1123,42 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         nullable=False,
         timezone=True,
     )
+    assert isinstance(catalog_apps.c.everyone.type, Boolean)
+    assert catalog_apps.c.everyone.nullable is False
+    assert catalog_apps.c.everyone.default is None
+    assert catalog_apps.c.everyone.server_default.arg.text == "false"
+    assert list(catalog_apps.c.everyone.foreign_keys) == []
     assert [
         (constraint.name, str(constraint.sqltext))
         for constraint in catalog_apps.constraints
         if isinstance(constraint, CheckConstraint)
     ] == []
     assert list(catalog_apps.indexes) == []
+
+    assert [column.name for column in catalog_app_bots.primary_key] == [
+        "catalog_app_id",
+        "bot_id",
+    ]
+    _assert_model_column(
+        catalog_app_bots.c.catalog_app_id,
+        Uuid,
+        nullable=False,
+        foreign_table="catalog_apps",
+        ondelete="CASCADE",
+    )
+    _assert_model_column(
+        catalog_app_bots.c.bot_id,
+        Uuid,
+        nullable=False,
+        foreign_table="bots",
+        ondelete="CASCADE",
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in catalog_app_bots.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == []
+    assert list(catalog_app_bots.indexes) == []
 
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
@@ -1168,6 +1207,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "dangerous_steps",
                     "library_files",
                     "catalog_apps",
+                    "catalog_app_bots",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1829,6 +1869,29 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                         "FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE",
                     ),
                 }
+                assert catalog_columns["everyone"]["type_name"] == "bool"
+                assert catalog_columns["everyone"]["format_type"] == "boolean"
+                assert catalog_columns["everyone"]["not_null"] is True
+                assert catalog_columns["everyone"]["column_default"] == "false"
+                link_columns = _columns(connection, "catalog_app_bots")
+                assert tuple(link_columns) == CATALOG_APP_BOT_COLUMNS
+                _assert_catalog_column(
+                    link_columns, "catalog_app_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    link_columns, "bot_id", "uuid", "uuid", not_null=True
+                )
+                assert _constraints(connection, "catalog_app_bots") == {
+                    ("p", "PRIMARY KEY (catalog_app_id, bot_id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (catalog_app_id) REFERENCES catalog_apps(id) ON DELETE CASCADE",
+                    ),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1851,6 +1914,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "dangerous_steps",
                     "library_files",
                     "catalog_apps",
+                    "catalog_app_bots",
                 ):
                     assert (
                         connection.execute(
