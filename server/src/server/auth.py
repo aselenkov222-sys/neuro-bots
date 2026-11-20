@@ -31,7 +31,12 @@ from server.accounts import (
     update_account_name,
     utc_now,
 )
-from server.config import development_tariff
+from server.config import (
+    configured_tariff_name,
+    configured_tariff_price,
+    development_tariff,
+    payment_required,
+)
 from server.confirmation import (
     apply_confirmation,
     issue_confirmation_link,
@@ -90,12 +95,16 @@ def find_stored_period(
 ) -> StoredPeriod | None:
     period = (
         connection.execute(
-            select(subscription_periods).where(
-                subscription_periods.c.account_id == account_id
+            select(subscription_periods)
+            .where(subscription_periods.c.account_id == account_id)
+            .order_by(
+                subscription_periods.c.started_at.desc(),
+                subscription_periods.c.id.desc(),
             )
+            .limit(1)
         )
         .mappings()
-        .one_or_none()
+        .first()
     )
     if period is None:
         return None
@@ -118,12 +127,20 @@ def account_document(
     name: str,
     email_confirmed_at: datetime | None,
     stored_period: StoredPeriod | None = None,
+    at: datetime | None = None,
 ) -> dict[str, object]:
+    tariff_name = configured_tariff_name()
+    tariff_price = configured_tariff_price()
     if email_confirmed_at is None:
         period = None
         quota = None
         quota_counter = None
         confirmed = False
+    elif stored_period is None and payment_required():
+        period = None
+        quota = None
+        quota_counter = None
+        confirmed = True
     elif stored_period is None:
         period = {
             "started_at": format_utc(email_confirmed_at),
@@ -134,10 +151,13 @@ def account_document(
         quota_counter = None
         confirmed = True
     else:
+        active = stored_period.active
+        if at is not None and at >= stored_period.ends_at:
+            active = False
         period = {
             "started_at": format_utc(stored_period.started_at),
             "ends_at": format_utc(stored_period.ends_at),
-            "active": stored_period.active,
+            "active": active,
         }
         quota = development_tariff.model_requests - stored_period.used
         quota_counter = stored_period.used
@@ -152,6 +172,7 @@ def account_document(
         "period": period,
         "quota": quota,
         "quota_counter": quota_counter,
+        "tariff": {"name": tariff_name, "price": tariff_price},
     }
 
 
@@ -162,6 +183,7 @@ def opened_session(
     session_id: object,
     email_confirmed_at: datetime | None,
     stored_period: StoredPeriod | None = None,
+    at: datetime | None = None,
 ) -> JSONResponse:
     response = JSONResponse(
         account_document(
@@ -170,6 +192,7 @@ def opened_session(
             name,
             email_confirmed_at,
             stored_period,
+            at,
         )
     )
     response.set_cookie(
@@ -219,7 +242,9 @@ async def register(request: Request) -> JSONResponse:
     except IntegrityError:
         return error_response(400, "email_taken", "Эта почта уже зарегистрирована")
     log_confirmation_link(str(request.base_url), token, stored_email)
-    return opened_session(account_id, stored_email, "", session_id, None)
+    return opened_session(
+        account_id, stored_email, "", session_id, None, at=utc_now()
+    )
 
 
 @router.post("/api/login")
@@ -231,6 +256,7 @@ async def login(request: Request) -> JSONResponse:
     if isinstance(credentials, JSONResponse):
         return credentials
     email, password = credentials
+    now = utc_now()
     with begin() as connection:
         account = find_account_by_email(connection, email)
         if account is None or not verify_password(password, account["password_hash"]):
@@ -264,6 +290,7 @@ async def login(request: Request) -> JSONResponse:
         session_id,
         confirmed_at,
         stored_period,
+        now,
     )
 
 
@@ -372,6 +399,7 @@ def me(request: Request) -> JSONResponse:
                 account["name"],
                 confirmed_at,
                 stored_period,
+                now,
             )
     if document is None:
         return unauthenticated()
@@ -388,14 +416,26 @@ def confirm_email(request: Request) -> Response:
         current = current_account(connection, request, now)
         if token is None:
             account_id = None
+            awaits_payment = False
         else:
             account_id = apply_confirmation(connection, token, now)
+            awaits_payment = (
+                account_id is not None
+                and payment_required()
+                and find_stored_period(connection, account_id) is None
+            )
     if account_id is not None:
         same_account = current is not None and current[1]["id"] == account_id
+        if same_account and awaits_payment:
+            destination = "tariff"
+        elif same_account:
+            destination = "bots"
+        else:
+            destination = "login"
         return JSONResponse(
             {
                 "email_confirmed": True,
-                "destination": "bots" if same_account else "login",
+                "destination": destination,
             }
         )
     return JSONResponse(

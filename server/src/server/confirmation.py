@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
 from server.accounts import calendar_month_end, utc_now
-from server.config import configured_mail_sink
+from server.config import configured_mail_sink, payment_required
 from server.models import accounts, confirmation_links, quota_counters, subscription_periods
 
 logger = logging.getLogger("server.confirmation")
@@ -117,7 +117,7 @@ def apply_confirmation(
         )
         .values(email_confirmed_at=now)
     )
-    if confirmed.rowcount == 1:
+    if confirmed.rowcount == 1 and not payment_required():
         period_id = uuid.uuid4()
         connection.execute(
             subscription_periods.insert().values(

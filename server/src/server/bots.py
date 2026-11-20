@@ -21,6 +21,7 @@ from server.auth import (
     unauthenticated,
 )
 from server.browser_action import (
+    SUBSCRIPTION_INACTIVE_TEXT,
     bot_holds_browser,
     enqueue_open,
     hold_text,
@@ -650,7 +651,6 @@ def _deliver_message(
     text: str,
     user_code: str | None = None,
 ) -> JSONResponse:
-    counter = _lock_quota_counter(opened.connection, opened.account["id"])
     _insert_message(
         opened.connection,
         chat["id"],
@@ -660,6 +660,23 @@ def _deliver_message(
         opened.now,
     )
     follow_at = opened.now + timedelta(microseconds=1)
+    from server.routines import period_is_active
+
+    if not period_is_active(opened.connection, opened.account["id"], opened.now):
+        _insert_message(
+            opened.connection,
+            chat["id"],
+            "error",
+            SUBSCRIPTION_INACTIVE_TEXT,
+            None,
+            follow_at,
+        )
+        opened.connection.execute(
+            chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse(_messages_document(opened.connection, chat["id"]))
+    counter = _lock_quota_counter(opened.connection, opened.account["id"])
     proposed = proposed_scenario(text)
     if proposed is not None:
         _insert_message(

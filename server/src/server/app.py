@@ -11,6 +11,7 @@ from server.browser_action import router as browser_router
 from server.catalog import router as catalog_router
 from server.db import database_responds
 from server.desktops import router as desktops_router
+from server.payment import router as payment_router
 from server.routines import router as routines_router
 
 app = FastAPI()
@@ -30,6 +31,7 @@ def health() -> Response:
 
 
 app.include_router(router)
+app.include_router(payment_router)
 app.include_router(bots_router)
 app.include_router(routines_router)
 app.include_router(desktops_router)
