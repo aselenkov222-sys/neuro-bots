@@ -680,7 +680,7 @@ function chatScreen() {
           <button class="btn-orange icon-btn" type="submit" aria-label="Отправить">${icon("send")}</button>
         </form>
       </section>
-      <aside class="zone side">${libraryHtml()}</aside>
+      <aside class="zone side">${libraryHtml()}<p class="hint">«Да» и «Нет» нажимает только пользователь. Главный бот сам их не нажимает.</p></aside>
     </div>`;
 }
 

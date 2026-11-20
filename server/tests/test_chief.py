@@ -12,10 +12,12 @@ from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
 from server.browser_action import clear_opens
 from server.db import create_db_engine
+from server.dangerous import take_answer
 from server.models import (
     accounts,
     bots,
     chats,
+    dangerous_steps,
     messages,
     quota_counters,
     subscription_periods,
@@ -611,6 +613,86 @@ def test_a_report_is_a_chat_message_and_not_a_digest(
     assert _chat_messages(worker["id"])[0]["code"] == "routine_skipped"
 
 
+def test_the_chief_cannot_press_yes(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_confirmed("chief-yes@example.com")
+    answers: list[tuple[str, str]] = []
+
+    def spy(connection, account_id, bot_id, message_id, answer, now):
+        answers.append((str(bot_id), answer))
+        return take_answer(connection, account_id, bot_id, message_id, answer, now)
+
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB_TEXT)
+    monkeypatch.setattr("server.routines.take_answer", spy)
+    with _client(cookie) as client:
+        chief = _create(client, "Старший")
+        worker = _create(client, "Оплата")
+        _appoint(client, chief["id"])
+        computer = _desktop(client)
+        _routine(client, worker["id"], "Отправить ответ.")
+        monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+        claimed = client.post(
+            f"/api/desktops/{computer}/routine-run",
+            headers={"Origin": ORIGIN},
+        )
+        assert claimed.status_code == 200
+        assert claimed.json()["bot_id"] == worker["id"]
+    gate = next(
+        row for row in _chat_messages(worker["id"]) if row["code"] == "dangerous_action"
+    )
+    report = _reports(chief["id"])[0]
+    assert report["text"] == "Рутина бота «Оплата» ждёт «Да»."
+    assert report["code"] != "dangerous_action"
+    stored = [
+        row for row in _rows(dangerous_steps) if row["bot_id"] == uuid.UUID(worker["id"])
+    ]
+    assert len(stored) == 1
+    assert stored[0]["answer"] is None
+    with _client(cookie) as client:
+        pressed = client.post(
+            f"/api/bots/{chief['id']}/messages/{gate['id']}/answer",
+            json={"answer": "yes"},
+            headers={"Origin": ORIGIN},
+        )
+        assert pressed.status_code == 200
+        assert all(row["text"] != "Да" for row in pressed.json()["messages"])
+        said = client.post(
+            f"/api/bots/{chief['id']}/messages",
+            json={"text": "Да"},
+            headers={"Origin": ORIGIN},
+        )
+        assert said.status_code == 200
+        on_report = client.post(
+            f"/api/bots/{chief['id']}/messages/{report['id']}/answer",
+            json={"answer": "yes"},
+            headers={"Origin": ORIGIN},
+        )
+        assert on_report.status_code == 200
+    stored = [
+        row for row in _rows(dangerous_steps) if row["bot_id"] == uuid.UUID(worker["id"])
+    ]
+    assert stored[0]["answer"] is None
+    assert stored[0]["performed_at"] is None
+    assert answers == [(chief["id"], "yes"), (chief["id"], "yes")]
+    assert [row["text"] for row in _chat_messages(worker["id"]) if row["role"] == "user"] == []
+    with _client(cookie) as client:
+        allowed = client.post(
+            f"/api/bots/{worker['id']}/messages/{gate['id']}/answer",
+            json={"answer": "yes"},
+            headers={"Origin": ORIGIN},
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["messages"][0]["answer"] == "yes"
+        assert "Да" in [row["text"] for row in allowed.json()["messages"]]
+    stored = [
+        row for row in _rows(dangerous_steps) if row["bot_id"] == uuid.UUID(worker["id"])
+    ]
+    assert stored[0]["answer"] == "yes"
+    assert stored[0]["performed_at"] is None
+    assert answers[-1] == (worker["id"], "yes")
+
+
 def test_cabinet_assigns_the_chief_on_the_bot_card() -> None:
     script = (WEB_DIR / "app.js").read_text(encoding="utf-8")
     styles = (WEB_DIR / "styles.css").read_text(encoding="utf-8")
@@ -626,3 +708,7 @@ def test_cabinet_assigns_the_chief_on_the_bot_card() -> None:
     assert "patchBot({ chief: target.checked })" in script
     assert ".switch" in styles
     assert ".chief" in styles
+    assert (
+        "«Да» и «Нет» нажимает только пользователь. Главный бот сам их не нажимает."
+        in chat
+    )
