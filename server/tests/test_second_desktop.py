@@ -11,15 +11,18 @@ from sqlalchemy import select
 from server.accounts import calendar_month_end, create_account, create_session
 from server.aggregator import CompleteResult
 from server.app import app
+from server.browser_action import clear_opens, peek_open
 from server.db import create_db_engine
 from server.models import (
     accounts,
     chats,
+    desktops,
     messages,
     quota_counters,
     routine_runs,
     subscription_periods,
 )
+from server.routines import settle_asleep
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = PROJECT_ROOT / "docker-compose.yml"
@@ -34,6 +37,9 @@ DUE = datetime(2026, 11, 18, 6, 0, tzinfo=timezone.utc)
 CLAIM_AT = DUE + timedelta(seconds=59)
 NOT_FOUND = {"code": "not_found", "message": "Десктоп не найден."}
 REPO_ROOT = PROJECT_ROOT.parent
+INBOX = "https://example.com/inbox"
+SEND_URL = "https://example.com/send"
+ASLEEP_TEXT = "Запуск завершён: рабочий десктоп уснул."
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -136,6 +142,27 @@ def _login(email: str) -> str:
     cookie = fresh.cookies.get("session")
     assert isinstance(cookie, str)
     return cookie
+
+
+def _runs(routine_id: str) -> list[dict]:
+    parsed = uuid.UUID(routine_id)
+    return [row for row in _rows(routine_runs) if row["routine_id"] == parsed]
+
+
+def _set_pulse(account_id: uuid.UUID, computer: uuid.UUID, moment: datetime) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                desktops.update()
+                .where(
+                    desktops.c.account_id == account_id,
+                    desktops.c.computer_id == computer,
+                )
+                .values(last_pulse_at=moment)
+            )
+    finally:
+        engine.dispose()
 
 
 def _bot_messages(bot_id: str) -> list[dict]:
@@ -310,3 +337,234 @@ def test_second_desktop_does_not_claim_a_routine(
     assert len(runs) == 1
     assert runs[0]["status"] == "claimed"
     assert [row["text"] for row in _bot_messages(bot.json()["id"])] == [STUB]
+
+
+def _routine_run(cookie: str, computer: uuid.UUID, body: dict | None = None):
+    with _client(cookie) as client:
+        return client.post(
+            f"/api/desktops/{computer}/routine-run",
+            json=body if body is not None else {},
+            headers={"Origin": ORIGIN},
+        )
+
+
+def test_transfer_finishes_the_open_run_on_the_old_desktop(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_opens()
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB)
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    email = f"transfer-run-{uuid.uuid4()}@example.com"
+    cookie, account_id = _open_account(email)
+    old = uuid.uuid4()
+    new = uuid.uuid4()
+    scenario = f"Прочитать почту {INBOX}\nОтправить {SEND_URL}"
+    try:
+        with _client(cookie) as client:
+            first = client.post(
+                "/api/bots",
+                json={"name": "Почта", "scenario": scenario},
+                headers={"Origin": ORIGIN},
+            )
+            second = client.post(
+                "/api/bots",
+                json={"name": "Таблица", "scenario": "план"},
+                headers={"Origin": ORIGIN},
+            )
+            assert first.status_code == 200
+            assert second.status_code == 200
+            earlier = client.post(
+                f"/api/bots/{first.json()['id']}/routines",
+                json={"weekdays": [3], "time": "09:00"},
+                headers={"Origin": ORIGIN},
+            )
+            later = client.post(
+                f"/api/bots/{second.json()['id']}/routines",
+                json={"weekdays": [3], "time": "09:00"},
+                headers={"Origin": ORIGIN},
+            )
+            assert earlier.status_code == 200
+            assert later.status_code == 200
+            assert _post_desktop(client, old).json()["working"] is True
+            pulsed = client.post(
+                f"/api/desktops/{old}/pulse",
+                json={"timezone": "Europe/Moscow"},
+                headers={"Origin": ORIGIN},
+            )
+            assert pulsed.status_code == 200
+        claimed = _routine_run(cookie, old)
+        assert claimed.status_code == 200
+        assert claimed.json()["bot_id"] == first.json()["id"]
+        assert _runs(earlier.json()["id"])[0]["status"] == "awaiting"
+        assert _runs(earlier.json()["id"])[0]["computer_id"] == old
+        assert peek_open(account_id, old) == INBOX
+        assert peek_open(account_id, new) is None
+        opened = _runs(later.json()["id"])
+        assert len(opened) == 1
+        assert opened[0]["status"] == "pending"
+        second_cookie = _login(email)
+        with _client(second_cookie) as client:
+            assert _post_desktop(client, new).json() == {
+                "id": str(new),
+                "working": False,
+            }
+            moved = client.post(
+                f"/api/desktops/{new}/working",
+                json={},
+                headers={"Origin": ORIGIN},
+            )
+            assert moved.status_code == 200
+            assert moved.json() == {"id": str(new), "working": True}
+            assert "password" not in moved.json()
+            assert "cookie" not in moved.json()
+            fresh = client.post(
+                f"/api/desktops/{new}/pulse",
+                json={"timezone": "Europe/Moscow"},
+                headers={"Origin": ORIGIN},
+            )
+            assert fresh.status_code == 200
+            page = client.get(f"/api/desktops/{new}/browser-task")
+        assert page.status_code == 204
+        with _client(cookie) as client:
+            kept = client.get(f"/api/desktops/{old}/browser-task")
+            finished = client.post(
+                f"/api/desktops/{old}/browser-task",
+                json={"text": "письма"},
+                headers={"Origin": ORIGIN},
+            )
+        assert kept.status_code == 200
+        assert kept.json() == {"url": INBOX}
+        assert finished.status_code == 200
+        assert peek_open(account_id, old) is None
+        held = _routine_run(cookie, old)
+        assert held.status_code == 204
+        assert _runs(later.json()["id"])[0]["status"] == "pending"
+        nxt = _routine_run(second_cookie, new)
+        assert nxt.status_code == 200
+        assert nxt.json()["bot_id"] == second.json()["id"]
+        assert _runs(later.json()["id"])[0]["computer_id"] == new
+        assert _runs(later.json()["id"])[0]["status"] == "claimed"
+        gate = next(
+            row
+            for row in _bot_messages(first.json()["id"])
+            if row["code"] == "dangerous_action"
+        )
+        with _client(second_cookie) as client:
+            answered = client.post(
+                f"/api/bots/{first.json()['id']}/messages/{gate['id']}/answer",
+                json={"answer": "yes"},
+                headers={"Origin": ORIGIN},
+            )
+        assert answered.status_code == 200
+        stolen = _routine_run(second_cookie, new)
+        assert stolen.status_code == 204
+        assert _runs(earlier.json()["id"])[0]["status"] == "awaiting"
+        released = _routine_run(cookie, old)
+        assert released.status_code == 200
+        assert released.json()["action"] == f"Отправить {SEND_URL}"
+        assert "password" not in released.json()
+        performed = _routine_run(
+            cookie,
+            old,
+            {"step_id": released.json()["step_id"], "performed": True},
+        )
+        assert performed.status_code == 204
+        assert _runs(earlier.json()["id"])[0]["status"] == "claimed"
+        assert _runs(earlier.json()["id"])[0]["computer_id"] == old
+        assert peek_open(account_id, old) == SEND_URL
+        assert peek_open(account_id, new) is None
+        stored = {
+            row["computer_id"]: row
+            for row in _rows(desktops)
+            if row["account_id"] == account_id
+        }
+        assert stored[old]["working"] is False
+        assert stored[new]["working"] is True
+        assert stored[old]["routines_stopped"] is False
+        assert stored[new]["routines_stopped"] is False
+    finally:
+        clear_opens()
+
+
+def test_open_run_follows_the_old_desktop_pulse(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_opens()
+    monkeypatch.setattr("server.aggregator.complete", lambda **kwargs: STUB)
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    email = f"transfer-asleep-{uuid.uuid4()}@example.com"
+    cookie, account_id = _open_account(email)
+    old = uuid.uuid4()
+    new = uuid.uuid4()
+    try:
+        with _client(cookie) as client:
+            bot = client.post(
+                "/api/bots",
+                json={"name": "Почта", "scenario": "Отправить ответ."},
+                headers={"Origin": ORIGIN},
+            )
+            assert bot.status_code == 200
+            routine = client.post(
+                f"/api/bots/{bot.json()['id']}/routines",
+                json={"weekdays": [3], "time": "09:00"},
+                headers={"Origin": ORIGIN},
+            )
+            assert routine.status_code == 200
+            assert _post_desktop(client, old).json()["working"] is True
+            assert (
+                client.post(
+                    f"/api/desktops/{old}/pulse",
+                    json={"timezone": "Europe/Moscow"},
+                    headers={"Origin": ORIGIN},
+                ).status_code
+                == 200
+            )
+        assert _routine_run(cookie, old).status_code == 200
+        assert _runs(routine.json()["id"])[0]["status"] == "awaiting"
+        second_cookie = _login(email)
+        with _client(second_cookie) as client:
+            assert _post_desktop(client, new).json()["working"] is False
+            assert (
+                client.post(
+                    f"/api/desktops/{new}/working",
+                    headers={"Origin": ORIGIN},
+                ).status_code
+                == 200
+            )
+        with _client(cookie) as client:
+            pulsed = client.post(
+                f"/api/desktops/{old}/pulse",
+                json={"timezone": "Europe/Moscow"},
+                headers={"Origin": ORIGIN},
+            )
+        assert pulsed.status_code == 200
+        _set_pulse(account_id, new, CLAIM_AT - timedelta(seconds=31))
+        engine = create_db_engine()
+        try:
+            with engine.begin() as connection:
+                settle_asleep(connection, CLAIM_AT)
+        finally:
+            engine.dispose()
+        assert _runs(routine.json()["id"])[0]["status"] == "awaiting"
+        _set_pulse(account_id, old, CLAIM_AT - timedelta(seconds=31))
+        _set_pulse(account_id, new, CLAIM_AT)
+        engine = create_db_engine()
+        try:
+            with engine.begin() as connection:
+                settle_asleep(connection, CLAIM_AT)
+        finally:
+            engine.dispose()
+        assert _runs(routine.json()["id"])[0]["status"] == "failed"
+        assert [row["text"] for row in _bot_messages(bot.json()["id"]) if row["role"] == "error"] == [
+            ASLEEP_TEXT
+        ]
+        with _client(cookie) as client:
+            refused = client.post(
+                f"/api/desktops/{old}/pulse",
+                json={"timezone": "Europe/Moscow"},
+                headers={"Origin": ORIGIN},
+            )
+        assert refused.status_code == 404
+        assert refused.json() == NOT_FOUND
+    finally:
+        clear_opens()
