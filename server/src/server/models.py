@@ -96,6 +96,18 @@ bots = Table(
     Column("description", String(280), nullable=False),
     Column("scenario", String(16000), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
+    Column(
+        "chief",
+        Boolean(),
+        nullable=False,
+        server_default=text("false"),
+    ),
+    Index(
+        "bots_one_chief",
+        "account_id",
+        unique=True,
+        postgresql_where=text("chief"),
+    ),
 )
 
 chats = Table(

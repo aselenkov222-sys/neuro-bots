@@ -381,7 +381,7 @@ function botCard(bot) {
     <button type="button" class="bot-card sheet" data-action="open-bot" data-id="${bot.id}">
       <span class="avatar" style="--av:${bot.color}">${icon(bot.icon)}</span>
       <span>
-        <strong>${esc(bot.name)}</strong>
+        <span class="bot-title"><strong>${esc(bot.name)}</strong>${bot.chief === true ? '<i class="chief">Главный</i>' : ""}</span>
         <small>${esc(bot.description || "Без описания")}</small>
       </span>
     </button>`;
@@ -544,6 +544,11 @@ function botScreen() {
         <textarea class="desc-input" id="bot-desc" rows="2">${esc(bot.description)}</textarea>
         ${picker("card", bot.color, bot.icon)}
       </div>
+      <label class="switch">
+        <input id="main-toggle" type="checkbox" ${bot.chief === true ? "checked" : ""}>
+        <span class="switch-ui" aria-hidden="true"></span>
+        Главный
+      </label>
     </section>
     <section class="editor sheet">
       <div class="section-label">
@@ -658,7 +663,7 @@ function chatScreen() {
       <section class="zone thread" aria-label="Переписка с ${esc(bot.name)}">
         <div class="thread-head">
           <div class="thread-titles">
-            <h2 class="thread-title">${esc(bot.name)}</h2>
+            <h2 class="thread-title">${esc(bot.name)}${bot.chief === true ? '<i class="chief">Главный</i>' : ""}</h2>
             <div class="chat-tabs" role="tablist" aria-label="Чаты этого бота">${tabs}</div>
             ${meta ? `<p class="meta">${meta}</p>` : ""}
           </div>
@@ -995,6 +1000,11 @@ async function patchBot(changes) {
   }
   state.card = result.data;
   if (Object.prototype.hasOwnProperty.call(changes, "scenario")) state.draft = result.data.scenario;
+  if (result.data.chief === true) {
+    state.bots.forEach((item) => {
+      if (item.id !== result.data.id) item.chief = false;
+    });
+  }
   const index = state.bots.findIndex((item) => item.id === result.data.id);
   if (index >= 0) state.bots[index] = result.data;
   else if (Object.prototype.hasOwnProperty.call(changes, "name")) state.bots.push(result.data);
@@ -1156,6 +1166,9 @@ app.addEventListener("change", (event) => {
   }
   if (target.id === "bot-desc" && state.card && target.value !== state.card.description) {
     patchBot({ description: target.value });
+  }
+  if (target.id === "main-toggle" && state.card) {
+    patchBot({ chief: target.checked });
   }
   if (target.id === "routine-time" && state.card && !routineLocked()) {
     const next = target.value;

@@ -86,6 +86,7 @@ SPREADSHEET_TYPE = (
 MAIN_CHAT_KEPT = "Основной чат удалить нельзя."
 PROPOSAL_NOT_FOUND = "Сообщение не найдено."
 INVALID_CONFIRM = "Нужно подтверждение."
+INVALID_CHIEF = "Нужен признак главного."
 MAIN_KIND = "main"
 EXTRA_KIND = "extra"
 
@@ -134,6 +135,7 @@ def bot_document(row: RowMapping) -> dict[str, object]:
         "description": row["description"],
         "scenario": row["scenario"],
         "updated_at": format_utc(row["updated_at"]),
+        "chief": row["chief"] is True,
     }
 
 
@@ -217,8 +219,8 @@ def parse_create(body: dict[str, object]) -> dict[str, str] | JSONResponse:
     }
 
 
-def parse_patch(body: dict[str, object]) -> dict[str, str] | JSONResponse:
-    changes: dict[str, str] = {}
+def parse_patch(body: dict[str, object]) -> dict[str, object] | JSONResponse:
+    changes: dict[str, object] = {}
     if "name" in body:
         name_error = _invalid_name(body["name"])
         if name_error is not None:
@@ -254,6 +256,10 @@ def parse_patch(body: dict[str, object]) -> dict[str, str] | JSONResponse:
         if icon_error is not None:
             return icon_error
         changes["icon"] = body["icon"]
+    if "chief" in body:
+        if not isinstance(body["chief"], bool):
+            return error_response(400, "invalid_request", INVALID_CHIEF)
+        changes["chief"] = body["chief"]
     return changes
 
 
@@ -574,13 +580,27 @@ async def update_bot(request: Request, bot_id: str) -> JSONResponse:
         existing = _load_bot(opened.connection, parsed_id, opened.account["id"])
         if existing is None:
             return not_found()
+        chief = changes.pop("chief", None)
+        if chief is True:
+            opened.connection.execute(
+                bots.update()
+                .where(
+                    bots.c.account_id == opened.account["id"],
+                    bots.c.id != parsed_id,
+                    bots.c.chief.is_(True),
+                )
+                .values(chief=False, updated_at=opened.now)
+            )
+        values = dict(changes)
+        if isinstance(chief, bool):
+            values["chief"] = chief
         opened.connection.execute(
             bots.update()
             .where(
                 bots.c.id == parsed_id,
                 bots.c.account_id == opened.account["id"],
             )
-            .values(**changes, updated_at=opened.now)
+            .values(**values, updated_at=opened.now)
         )
         touch_session(opened.connection, opened.session["id"], opened.now)
         row = _load_bot(opened.connection, parsed_id, opened.account["id"])
