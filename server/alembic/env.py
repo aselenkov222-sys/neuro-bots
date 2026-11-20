@@ -4,10 +4,10 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 import server.models  # registers tables on metadata
-from server.db import DATABASE_URL, metadata
+from server.db import DATABASE_URL, alembic_sqlalchemy_url, database_url, metadata
 
 config = context.config
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+config.set_main_option("sqlalchemy.url", alembic_sqlalchemy_url())
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -17,7 +17,7 @@ target_metadata = metadata
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=DATABASE_URL,
+        url=database_url() or DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -29,7 +29,7 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     section = config.get_section(config.config_ini_section, {})
-    section["sqlalchemy.url"] = DATABASE_URL
+    section["sqlalchemy.url"] = database_url() or DATABASE_URL
     connectable = engine_from_config(
         section,
         prefix="sqlalchemy.",
