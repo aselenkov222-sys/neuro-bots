@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import NamedTuple
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -29,12 +30,18 @@ from server.browser_action import (
 from server.dangerous import DANGEROUS_CODE, gate_state
 from server.config import development_tariff
 from server.desktops import find_working_desktop
+from server.library import attach_files, store_library_file
 from server.models import (
     bots,
     chats,
+    dangerous_steps,
+    desktop_notices,
+    library_files,
     messages,
     quota_charges,
     quota_counters,
+    routine_checks,
+    routines,
     subscription_periods,
 )
 from server.scenario_chat import PROPOSAL_CODE, confirm_proposal, proposed_scenario
@@ -72,6 +79,10 @@ EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
 COMPUTER_UNAVAILABLE_TEXT = "компьютер недоступен"
 CHAT_NOT_FOUND = "Чат не найден."
+FILE_NOT_FOUND = "Файл не найден."
+SPREADSHEET_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 MAIN_CHAT_KEPT = "Основной чат удалить нельзя."
 PROPOSAL_NOT_FOUND = "Сообщение не найдено."
 INVALID_CONFIRM = "Нужно подтверждение."
@@ -96,6 +107,10 @@ def not_found() -> JSONResponse:
 
 def chat_not_found() -> JSONResponse:
     return error_response(404, "not_found", CHAT_NOT_FOUND)
+
+
+def file_not_found() -> JSONResponse:
+    return error_response(404, "not_found", FILE_NOT_FOUND)
 
 
 def proposal_not_found() -> JSONResponse:
@@ -242,6 +257,23 @@ def parse_patch(body: dict[str, object]) -> dict[str, str] | JSONResponse:
     return changes
 
 
+def _remove_bot(connection: Connection, bot_id: uuid.UUID) -> None:
+    chat_ids = select(chats.c.id).where(chats.c.bot_id == bot_id)
+    connection.execute(
+        dangerous_steps.delete().where(dangerous_steps.c.bot_id == bot_id)
+    )
+    connection.execute(
+        desktop_notices.delete().where(desktop_notices.c.bot_id == bot_id)
+    )
+    connection.execute(
+        routine_checks.delete().where(routine_checks.c.bot_id == bot_id)
+    )
+    connection.execute(routines.delete().where(routines.c.bot_id == bot_id))
+    connection.execute(messages.delete().where(messages.c.chat_id.in_(chat_ids)))
+    connection.execute(chats.delete().where(chats.c.bot_id == bot_id))
+    connection.execute(bots.delete().where(bots.c.id == bot_id))
+
+
 def _load_bot(
     connection: Connection, bot_id: uuid.UUID, account_id: uuid.UUID
 ) -> RowMapping | None:
@@ -372,10 +404,11 @@ def _insert_message(
     text: str,
     code: str | None,
     updated_at: datetime,
-) -> None:
+) -> uuid.UUID:
+    message_id = uuid.uuid4()
     connection.execute(
         messages.insert().values(
-            id=uuid.uuid4(),
+            id=message_id,
             chat_id=chat_id,
             role=role,
             text=text,
@@ -383,6 +416,7 @@ def _insert_message(
             updated_at=updated_at,
         )
     )
+    return message_id
 
 
 def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, object]:
@@ -405,6 +439,7 @@ def _messages_document(connection: Connection, chat_id: uuid.UUID) -> dict[str, 
         }
         for row in rows
     ]
+    attach_files(connection, payload, [row["id"] for row in rows])
     gated = [
         uuid.UUID(item["id"])
         for item in payload
@@ -553,6 +588,22 @@ async def update_bot(request: Request, bot_id: str) -> JSONResponse:
         return JSONResponse(bot_document(row))
 
 
+@router.delete("/api/bots/{bot_id}")
+def delete_bot(request: Request, bot_id: str) -> Response:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        _remove_bot(opened.connection, parsed_id)
+        return Response(status_code=204)
+
+
 @router.get("/api/bots/{bot_id}/messages")
 def list_messages(request: Request, bot_id: str) -> JSONResponse:
     with open_confirmed(request, mutating=False) as opened:
@@ -678,7 +729,8 @@ def _deliver_message(
             messages=_adapter_messages(opened.connection, chat["id"]),
             desktop_available=desktop_available,
         )
-        if reply == "":
+        reply_text, xlsx = aggregator.split_reply(reply)
+        if reply_text == "":
             _insert_message(
                 opened.connection,
                 chat["id"],
@@ -688,14 +740,24 @@ def _deliver_message(
                 follow_at,
             )
         else:
-            _insert_message(
+            message_id = _insert_message(
                 opened.connection,
                 chat["id"],
                 "assistant",
-                reply,
+                reply_text,
                 None,
                 follow_at,
             )
+            if xlsx is not None:
+                store_library_file(
+                    opened.connection,
+                    bot_id=bot["id"],
+                    chat_id=chat["id"],
+                    message_id=message_id,
+                    name=xlsx[0],
+                    content=xlsx[1],
+                    created_at=follow_at,
+                )
             opened.connection.execute(
                 quota_charges.insert().values(
                     id=uuid.uuid4(),
@@ -894,3 +956,113 @@ def list_chat_messages(request: Request, bot_id: str, chat_id: str) -> JSONRespo
             return chat_not_found()
         touch_session(opened.connection, opened.session["id"], opened.now)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+def _library_document(row: RowMapping) -> dict[str, str]:
+    return {
+        "id": str(row["id"]),
+        "name": row["name"],
+        "created_at": format_utc(row["created_at"]),
+    }
+
+
+def _library_rows(connection: Connection, bot_id: uuid.UUID) -> list[RowMapping]:
+    return (
+        connection.execute(
+            select(
+                library_files.c.id,
+                library_files.c.name,
+                library_files.c.created_at,
+            )
+            .where(library_files.c.bot_id == bot_id)
+            .order_by(library_files.c.created_at.asc(), library_files.c.id.asc())
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _library_file(
+    connection: Connection, bot_id: uuid.UUID, file_id: uuid.UUID
+) -> RowMapping | None:
+    return (
+        connection.execute(
+            select(library_files).where(
+                library_files.c.id == file_id,
+                library_files.c.bot_id == bot_id,
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+def _spreadsheet_disposition(name: str) -> str:
+    return f"attachment; filename*=UTF-8''{quote(name, safe='')}"
+
+
+@router.get("/api/bots/{bot_id}/library")
+def list_library(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        rows = _library_rows(opened.connection, parsed_id)
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return JSONResponse({"files": [_library_document(row) for row in rows]})
+
+
+@router.get("/api/bots/{bot_id}/library/{file_id}")
+def read_library_file(request: Request, bot_id: str, file_id: str) -> Response:
+    with open_confirmed(request, mutating=False) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_file = parse_id(file_id)
+        if parsed_file is None:
+            return file_not_found()
+        row = _library_file(opened.connection, parsed_id, parsed_file)
+        if row is None:
+            return file_not_found()
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return Response(
+            content=bytes(row["content"]),
+            media_type=SPREADSHEET_TYPE,
+            headers={"Content-Disposition": _spreadsheet_disposition(row["name"])},
+        )
+
+
+@router.delete("/api/bots/{bot_id}/library/{file_id}")
+def delete_library_file(request: Request, bot_id: str, file_id: str) -> Response:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        bot = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if bot is None:
+            return not_found()
+        parsed_file = parse_id(file_id)
+        if parsed_file is None:
+            return file_not_found()
+        deleted = opened.connection.execute(
+            library_files.delete().where(
+                library_files.c.id == parsed_file,
+                library_files.c.bot_id == parsed_id,
+            )
+        )
+        if deleted.rowcount == 0:
+            return file_not_found()
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        return Response(status_code=204)

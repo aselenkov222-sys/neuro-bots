@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     Time,
@@ -96,6 +97,7 @@ CHECK_REVISION = "e6b1a9c34f28"
 NOTICE_REVISION = "f3a8c1d27e05"
 GATE_REVISION = "b3c7e9a41d52"
 CHAT_REVISION = "e7a1c4b82d60"
+LIBRARY_REVISION = "c2d8f4a91e73"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -113,6 +115,23 @@ ROUTINE_CHECK_COLUMNS = ("id", "bot_id", "status", "created_at")
 ROUTINE_CHECK_STATUS_CHECK = (
     "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, "
     "'claimed'::character varying, 'awaiting'::character varying])::text[])))"
+)
+LIBRARY_FILE_COLUMNS = (
+    "id",
+    "bot_id",
+    "chat_id",
+    "message_id",
+    "name",
+    "content",
+    "created_at",
+)
+LIBRARY_NAME_SQL = (
+    "name LIKE '%.xlsx' AND strpos(name, '/') = 0 "
+    "AND strpos(name, chr(92)) = 0 AND char_length(name) >= 5"
+)
+LIBRARY_NAME_CHECK = (
+    "CHECK (((name ~~ '%.xlsx'::text) AND (strpos(name, '/'::text) = 0) AND "
+    "(strpos(name, chr(92)) = 0) AND (char_length(name) >= 5)))"
 )
 DANGEROUS_STEP_COLUMNS = (
     "id",
@@ -238,8 +257,10 @@ def _revision_chain() -> list[str]:
     assert links[NOTICE_REVISION] == CHECK_REVISION
     assert links[GATE_REVISION] == NOTICE_REVISION
     assert links[CHAT_REVISION] == GATE_REVISION
-    assert links[chain[-1]] == GATE_REVISION
-    assert chain[-1] == CHAT_REVISION
+    assert links[LIBRARY_REVISION] == CHAT_REVISION
+    assert links[chain[-1]] == CHAT_REVISION
+    assert chain[-1] == LIBRARY_REVISION
+    assert chain[-1] != CHAT_REVISION
     assert chain[-1] != GATE_REVISION
     assert chain[-1] != NOTICE_REVISION
     assert chain[-1] != CONFIRMATION_REVISION
@@ -515,6 +536,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     routine_checks = metadata.tables["routine_checks"]
     desktop_notices = metadata.tables["desktop_notices"]
     dangerous_steps = metadata.tables["dangerous_steps"]
+    library_files = metadata.tables["library_files"]
     assert set(metadata.tables) == {
         "accounts",
         "sessions",
@@ -531,6 +553,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         "routine_checks",
         "desktop_notices",
         "dangerous_steps",
+        "library_files",
     }
     assert accounts is server.models.accounts
     assert sessions is server.models.sessions
@@ -547,6 +570,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert routine_checks is server.models.routine_checks
     assert desktop_notices is server.models.desktop_notices
     assert dangerous_steps is server.models.dangerous_steps
+    assert library_files is server.models.library_files
     assert tuple(accounts.columns.keys()) == ACCOUNT_COLUMNS
     assert tuple(sessions.columns.keys()) == SESSION_COLUMNS
     assert tuple(confirmation_links.columns.keys()) == CONFIRMATION_LINK_COLUMNS
@@ -562,6 +586,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert tuple(routine_checks.columns.keys()) == ROUTINE_CHECK_COLUMNS
     assert tuple(desktop_notices.columns.keys()) == NOTICE_COLUMNS
     assert tuple(dangerous_steps.columns.keys()) == DANGEROUS_STEP_COLUMNS
+    assert tuple(library_files.columns.keys()) == LIBRARY_FILE_COLUMNS
 
     assert isinstance(accounts.c.id.type, Uuid)
     assert accounts.c.id.nullable is False
@@ -1018,6 +1043,44 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
         ),
     }
 
+    assert [column.name for column in library_files.primary_key] == ["id"]
+    _assert_model_column(library_files.c.id, Uuid, nullable=False)
+    _assert_model_column(
+        library_files.c.bot_id,
+        Uuid,
+        nullable=False,
+        foreign_table="bots",
+        ondelete="CASCADE",
+    )
+    _assert_model_column(
+        library_files.c.chat_id,
+        Uuid,
+        nullable=True,
+        foreign_table="chats",
+        ondelete="SET NULL",
+    )
+    _assert_model_column(
+        library_files.c.message_id,
+        Uuid,
+        nullable=True,
+        foreign_table="messages",
+        ondelete="SET NULL",
+    )
+    _assert_model_column(library_files.c.name, Text, nullable=False)
+    _assert_model_column(library_files.c.content, LargeBinary, nullable=False)
+    _assert_model_column(
+        library_files.c.created_at,
+        DateTime,
+        nullable=False,
+        timezone=True,
+    )
+    assert [
+        (constraint.name, str(constraint.sqltext))
+        for constraint in library_files.constraints
+        if isinstance(constraint, CheckConstraint)
+    ] == [("library_files_name_check", LIBRARY_NAME_SQL)]
+    assert list(library_files.indexes) == []
+
     revision_id = _revision_id()
     down = _compose("down", "--remove-orphans", timeout=60)
     assert down.returncode == 0, down.stderr
@@ -1063,6 +1126,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "routine_checks",
                     "desktop_notices",
                     "dangerous_steps",
+                    "library_files",
                     "alembic_version",
                 }
                 stored_revision = connection.execute(
@@ -1650,6 +1714,49 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     ("c", DANGEROUS_ANSWER_CHECK),
                     ("c", DANGEROUS_PARENT_CHECK),
                 }
+                file_columns = _columns(connection, "library_files")
+                assert tuple(file_columns) == LIBRARY_FILE_COLUMNS
+                _assert_catalog_column(
+                    file_columns, "id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    file_columns, "bot_id", "uuid", "uuid", not_null=True
+                )
+                _assert_catalog_column(
+                    file_columns, "chat_id", "uuid", "uuid", not_null=False
+                )
+                _assert_catalog_column(
+                    file_columns, "message_id", "uuid", "uuid", not_null=False
+                )
+                _assert_catalog_column(
+                    file_columns, "name", "text", "text", not_null=True
+                )
+                _assert_catalog_column(
+                    file_columns, "content", "bytea", "bytea", not_null=True
+                )
+                _assert_catalog_column(
+                    file_columns,
+                    "created_at",
+                    "timestamptz",
+                    "timestamp with time zone",
+                    not_null=True,
+                )
+                assert _constraints(connection, "library_files") == {
+                    ("p", "PRIMARY KEY (id)"),
+                    (
+                        "f",
+                        "FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE SET NULL",
+                    ),
+                    (
+                        "f",
+                        "FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL",
+                    ),
+                    ("c", LIBRARY_NAME_CHECK),
+                }
                 try:
                     _insert_accepted_message_roles(connection)
                 finally:
@@ -1670,6 +1777,7 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                     "routine_checks",
                     "desktop_notices",
                     "dangerous_steps",
+                    "library_files",
                 ):
                     assert (
                         connection.execute(

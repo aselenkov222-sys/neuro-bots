@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -255,5 +256,37 @@ dangerous_steps = Table(
         "(run_id IS NOT NULL AND check_id IS NULL) OR "
         "(run_id IS NULL AND check_id IS NOT NULL)",
         name="dangerous_steps_parent_check",
+    ),
+)
+
+library_files = Table(
+    "library_files",
+    metadata,
+    Column("id", Uuid(), primary_key=True),
+    Column(
+        "bot_id",
+        Uuid(),
+        ForeignKey("bots.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "chat_id",
+        Uuid(),
+        ForeignKey("chats.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column(
+        "message_id",
+        Uuid(),
+        ForeignKey("messages.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("name", Text(), nullable=False),
+    Column("content", LargeBinary(), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    CheckConstraint(
+        "name LIKE '%.xlsx' AND strpos(name, '/') = 0 "
+        "AND strpos(name, chr(92)) = 0 AND char_length(name) >= 5",
+        name="library_files_name_check",
     ),
 )
