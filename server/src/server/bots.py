@@ -1,4 +1,6 @@
 import json
+import logging
+import secrets
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
-from server.accounts import format_utc, touch_session, utc_now
+from server.accounts import find_account_by_id, format_utc, touch_session, utc_now
 from server.auth import (
     begin,
     current_account,
@@ -76,6 +78,9 @@ INVALID_OBJECT = "Нужен JSON-объект."
 NOT_FOUND = "Бот не найден."
 MESSAGE_LIMIT = 8000
 INVALID_MESSAGE = "Сообщение — от 1 до 8 000 символов."
+PAYLOAD_TOO_LARGE = "Сообщение длиннее 8 000 символов."
+INVALID_BODY = "Тело запроса не текст."
+WEBHOOK_UNKNOWN = "Адрес не найден."
 EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
@@ -97,13 +102,17 @@ EXTRA_KIND = "extra"
 
 class Opened(NamedTuple):
     connection: Connection
-    session: RowMapping
+    session: RowMapping | None
     account: RowMapping
     now: datetime
 
 
 def email_unconfirmed() -> JSONResponse:
     return error_response(403, "email_unconfirmed", "Почта ещё не подтверждена.")
+
+
+def webhook_unknown() -> JSONResponse:
+    return error_response(404, "webhook_unknown", WEBHOOK_UNKNOWN)
 
 
 def not_found() -> JSONResponse:
@@ -130,6 +139,50 @@ def main_chat_kept() -> JSONResponse:
     return error_response(400, "main_chat", MAIN_CHAT_KEPT)
 
 
+def new_inbound_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def inbound_webhook_address(secret: str) -> str:
+    return f"/api/hooks/{secret}"
+
+
+def hook_message(method: str, query: str, body: str) -> str:
+    lines = [method]
+    if query != "":
+        lines.append(query)
+    if body != "":
+        lines.append(body)
+    return "\n".join(lines)
+
+
+def _decoded_hook_body(raw: bytes) -> str | JSONResponse:
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return error_response(400, "invalid_body", INVALID_BODY)
+    if len(body) > MESSAGE_LIMIT:
+        return error_response(400, "payload_too_large", PAYLOAD_TOO_LARGE)
+    return body
+
+
+class _DropHookAccess(logging.Filter):
+    # The access log line includes the request path, which is the secret address.
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/hooks/" not in record.getMessage()
+
+
+def _install_hook_log_filter() -> None:
+    for name in ("uvicorn.access", "uvicorn.error"):
+        logger = logging.getLogger(name)
+        if any(isinstance(item, _DropHookAccess) for item in logger.filters):
+            continue
+        logger.addFilter(_DropHookAccess())
+
+
+_install_hook_log_filter()
+
+
 def bot_document(row: RowMapping) -> dict[str, object]:
     return {
         "id": str(row["id"]),
@@ -140,6 +193,7 @@ def bot_document(row: RowMapping) -> dict[str, object]:
         "scenario": row["scenario"],
         "updated_at": format_utc(row["updated_at"]),
         "chief": row["chief"] is True,
+        "inbound_webhook": inbound_webhook_address(row["inbound_secret"]),
     }
 
 
@@ -532,6 +586,7 @@ async def create_bot(request: Request) -> JSONResponse:
                 description=parsed["description"],
                 scenario=parsed["scenario"],
                 updated_at=opened.now,
+                inbound_secret=new_inbound_secret(),
             )
         )
         opened.connection.execute(
@@ -612,6 +667,34 @@ async def update_bot(request: Request, bot_id: str) -> JSONResponse:
         return JSONResponse(bot_document(row))
 
 
+@router.post("/api/bots/{bot_id}/inbound-webhook")
+async def rotate_inbound_webhook(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        body = await read_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        existing = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if existing is None:
+            return not_found()
+        opened.connection.execute(
+            bots.update()
+            .where(
+                bots.c.id == parsed_id,
+                bots.c.account_id == opened.account["id"],
+            )
+            .values(inbound_secret=new_inbound_secret(), updated_at=opened.now)
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        row = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        assert row is not None
+        return JSONResponse(bot_document(row))
+
+
 @router.delete("/api/bots/{bot_id}")
 def delete_bot(request: Request, bot_id: str) -> Response:
     with open_confirmed(request, mutating=True) as opened:
@@ -644,6 +727,12 @@ def list_messages(request: Request, bot_id: str) -> JSONResponse:
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
 
 
+def _touch_turn(opened: Opened) -> None:
+    if opened.session is None:
+        return
+    touch_session(opened.connection, opened.session["id"], opened.now)
+
+
 def _deliver_message(
     opened: Opened,
     bot: RowMapping,
@@ -674,7 +763,7 @@ def _deliver_message(
         opened.connection.execute(
             chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
         )
-        touch_session(opened.connection, opened.session["id"], opened.now)
+        _touch_turn(opened)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
     counter = _lock_quota_counter(opened.connection, opened.account["id"])
     proposed = proposed_scenario(text)
@@ -690,7 +779,7 @@ def _deliver_message(
         opened.connection.execute(
             chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
         )
-        touch_session(opened.connection, opened.session["id"], opened.now)
+        _touch_turn(opened)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
     desktop = find_working_desktop(opened.connection, opened.account["id"])
     desktop_available = (
@@ -818,8 +907,46 @@ def _deliver_message(
     opened.connection.execute(
         chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
     )
-    touch_session(opened.connection, opened.session["id"], opened.now)
+    _touch_turn(opened)
     return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+def _raw_query(request: Request) -> str:
+    raw = request.scope.get("query_string", b"")
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("latin-1")
+
+
+@router.api_route("/api/hooks/{token}", methods=["GET", "POST"])
+async def receive_hook(request: Request, token: str) -> Response:
+    _install_hook_log_filter()
+    query = _raw_query(request)
+    raw = await request.body()
+    now = utc_now()
+    with begin() as connection:
+        bot = (
+            connection.execute(select(bots).where(bots.c.inbound_secret == token))
+            .mappings()
+            .one_or_none()
+        )
+        if bot is None:
+            return webhook_unknown()
+        account = find_account_by_id(connection, bot["account_id"])
+        if account is None:
+            return webhook_unknown()
+        if account["email_confirmed_at"] is None:
+            return email_unconfirmed()
+        body = _decoded_hook_body(raw)
+        if isinstance(body, JSONResponse):
+            return body
+        _deliver_message(
+            Opened(connection, None, account, now),
+            bot,
+            main_chat(connection, bot["id"]),
+            hook_message(request.method, query, body),
+        )
+    return JSONResponse({"ok": True})
 
 
 def _not_chief() -> JSONResponse:

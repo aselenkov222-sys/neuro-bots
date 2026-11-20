@@ -41,6 +41,7 @@ BOT_FIELDS = (
     "scenario",
     "updated_at",
     "chief",
+    "inbound_webhook",
 )
 INVALID_ORIGIN = {
     "code": "invalid_origin",

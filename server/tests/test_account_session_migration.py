@@ -58,6 +58,7 @@ BOT_COLUMNS = (
     "scenario",
     "updated_at",
     "chief",
+    "inbound_secret",
 )
 CHAT_COLUMNS = ("id", "bot_id", "updated_at", "kind", "created_at")
 MESSAGE_COLUMNS = ("id", "chat_id", "role", "text", "code", "updated_at")
@@ -103,6 +104,7 @@ CATALOG_REVISION = "d9b4e2a71c58"
 CONNECTION_REVISION = "e2b7c4a91f06"
 CHIEF_REVISION = "a9c3e7b14d82"
 COMPUTER_REVISION = "b6d2e8a14c70"
+INBOUND_REVISION = "c7a1e9d24b83"
 NOTICE_COLUMNS = (
     "id",
     "account_id",
@@ -278,8 +280,10 @@ def _revision_chain() -> list[str]:
     assert links[CONNECTION_REVISION] == CATALOG_REVISION
     assert links[CHIEF_REVISION] == CONNECTION_REVISION
     assert links[COMPUTER_REVISION] == CHIEF_REVISION
-    assert links[chain[-1]] == CHIEF_REVISION
-    assert chain[-1] == COMPUTER_REVISION
+    assert links[INBOUND_REVISION] == COMPUTER_REVISION
+    assert links[chain[-1]] == COMPUTER_REVISION
+    assert chain[-1] == INBOUND_REVISION
+    assert chain[-1] != COMPUTER_REVISION
     assert chain[-1] != CHIEF_REVISION
     assert chain[-1] != CONNECTION_REVISION
     assert chain[-1] != CATALOG_REVISION
@@ -463,11 +467,11 @@ def _insert_accepted_message_roles(connection: Connection) -> None:
             """
             INSERT INTO bots (
                 id, account_id, name, color, icon,
-                description, scenario, updated_at
+                description, scenario, updated_at, inbound_secret
             )
             VALUES (
                 :id, :account_id, :name, :color, :icon,
-                :description, :scenario, :updated_at
+                :description, :scenario, :updated_at, :inbound_secret
             )
             """
         ),
@@ -480,6 +484,7 @@ def _insert_accepted_message_roles(connection: Connection) -> None:
             "description": "",
             "scenario": "",
             "updated_at": moment,
+            "inbound_secret": "message-role",
         },
     )
     connection.execute(
@@ -761,6 +766,16 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
     assert chief_index.unique is True
     assert [column.name for column in chief_index.columns] == ["account_id"]
     assert str(chief_index.dialect_options["postgresql"]["where"]) == "chief"
+    _assert_model_column(bots.c.inbound_secret, Text, nullable=False, unique=True)
+    secret_constraints = [
+        constraint
+        for constraint in bots.constraints
+        if isinstance(constraint, UniqueConstraint)
+    ]
+    assert len(secret_constraints) == 1
+    assert [column.name for column in secret_constraints[0].columns] == [
+        "inbound_secret",
+    ]
 
     assert [column.name for column in chats.primary_key] == ["id"]
     _assert_model_column(chats.c.id, Uuid, nullable=False)
@@ -1462,8 +1477,12 @@ def test_upgrade_head_creates_accounts_and_sessions() -> None:
                 assert chief_row["is_unique"] is True
                 assert chief_row["predicate"] == "chief"
                 assert list(chief_row["columns"]) == ["account_id"]
+                _assert_catalog_column(
+                    bot_columns, "inbound_secret", "text", "text", not_null=True
+                )
                 assert _constraints(connection, "bots") == {
                     ("p", "PRIMARY KEY (id)"),
+                    ("u", "UNIQUE (inbound_secret)"),
                     (
                         "f",
                         "FOREIGN KEY (account_id) REFERENCES accounts(id)",

@@ -622,6 +622,23 @@ function routineBlock() {
     </section>`;
 }
 
+function inboundBlock(bot) {
+  const path = bot && typeof bot.inbound_webhook === "string" ? bot.inbound_webhook : "";
+  const address = path ? `${location.origin}${path}` : "";
+  return `
+    <section class="editor sheet">
+      <div class="section-label">
+        <h2>Входящий адрес</h2>
+      </div>
+      <p id="inbound-webhook">${esc(address)}</p>
+      <p class="hint">После смены прежний адрес молчит.</p>
+      <div class="actions">
+        <button type="button" class="btn-quiet" data-action="copy-inbound">Скопировать</button>
+        <button type="button" class="btn-orange" data-action="rotate-inbound">Сменить</button>
+      </div>
+    </section>`;
+}
+
 function botScreen() {
   const bot = state.card;
   if (!bot) return `${topbar("Карточка бота", "", logoutControl())}${noticeHtml()}`;
@@ -644,6 +661,7 @@ function botScreen() {
         Главный
       </label>
     </section>
+    ${inboundBlock(bot)}
     <section class="editor sheet">
       <div class="section-label">
         <h2>Текст сценария</h2>
@@ -1091,6 +1109,33 @@ async function deleteLibraryFile(fileId) {
   render();
 }
 
+async function copyInbound() {
+  const node = document.getElementById("inbound-webhook");
+  if (!node || !node.textContent) return;
+  try {
+    await navigator.clipboard.writeText(node.textContent);
+  } catch (error) {
+    return;
+  }
+}
+
+async function rotateInbound() {
+  if (!state.activeId) return;
+  const result = await api(`/api/bots/${state.activeId}/inbound-webhook`, {
+    method: "POST",
+    body: {}
+  });
+  note(result);
+  if (!result.ok || !result.data) {
+    render();
+    return;
+  }
+  state.card = result.data;
+  const index = state.bots.findIndex((item) => item.id === result.data.id);
+  if (index >= 0) state.bots[index] = result.data;
+  render();
+}
+
 async function patchBot(changes) {
   if (!state.activeId) return;
   const result = await api(`/api/bots/${state.activeId}`, { method: "PATCH", body: changes });
@@ -1418,6 +1463,8 @@ app.addEventListener("click", (event) => {
     state.savedFlash = true;
     patchBot({ scenario: state.draft });
   }
+  if (action === "copy-inbound") copyInbound();
+  if (action === "rotate-inbound") rotateInbound();
   if (action === "toggle-day") toggleDay(Number(target.dataset.day));
   if (action === "toggle-pause") togglePause();
   if (action === "check-now") checkNow();
