@@ -422,6 +422,76 @@ def test_no_chief_and_the_chiefs_own_routine_write_no_report(
     assert all(row["code"] != REPORT_CODE for row in own)
 
 
+def test_a_chief_assignment_starts_the_other_bots_turn(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cookie, _account_id = _open_confirmed("chief-task@example.com")
+    seen: list[str] = []
+
+    def spy(**kwargs: object) -> str:
+        scenario = kwargs.get("scenario")
+        seen.append(scenario if isinstance(scenario, str) else "")
+        return STUB_TEXT
+
+    monkeypatch.setattr("server.aggregator.complete", spy)
+    with _client(cookie) as client:
+        chief = _create(client, "Старший")
+        worker = _create(client, "Почта")
+        worker_scenario = "Читать входящие."
+        patched = client.patch(
+            f"/api/bots/{worker['id']}",
+            json={"scenario": worker_scenario},
+            headers={"Origin": ORIGIN},
+        )
+        assert patched.status_code == 200
+        extra = client.post(
+            f"/api/bots/{worker['id']}/chats",
+            headers={"Origin": ORIGIN},
+        )
+        assert extra.status_code == 200
+        extra_id = extra.json()["id"]
+        refused = client.post(
+            f"/api/bots/{chief['id']}/assignments",
+            json={"bot_id": worker["id"], "text": "Проверь ящик."},
+            headers={"Origin": ORIGIN},
+        )
+        assert refused.status_code == 400
+        assert refused.json() == {
+            "code": "not_chief",
+            "message": "Этот бот не главный.",
+        }
+        assert seen == []
+        _appoint(client, chief["id"])
+        assigned = client.post(
+            f"/api/bots/{chief['id']}/assignments",
+            json={"bot_id": worker["id"], "text": "Проверь ящик."},
+            headers={"Origin": ORIGIN},
+        )
+        assert assigned.status_code == 200
+        body = assigned.json()["messages"]
+        assert [row["role"] for row in body] == ["user", "assistant"]
+        assert body[0]["text"] == "Проверь ящик."
+        assert body[0]["code"] == "chief_assignment"
+        assert body[1]["text"] == STUB_TEXT
+        assert _scenario(worker["id"]) == worker_scenario
+        assert _scenario(chief["id"]) == ""
+        assert _chat_messages(chief["id"]) == []
+        extra_messages = client.get(
+            f"/api/bots/{worker['id']}/chats/{extra_id}/messages"
+        )
+        assert extra_messages.status_code == 200
+        assert extra_messages.json()["messages"] == []
+        self_task = client.post(
+            f"/api/bots/{chief['id']}/assignments",
+            json={"bot_id": chief["id"], "text": "Себе."},
+            headers={"Origin": ORIGIN},
+        )
+        assert self_task.status_code == 400
+        assert self_task.json()["message"] == "Поручение уходит другому боту."
+        assert _chat_messages(chief["id"]) == []
+    assert seen == [worker_scenario]
+
+
 def test_a_report_is_a_chat_message_and_not_a_digest(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

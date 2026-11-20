@@ -8,6 +8,7 @@ from server.dangerous import write_message
 from server.models import bots
 
 REPORT_CODE = "chief_report"
+ASSIGNMENT_CODE = "chief_assignment"
 SKIPPED = "skipped"
 WAITING = "waiting"
 COMPLETED = "completed"

@@ -27,8 +27,9 @@ from server.browser_action import (
     named_address,
     take_login_choice,
 )
-from server.dangerous import DANGEROUS_CODE, gate_state
+from server.chief import ASSIGNMENT_CODE
 from server.config import development_tariff
+from server.dangerous import DANGEROUS_CODE, gate_state
 from server.desktops import find_working_desktop
 from server.library import attach_files, store_library_file
 from server.models import (
@@ -87,6 +88,8 @@ MAIN_CHAT_KEPT = "Основной чат удалить нельзя."
 PROPOSAL_NOT_FOUND = "Сообщение не найдено."
 INVALID_CONFIRM = "Нужно подтверждение."
 INVALID_CHIEF = "Нужен признак главного."
+NOT_CHIEF = "Этот бот не главный."
+ASSIGN_OTHER = "Поручение уходит другому боту."
 MAIN_KIND = "main"
 EXTRA_KIND = "extra"
 
@@ -641,7 +644,11 @@ def list_messages(request: Request, bot_id: str) -> JSONResponse:
 
 
 def _deliver_message(
-    opened: Opened, bot: RowMapping, chat: RowMapping, text: str
+    opened: Opened,
+    bot: RowMapping,
+    chat: RowMapping,
+    text: str,
+    user_code: str | None = None,
 ) -> JSONResponse:
     counter = _lock_quota_counter(opened.connection, opened.account["id"])
     _insert_message(
@@ -649,7 +656,7 @@ def _deliver_message(
         chat["id"],
         "user",
         text,
-        None,
+        user_code,
         opened.now,
     )
     follow_at = opened.now + timedelta(microseconds=1)
@@ -795,6 +802,55 @@ def _deliver_message(
     )
     touch_session(opened.connection, opened.session["id"], opened.now)
     return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+def _not_chief() -> JSONResponse:
+    return error_response(400, "not_chief", NOT_CHIEF)
+
+
+def _assign_other() -> JSONResponse:
+    return error_response(400, "invalid_request", ASSIGN_OTHER)
+
+
+@router.post("/api/bots/{bot_id}/assignments")
+async def create_assignment(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        chief = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if chief is None:
+            return not_found()
+        if chief["chief"] is not True:
+            return _not_chief()
+        body = await read_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        if "password" in body or "cookie" in body:
+            return error_response(400, "invalid_message", INVALID_MESSAGE)
+        target_raw = body.get("bot_id")
+        if not isinstance(target_raw, str):
+            return not_found()
+        target_id = parse_id(target_raw)
+        if target_id is None:
+            return not_found()
+        if target_id == parsed_id:
+            return _assign_other()
+        target = _load_bot(opened.connection, target_id, opened.account["id"])
+        if target is None:
+            return not_found()
+        text = body.get("text")
+        if not isinstance(text, str) or not 1 <= len(text) <= MESSAGE_LIMIT:
+            return error_response(400, "invalid_message", INVALID_MESSAGE)
+        return _deliver_message(
+            opened,
+            target,
+            main_chat(opened.connection, target_id),
+            text,
+            ASSIGNMENT_CODE,
+        )
 
 
 @router.post("/api/bots/{bot_id}/messages")
