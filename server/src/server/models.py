@@ -102,6 +102,7 @@ bots = Table(
         nullable=False,
         server_default=text("false"),
     ),
+    Column("inbound_secret", Text(), nullable=False, unique=True),
     Index(
         "bots_one_chief",
         "account_id",

@@ -1,4 +1,5 @@
 import json
+import secrets
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -130,6 +131,14 @@ def main_chat_kept() -> JSONResponse:
     return error_response(400, "main_chat", MAIN_CHAT_KEPT)
 
 
+def new_inbound_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def inbound_webhook_address(secret: str) -> str:
+    return f"/api/hooks/{secret}"
+
+
 def bot_document(row: RowMapping) -> dict[str, object]:
     return {
         "id": str(row["id"]),
@@ -140,6 +149,7 @@ def bot_document(row: RowMapping) -> dict[str, object]:
         "scenario": row["scenario"],
         "updated_at": format_utc(row["updated_at"]),
         "chief": row["chief"] is True,
+        "inbound_webhook": inbound_webhook_address(row["inbound_secret"]),
     }
 
 
@@ -532,6 +542,7 @@ async def create_bot(request: Request) -> JSONResponse:
                 description=parsed["description"],
                 scenario=parsed["scenario"],
                 updated_at=opened.now,
+                inbound_secret=new_inbound_secret(),
             )
         )
         opened.connection.execute(
