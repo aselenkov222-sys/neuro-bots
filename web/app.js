@@ -1481,6 +1481,23 @@ function resetCabinet() {
   state.confirmAccountRemoval = false;
 }
 
+async function noteAccountRemoved() {
+  const bridge = window.__neuroDesktop;
+  if (!bridge || typeof bridge.openUrl !== "string" || typeof bridge.openToken !== "string") return;
+  try {
+    await fetch(`${bridge.openUrl.replace(/\/$/, "")}/account-removed`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Desktop-Open": bridge.openToken
+      },
+      body: "{}"
+    });
+  } catch (error) {
+    return;
+  }
+}
+
 async function removeAccount() {
   stopPulse();
   const result = await api("/api/me", { method: "DELETE", body: { confirm: true } });
@@ -1489,6 +1506,7 @@ async function removeAccount() {
     render();
     return;
   }
+  await noteAccountRemoved();
   resetCabinet();
   if (location.hash !== "#register") location.hash = "#register";
   else render();

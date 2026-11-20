@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,6 +13,14 @@ _held: list[object] = []
 
 def browser_profile_dir() -> Path:
     return default_state_dir() / "browser-profile"
+
+
+def clear_browser_profile() -> None:
+    profile = browser_profile_dir()
+    if profile.is_dir():
+        shutil.rmtree(profile)
+    elif profile.exists():
+        profile.unlink()
 
 
 def _windows_roots() -> tuple[Path, ...]:
