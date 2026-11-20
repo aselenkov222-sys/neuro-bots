@@ -1,3 +1,5 @@
+import os
+
 from sqlalchemy import MetaData, create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -6,8 +8,19 @@ DATABASE_URL = "postgresql+psycopg://neurobots@127.0.0.1:5432/neurobots"
 metadata = MetaData()
 
 
+def database_url() -> str:
+    configured = os.environ.get("NEURO_BOTS_DATABASE_URL")
+    if configured is None or configured == "":
+        return DATABASE_URL
+    return configured
+
+
+def alembic_sqlalchemy_url() -> str:
+    return (database_url() or DATABASE_URL).replace("%", "%%")
+
+
 def create_db_engine() -> Engine:
-    return create_engine(DATABASE_URL)
+    return create_engine(database_url())
 
 
 def database_responds(engine: Engine | None = None) -> bool:

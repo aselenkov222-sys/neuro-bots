@@ -1,5 +1,7 @@
 from typing import NamedTuple
 
+from server.config import configured_aggregator_key
+
 
 class CompleteResult(NamedTuple):
     text: str
@@ -14,6 +16,7 @@ def complete(
     desktop_available: bool,
     page_text: str,
 ) -> str:
+    configured_aggregator_key()
     return "Сейчас я на заглушке агрегатора и не вызываю модель."
 
 
