@@ -31,7 +31,12 @@ from server.accounts import (
     update_account_name,
     utc_now,
 )
-from server.config import development_tariff
+from server.config import (
+    configured_tariff_name,
+    configured_tariff_price,
+    development_tariff,
+    payment_required,
+)
 from server.confirmation import (
     apply_confirmation,
     issue_confirmation_link,
@@ -90,12 +95,16 @@ def find_stored_period(
 ) -> StoredPeriod | None:
     period = (
         connection.execute(
-            select(subscription_periods).where(
-                subscription_periods.c.account_id == account_id
+            select(subscription_periods)
+            .where(subscription_periods.c.account_id == account_id)
+            .order_by(
+                subscription_periods.c.started_at.desc(),
+                subscription_periods.c.id.desc(),
             )
+            .limit(1)
         )
         .mappings()
-        .one_or_none()
+        .first()
     )
     if period is None:
         return None
@@ -119,11 +128,18 @@ def account_document(
     email_confirmed_at: datetime | None,
     stored_period: StoredPeriod | None = None,
 ) -> dict[str, object]:
+    tariff_name = configured_tariff_name()
+    tariff_price = configured_tariff_price()
     if email_confirmed_at is None:
         period = None
         quota = None
         quota_counter = None
         confirmed = False
+    elif stored_period is None and payment_required():
+        period = None
+        quota = None
+        quota_counter = None
+        confirmed = True
     elif stored_period is None:
         period = {
             "started_at": format_utc(email_confirmed_at),
@@ -152,6 +168,7 @@ def account_document(
         "period": period,
         "quota": quota,
         "quota_counter": quota_counter,
+        "tariff": {"name": tariff_name, "price": tariff_price},
     }
 
 

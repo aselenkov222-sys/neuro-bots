@@ -16,3 +16,21 @@ def configured_mail_sink() -> str | None:
     if configured is None or configured == "":
         return None
     return configured
+
+
+def configured_tariff_name() -> str | None:
+    configured = os.environ.get("NEURO_BOTS_TARIFF_NAME")
+    if configured is None or configured == "":
+        return None
+    return configured
+
+
+def configured_tariff_price() -> str | None:
+    configured = os.environ.get("NEURO_BOTS_TARIFF_PRICE")
+    if configured is None or configured == "":
+        return None
+    return configured
+
+
+def payment_required() -> bool:
+    return configured_tariff_name() is not None and configured_tariff_price() is not None

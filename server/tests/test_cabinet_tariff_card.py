@@ -8,8 +8,6 @@ from server.app import app
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 REMOVED = (
     "Рабочий десктоп",
-    "Оплатить",
-    'data-action="pay"',
     "pick-tariff",
     "Выбор тарифа",
     "Тариф 1",
@@ -46,12 +44,31 @@ def test_cabinet_drops_later_features_and_shows_one_tariff_card() -> None:
 
         tariff = _screen(script, "tariffScreen", "function registerScreen(")
         assert tariff.count('class="tariff') == 1
+        assert '<article class="tariff sheet"></article>' in tariff
+        assert "logoutControl()" in tariff
         assert 'topbar("Тариф"' in tariff
         assert "Выбор тарифа" not in tariff
         assert "500" not in tariff
         assert re.search(r"\b5\b", tariff) is None
         assert "price" not in tariff
+        assert "Оплатить" not in tariff
+        assert 'data-action="pay"' not in tariff
         assert "radio" not in tariff
+
+        gate = _screen(script, "pricedTariff", "function awaitsPayment(")
+        assert "tariff.name" in gate
+        assert "tariff.price" in gate
+        assert 'tariff.name === ""' in gate
+        assert 'tariff.price === ""' in gate
+        card = _screen(script, "tariffCard", "function tariffScreen(")
+        empty_branch, pay_branch = card.split("if (!tariff) return emptyMarkup;", 1)
+        assert "Оплатить" not in empty_branch
+        assert 'data-action="pay"' not in empty_branch
+        assert 'class="price"' not in empty_branch
+        assert card.count('class="tariff') == 1
+        assert "Оплатить" in pay_branch
+        assert 'data-action="pay"' in pay_branch
+        assert 'class="price"' in pay_branch
 
         register = _screen(script, "registerScreen", "function loginScreen(")
         login = _screen(script, "loginScreen", "function botCard(")

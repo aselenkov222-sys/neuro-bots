@@ -279,11 +279,22 @@ function screen() {
   return "";
 }
 
+function pricedTariff() {
+  const tariff = state.me && state.me.tariff;
+  if (!tariff || typeof tariff.name !== "string" || typeof tariff.price !== "string") return null;
+  if (tariff.name === "" || tariff.price === "") return null;
+  return tariff;
+}
+
+function awaitsPayment() {
+  return Boolean(state.me && state.me.email_confirmed && pricedTariff() && state.me.period == null);
+}
+
 function desiredScreen() {
   const requested = screen();
   if (requested === "login" || requested === "register") return requested;
   if (!state.me) return "register";
-  if (state.holdTariff || !state.me.email_confirmed) return "tariff";
+  if (state.holdTariff || !state.me.email_confirmed || awaitsPayment()) return "tariff";
   if (requested === "profile" || requested === "catalog") return requested;
   if ((requested === "bot" || requested === "chat") && state.activeId) return requested;
   return "bots";
@@ -334,6 +345,19 @@ function note(result) {
   else if (result && result.ok) state.notice = "";
 }
 
+function tariffCard(emptyMarkup) {
+  const tariff = pricedTariff();
+  if (!tariff) return emptyMarkup;
+  return `
+    <article class="tariff sheet">
+      <strong>${esc(tariff.name)}</strong>
+      <span class="price">${esc(tariff.price)}</span>
+    </article>
+    <div class="pay-row">
+      <button type="button" class="btn-orange" data-action="pay">Оплатить</button>
+    </div>`;
+}
+
 function tariffScreen() {
   const resend = state.me && state.me.email_confirmed === false
     ? '<div class="actions" style="margin-top:12px"><button type="button" class="btn-orange" data-action="resend">Прислать новую</button></div>'
@@ -341,7 +365,7 @@ function tariffScreen() {
   return `
     ${topbar("Тариф", "", logoutControl())}
     ${noticeHtml()}
-    <article class="tariff sheet"></article>
+    ${tariffCard('<article class="tariff sheet"></article>')}
     ${resend}`;
 }
 
@@ -465,7 +489,7 @@ function profileScreen() {
         <input class="name-input" id="profile-name" type="text" maxlength="80" value="${esc(profileName())}" autocomplete="nickname">
       </div>
     </section>
-    <article class="tariff sheet" aria-label="Тариф"></article>
+    ${tariffCard('<article class="tariff sheet" aria-label="Тариф"></article>')}
     <section class="panel sheet">
       <div class="fields">
         <label class="field" for="quota-counter">Счётчик квоты
@@ -1118,6 +1142,19 @@ async function submitLogin() {
   location.hash = result.data.email_confirmed ? "#bots" : "#tariff";
 }
 
+async function pay() {
+  const result = await api("/api/payment", { method: "POST", body: {} });
+  note(result);
+  if (!result.ok || !result.data) {
+    render();
+    return;
+  }
+  state.me = result.data;
+  state.holdTariff = false;
+  if (location.hash !== "#bots") location.hash = "#bots";
+  else await showCurrent();
+}
+
 async function submitCreate() {
   const draft = state.creating;
   if (!draft || !draft.name.trim()) return;
@@ -1290,6 +1327,10 @@ app.addEventListener("click", (event) => {
   const action = target.dataset.action;
   if (action === "resend") {
     sendConfirmation();
+    return;
+  }
+  if (action === "pay") {
+    pay();
     return;
   }
   if (action === "logout") {

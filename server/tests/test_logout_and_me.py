@@ -133,6 +133,7 @@ def _account_body(account_id: uuid.UUID, email: str) -> dict:
         "period": None,
         "quota": None,
         "quota_counter": None,
+        "tariff": {"name": None, "price": None},
     }
 
 
