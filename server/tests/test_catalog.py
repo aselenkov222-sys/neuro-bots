@@ -950,3 +950,88 @@ def test_connected_routine_opens_a_catalog_address_once_before_a_gate(
     assert peek_open(account_id, computer) is None
     assert calls == []
     assert _charges(account_id) == []
+
+
+def test_a_connection_does_not_close_another_address(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-rest@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    outside = "https://other.example/home"
+    closed = "https://bank.example/pay"
+    scenario = (
+        f"{CATALOG_SCENARIO}\n"
+        "ещё раз https://Example.com/notes.\n"
+        f"Открой {outside}\n"
+        f"ещё раз {outside}"
+    )
+    with _client(cookie) as client:
+        mail = _item(client)
+        bank = _post(
+            client,
+            {
+                "name": "Банк",
+                "address": closed,
+                "description": "счета",
+            },
+        )
+        assert bank.status_code == 200
+        bot = _bot_with_scenario(client, "Связь", scenario)
+        created = _routine(client, bot["id"])
+        connected = _connect(
+            client, mail["id"], {"everyone": False, "bot_ids": [bot["id"]]}
+        )
+        assert connected.status_code == 200
+        assert connected.json()["bot_ids"] == [bot["id"]]
+        assert bank.json()["everyone"] is False
+        assert bank.json()["bot_ids"] == []
+        computer = _working_desktop(client)
+        claimed = _claim(client, computer)
+    assert claimed.status_code == 200
+    assert claimed.json()["bot_id"] == bot["id"]
+    opened = _runs_for(created["id"])
+    assert len(opened) == 1
+    assert opened[0]["status"] == "claimed"
+    assert peek_open(account_id, computer) == CATALOG_ADDRESS
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) == outside
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    spoken = _chat_messages(uuid.UUID(bot["id"]))
+    assert [row["code"] for row in spoken] == [None]
+    assert spoken[0]["text"] == STUB_TEXT
+    assert len(calls) == 1
+    assert _used(account_id) == 1
+    with _client(cookie) as client:
+        updated = client.patch(
+            f"/api/bots/{bot['id']}",
+            json={"scenario": f"Открой {closed}"},
+            headers={"Origin": ORIGIN},
+        )
+        assert updated.status_code == 200
+    monkeypatch.setattr(
+        "server.routines.utc_now",
+        lambda: datetime(2026, 11, 20, 6, 0, tzinfo=timezone.utc)
+        + timedelta(seconds=59),
+    )
+    with _client(cookie) as client:
+        stopped = _claim(client, computer)
+    assert stopped.status_code == 204
+    runs = {row["local_date"]: row for row in _runs_for(created["id"])}
+    assert runs[opened[0]["local_date"]]["status"] == "claimed"
+    failed = next(row for row in runs.values() if row["id"] != opened[0]["id"])
+    assert failed["status"] == "failed"
+    assert failed["claimed_at"] is None
+    assert peek_open(account_id, computer) is None
+    assert len(calls) == 1
+    assert _used(account_id) == 1
+    assert len(_charges(account_id)) == 1
+    errors = [
+        row
+        for row in _chat_messages(uuid.UUID(bot["id"]))
+        if row["role"] == "error"
+    ]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "catalog_not_connected"
+    assert errors[0]["text"] == CATALOG_CLOSED
