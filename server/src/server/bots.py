@@ -1,4 +1,5 @@
 import json
+import logging
 import secrets
 import uuid
 from collections.abc import Iterator
@@ -13,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
-from server.accounts import format_utc, touch_session, utc_now
+from server.accounts import find_account_by_id, format_utc, touch_session, utc_now
 from server.auth import (
     begin,
     current_account,
@@ -98,7 +99,7 @@ EXTRA_KIND = "extra"
 
 class Opened(NamedTuple):
     connection: Connection
-    session: RowMapping
+    session: RowMapping | None
     account: RowMapping
     now: datetime
 
@@ -137,6 +138,32 @@ def new_inbound_secret() -> str:
 
 def inbound_webhook_address(secret: str) -> str:
     return f"/api/hooks/{secret}"
+
+
+def hook_message(method: str, query: str, body: str) -> str:
+    lines = [method]
+    if query != "":
+        lines.append(query)
+    if body != "":
+        lines.append(body)
+    return "\n".join(lines)
+
+
+class _DropHookAccess(logging.Filter):
+    # The access log line includes the request path, which is the secret address.
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/hooks/" not in record.getMessage()
+
+
+def _install_hook_log_filter() -> None:
+    for name in ("uvicorn.access", "uvicorn.error"):
+        logger = logging.getLogger(name)
+        if any(isinstance(item, _DropHookAccess) for item in logger.filters):
+            continue
+        logger.addFilter(_DropHookAccess())
+
+
+_install_hook_log_filter()
 
 
 def bot_document(row: RowMapping) -> dict[str, object]:
@@ -655,6 +682,12 @@ def list_messages(request: Request, bot_id: str) -> JSONResponse:
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
 
 
+def _touch_turn(opened: Opened) -> None:
+    if opened.session is None:
+        return
+    touch_session(opened.connection, opened.session["id"], opened.now)
+
+
 def _deliver_message(
     opened: Opened,
     bot: RowMapping,
@@ -685,7 +718,7 @@ def _deliver_message(
         opened.connection.execute(
             chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
         )
-        touch_session(opened.connection, opened.session["id"], opened.now)
+        _touch_turn(opened)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
     counter = _lock_quota_counter(opened.connection, opened.account["id"])
     proposed = proposed_scenario(text)
@@ -701,7 +734,7 @@ def _deliver_message(
         opened.connection.execute(
             chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
         )
-        touch_session(opened.connection, opened.session["id"], opened.now)
+        _touch_turn(opened)
         return JSONResponse(_messages_document(opened.connection, chat["id"]))
     desktop = find_working_desktop(opened.connection, opened.account["id"])
     desktop_available = (
@@ -829,8 +862,42 @@ def _deliver_message(
     opened.connection.execute(
         chats.update().where(chats.c.id == chat["id"]).values(updated_at=follow_at)
     )
-    touch_session(opened.connection, opened.session["id"], opened.now)
+    _touch_turn(opened)
     return JSONResponse(_messages_document(opened.connection, chat["id"]))
+
+
+def _raw_query(request: Request) -> str:
+    raw = request.scope.get("query_string", b"")
+    if isinstance(raw, str):
+        return raw
+    return raw.decode("latin-1")
+
+
+@router.api_route("/api/hooks/{token}", methods=["GET", "POST"])
+async def receive_hook(request: Request, token: str) -> Response:
+    _install_hook_log_filter()
+    query = _raw_query(request)
+    body = (await request.body()).decode("utf-8")
+    text = hook_message(request.method, query, body)
+    now = utc_now()
+    with begin() as connection:
+        bot = (
+            connection.execute(select(bots).where(bots.c.inbound_secret == token))
+            .mappings()
+            .one_or_none()
+        )
+        if bot is None:
+            return Response(status_code=404)
+        account = find_account_by_id(connection, bot["account_id"])
+        if account is None:
+            return Response(status_code=404)
+        _deliver_message(
+            Opened(connection, None, account, now),
+            bot,
+            main_chat(connection, bot["id"]),
+            text,
+        )
+    return JSONResponse({"ok": True})
 
 
 def _not_chief() -> JSONResponse:
