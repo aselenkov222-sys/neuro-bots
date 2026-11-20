@@ -41,6 +41,11 @@ PAYLOAD_TOO_LARGE = {
     "message": "Сообщение длиннее 8 000 символов.",
 }
 INVALID_BODY = {"code": "invalid_body", "message": "Тело запроса не текст."}
+WEBHOOK_UNKNOWN = {"code": "webhook_unknown", "message": "Адрес не найден."}
+EMAIL_UNCONFIRMED = {
+    "code": "email_unconfirmed",
+    "message": "Почта ещё не подтверждена.",
+}
 
 
 def _compose(*args: str, timeout: float) -> subprocess.CompletedProcess[str]:
@@ -182,6 +187,19 @@ def _runs(routine_ids: set[uuid.UUID]) -> list[dict]:
     return [row for row in _rows(routine_runs) if row["routine_id"] in routine_ids]
 
 
+def _clear_confirmation(account_id: uuid.UUID) -> None:
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                accounts.update()
+                .where(accounts.c.id == account_id)
+                .values(email_confirmed_at=None)
+            )
+    finally:
+        engine.dispose()
+
+
 def _set_period_active(account_id: uuid.UUID, active: bool) -> None:
     engine = create_db_engine()
     try:
@@ -286,7 +304,9 @@ def test_hook_writes_the_main_chat_without_a_session_or_origin(
     before_messages = len(stored)
     with _client() as caller:
         unknown = _hook(caller, "GET", f"/api/hooks/{UNKNOWN}")
-    assert unknown.status_code < 500
+    assert unknown.status_code == 404
+    assert unknown.json() == WEBHOOK_UNKNOWN
+    assert tuple(unknown.json()) == ("code", "message")
     assert UNKNOWN not in unknown.text
     assert len(_chat_messages(bot_id)) == before_messages
     with _client(cookie) as owner:
@@ -460,9 +480,97 @@ def test_hook_body_of_8000_characters_is_accepted_and_longer_or_non_utf8_is_refu
     again, again_charges = _quota(account_id)
     assert again["used"] == counter["used"]
     assert len(again_charges) == len(charges)
-    assert bad_unknown.status_code == plain_unknown.status_code
+    assert bad_unknown.status_code == plain_unknown.status_code == 404
+    assert bad_unknown.json() == plain_unknown.json() == WEBHOOK_UNKNOWN
     assert bad_unknown.content == plain_unknown.content
     assert UNKNOWN not in bad_unknown.text
+
+
+def test_unknown_address_and_unconfirmed_email_do_not_start_a_turn(
+    database: None,
+) -> None:
+    cookie, account_id = _open_ready("hook-unconfirmed@example.com")
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра"},
+            headers={"Origin": ORIGIN},
+        )
+    assert created.status_code == 200
+    bot_id = created.json()["id"]
+    path = created.json()["inbound_webhook"]
+    _clear_confirmation(account_id)
+    messages_before = len(_rows(messages))
+    charges_before = len(_rows(quota_charges))
+    long_body = ("я" * 8001).encode("utf-8")
+    with _client() as caller:
+        unknown_get = _hook(caller, "GET", f"/api/hooks/{UNKNOWN}")
+        unknown_long = _hook(
+            caller, "POST", f"/api/hooks/{UNKNOWN}", content=long_body
+        )
+        unknown_binary = _hook(
+            caller, "POST", f"/api/hooks/{UNKNOWN}", content=b"\xff"
+        )
+        unconfirmed = _hook(caller, "POST", path, content=b"hello")
+        unconfirmed_long = _hook(caller, "POST", path, content=long_body)
+        unconfirmed_binary = _hook(caller, "POST", path, content=b"\xff")
+    for response in (unknown_get, unknown_long, unknown_binary):
+        assert response.status_code == 404
+        assert response.json() == WEBHOOK_UNKNOWN
+        assert tuple(response.json()) == ("code", "message")
+        assert UNKNOWN not in response.text
+        assert STUB not in response.text
+    for response in (unconfirmed, unconfirmed_long, unconfirmed_binary):
+        assert response.status_code == 403
+        assert response.json() == EMAIL_UNCONFIRMED
+        assert tuple(response.json()) == ("code", "message")
+        assert STUB not in response.text
+    assert _chat_messages(bot_id) == []
+    assert len(_rows(messages)) == messages_before
+    assert len(_rows(quota_charges)) == charges_before
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 0
+    assert charges == []
+
+
+def test_two_accepted_hooks_are_separate_turns(database: None) -> None:
+    cookie, account_id = _open_ready("hook-two-turns@example.com")
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра"},
+            headers={"Origin": ORIGIN},
+        )
+    assert created.status_code == 200
+    bot_id = created.json()["id"]
+    path = created.json()["inbound_webhook"]
+    with _client() as caller:
+        first = _hook(caller, "POST", path, content=b"one")
+    assert first.status_code == 200
+    assert first.json() == {"ok": True}
+    assert tuple(first.json()) == ("ok",)
+    assert STUB not in first.text
+    after_first = _chat_messages(bot_id)
+    assert [row["role"] for row in after_first] == ["user", "assistant"]
+    assert after_first[0]["text"] == "POST\none"
+    assert after_first[1]["text"] == STUB
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 1
+    assert len(charges) == 1
+    with _client() as caller:
+        second = _hook(caller, "GET", path)
+    assert second.status_code == 200
+    assert second.json() == {"ok": True}
+    assert tuple(second.json()) == ("ok",)
+    assert STUB not in second.text
+    stored = _chat_messages(bot_id)
+    assert [row["role"] for row in stored] == ["user", "assistant", "user", "assistant"]
+    assert stored[2]["text"] == "GET"
+    assert stored[3]["text"] == STUB
+    assert stored[1]["text"] == stored[3]["text"] == STUB
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 2
+    assert len(charges) == 2
 
 
 class _Journal:
@@ -578,7 +686,8 @@ def test_hook_request_does_not_write_the_address_to_the_server_journal(
         assert posted.json() == {"ok": True}
         assert empty.status_code == 200
         assert empty.json() == {"ok": True}
-        assert unknown.status_code < 500
+        assert unknown.status_code == 404
+        assert unknown.json() == WEBHOOK_UNKNOWN
         assert UNKNOWN not in unknown.text
         time.sleep(0.5)
         written = journal.text()

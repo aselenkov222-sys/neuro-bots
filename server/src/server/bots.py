@@ -80,6 +80,7 @@ MESSAGE_LIMIT = 8000
 INVALID_MESSAGE = "Сообщение — от 1 до 8 000 символов."
 PAYLOAD_TOO_LARGE = "Сообщение длиннее 8 000 символов."
 INVALID_BODY = "Тело запроса не текст."
+WEBHOOK_UNKNOWN = "Адрес не найден."
 EMPTY_MODEL_TEXT = "Ответ модели не пришёл."
 EMPTY_MODEL_CODE = "empty_model_response"
 QUOTA_EXHAUSTED_TEXT = "Квота на период закончилась."
@@ -108,6 +109,10 @@ class Opened(NamedTuple):
 
 def email_unconfirmed() -> JSONResponse:
     return error_response(403, "email_unconfirmed", "Почта ещё не подтверждена.")
+
+
+def webhook_unknown() -> JSONResponse:
+    return error_response(404, "webhook_unknown", WEBHOOK_UNKNOWN)
 
 
 def not_found() -> JSONResponse:
@@ -898,10 +903,12 @@ async def receive_hook(request: Request, token: str) -> Response:
             .one_or_none()
         )
         if bot is None:
-            return Response(status_code=404)
+            return webhook_unknown()
         account = find_account_by_id(connection, bot["account_id"])
         if account is None:
-            return Response(status_code=404)
+            return webhook_unknown()
+        if account["email_confirmed_at"] is None:
+            return email_unconfirmed()
         body = _decoded_hook_body(raw)
         if isinstance(body, JSONResponse):
             return body
