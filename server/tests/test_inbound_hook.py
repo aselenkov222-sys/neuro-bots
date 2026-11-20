@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from playwright.sync_api import sync_playwright
 from sqlalchemy import select
 
 from server.accounts import calendar_month_end, create_account, create_session
@@ -17,6 +18,7 @@ from server.app import app
 from server.db import create_db_engine
 from server.models import (
     accounts,
+    bots,
     chats,
     messages,
     quota_charges,
@@ -177,6 +179,18 @@ def _chat_messages(bot_id: str) -> list[dict]:
     chat = _main_chat(bot_id)
     rows = [row for row in _rows(messages) if row["chat_id"] == chat["id"]]
     return sorted(rows, key=lambda row: (row["updated_at"], row["id"]))
+
+
+def _stored_secret(bot_id: str) -> str:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            secret = connection.execute(
+                select(bots.c.inbound_secret).where(bots.c.id == uuid.UUID(bot_id))
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    return str(secret)
 
 
 def _bot_routines(bot_id: str) -> list[dict]:
@@ -694,5 +708,194 @@ def test_hook_request_does_not_write_the_address_to_the_server_journal(
         assert secret not in written
         assert "/api/hooks/" not in written
         assert UNKNOWN not in written
+    finally:
+        _stop(process, journal)
+
+
+def test_rotate_replaces_the_address_and_ignores_a_client_secret(
+    database: None,
+) -> None:
+    cookie, account_id = _open_ready("hook-rotate@example.com")
+    seen = _session(cookie)["last_request_at"]
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра"},
+            headers={"Origin": ORIGIN},
+        )
+        assert created.status_code == 200
+        bot_id = created.json()["id"]
+        old_path = created.json()["inbound_webhook"]
+        previous = created.json()["updated_at"]
+        rejected = owner.post(
+            f"/api/bots/{bot_id}/inbound-webhook",
+            json={"inbound_secret": "client-supplied-secret"},
+            headers={"Origin": FOREIGN},
+        )
+        assert rejected.status_code == 403
+        assert rejected.json()["code"] == "invalid_origin"
+        kept = owner.get(f"/api/bots/{bot_id}")
+        assert kept.status_code == 200
+        assert kept.json()["inbound_webhook"] == old_path
+        rotated = owner.post(
+            f"/api/bots/{bot_id}/inbound-webhook",
+            json={
+                "inbound_secret": "client-supplied-secret",
+                "inbound_webhook": "/api/hooks/client-supplied-secret",
+            },
+            headers={"Origin": ORIGIN},
+        )
+    assert rotated.status_code == 200
+    body = rotated.json()
+    assert tuple(body) == (
+        "id",
+        "name",
+        "color",
+        "icon",
+        "description",
+        "scenario",
+        "updated_at",
+        "chief",
+        "inbound_webhook",
+    )
+    assert body["name"] == "Искра"
+    assert body["updated_at"] != previous
+    new_path = body["inbound_webhook"]
+    assert new_path != old_path
+    assert "client-supplied-secret" not in new_path
+    stored = _stored_secret(bot_id)
+    assert stored != "client-supplied-secret"
+    assert new_path == f"/api/hooks/{stored}"
+    assert _session(cookie)["last_request_at"] > seen
+    with _client(cookie) as owner:
+        again = owner.get(f"/api/bots/{bot_id}")
+    assert again.json() == body
+    with _client() as caller:
+        dead = _hook(caller, "POST", old_path, content=b"old")
+        live = _hook(caller, "POST", new_path, content=b"new")
+    assert dead.status_code == 404
+    assert dead.json() == WEBHOOK_UNKNOWN
+    assert tuple(dead.json()) == ("code", "message")
+    assert live.status_code == 200
+    assert live.json() == {"ok": True}
+    assert STUB not in live.text
+    spoken = _chat_messages(bot_id)
+    assert [row["role"] for row in spoken] == ["user", "assistant"]
+    assert spoken[0]["text"] == "POST\nnew"
+    assert spoken[1]["text"] == STUB
+    counter, charges = _quota(account_id)
+    assert counter["used"] == 1
+    assert len(charges) == 1
+
+
+def test_bot_card_shows_the_absolute_address_and_can_copy_and_rotate(
+    database: None,
+) -> None:
+    cookie, _account_id = _open_ready("hook-card@example.com")
+    with _client(cookie) as owner:
+        created = owner.post(
+            "/api/bots",
+            json={"name": "Искра"},
+            headers={"Origin": ORIGIN},
+        )
+    assert created.status_code == 200
+    bot_id = created.json()["id"]
+    path = created.json()["inbound_webhook"]
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = _Journal(process)
+    fresh = ""
+    try:
+        with httpx.Client(timeout=5) as client:
+            ready = _wait_until(
+                journal,
+                lambda current: "Application startup complete." in current
+                and _health_ok(client, origin),
+            )
+            assert "Application startup complete." in ready, ready
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = browser.new_context()
+            context.grant_permissions(
+                ["clipboard-read", "clipboard-write"], origin=origin
+            )
+            context.add_cookies(
+                [{"name": "session", "value": cookie, "url": origin}]
+            )
+            page = context.new_page()
+            page.goto(f"{origin}/#bots")
+            page.wait_for_selector(".bot-card")
+            page.click(".bot-card")
+            page.wait_for_selector("#inbound-webhook")
+            shown = page.locator("#inbound-webhook").inner_text()
+            assert shown == f"{origin}{path}"
+            assert page.locator("#inbound-webhook").is_visible()
+            assert page.locator("input#inbound-webhook").count() == 0
+            assert page.locator("textarea#inbound-webhook").count() == 0
+            assert page.locator("h2", has_text="Входящий адрес").count() == 1
+            copy = page.locator('[data-action="copy-inbound"]')
+            rotate = page.locator('[data-action="rotate-inbound"]')
+            assert copy.inner_text() == "Скопировать"
+            assert "btn-quiet" in (copy.get_attribute("class") or "")
+            assert rotate.inner_text() == "Сменить"
+            assert "btn-orange" in (rotate.get_attribute("class") or "")
+            assert page.locator(".proto-nav").count() == 0
+            assert page.evaluate(
+                """() => {
+                  const identity = document.querySelector(".identity");
+                  const address = document.getElementById("inbound-webhook");
+                  const scenario = document.getElementById("scenario");
+                  const after = Node.DOCUMENT_POSITION_FOLLOWING;
+                  return Boolean(
+                    identity && address && scenario &&
+                    (identity.compareDocumentPosition(address) & after) &&
+                    (address.compareDocumentPosition(scenario) & after)
+                  );
+                }"""
+            )
+            copy.click()
+            page.wait_for_function(
+                "(expected) => navigator.clipboard.readText().then((text) => text === expected)",
+                arg=shown,
+            )
+            rotate.click()
+            page.wait_for_function(
+                "(previous) => { const node = document.getElementById('inbound-webhook'); return Boolean(node && node.textContent !== previous); }",
+                arg=shown,
+            )
+            with _client(cookie) as owner:
+                card = owner.get(f"/api/bots/{bot_id}")
+            assert card.status_code == 200
+            fresh = card.json()["inbound_webhook"]
+            assert fresh != path
+            assert page.locator("#inbound-webhook").inner_text() == f"{origin}{fresh}"
+            shot = Path("/opt/cursor/artifacts/inbound-card.png")
+            if shot.parent.is_dir():
+                page.screenshot(path=str(shot), full_page=True)
+            browser.close()
+        written = journal.text()
+        assert path not in written
+        assert fresh not in written
+        assert "/api/hooks/" not in written
     finally:
         _stop(process, journal)

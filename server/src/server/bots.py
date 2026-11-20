@@ -667,6 +667,34 @@ async def update_bot(request: Request, bot_id: str) -> JSONResponse:
         return JSONResponse(bot_document(row))
 
 
+@router.post("/api/bots/{bot_id}/inbound-webhook")
+async def rotate_inbound_webhook(request: Request, bot_id: str) -> JSONResponse:
+    with open_confirmed(request, mutating=True) as opened:
+        if isinstance(opened, JSONResponse):
+            return opened
+        parsed_id = parse_id(bot_id)
+        if parsed_id is None:
+            return not_found()
+        body = await read_object(request)
+        if isinstance(body, JSONResponse):
+            return body
+        existing = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        if existing is None:
+            return not_found()
+        opened.connection.execute(
+            bots.update()
+            .where(
+                bots.c.id == parsed_id,
+                bots.c.account_id == opened.account["id"],
+            )
+            .values(inbound_secret=new_inbound_secret(), updated_at=opened.now)
+        )
+        touch_session(opened.connection, opened.session["id"], opened.now)
+        row = _load_bot(opened.connection, parsed_id, opened.account["id"])
+        assert row is not None
+        return JSONResponse(bot_document(row))
+
+
 @router.delete("/api/bots/{bot_id}")
 def delete_bot(request: Request, bot_id: str) -> Response:
     with open_confirmed(request, mutating=True) as opened:

@@ -502,6 +502,11 @@ textarea { resize: vertical; min-height: 88px; line-height: 1.5; }
 
 #scenario { min-height: 180px; }
 
+#inbound-webhook {
+  margin: 0 0 10px;
+  overflow-wrap: anywhere;
+}
+
 input:focus, textarea:focus, input:focus-visible, textarea:focus-visible {
   border-color: #c2410c;
   box-shadow: 0 0 0 1px #c2410c;
