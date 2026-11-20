@@ -147,6 +147,13 @@ def clear_opens() -> None:
         _held.clear()
 
 
+def forget_account(account_id: uuid.UUID) -> None:
+    with _lock:
+        for store in (_opens, _choices, _held):
+            for key in [key for key in store if key[0] == account_id]:
+                del store[key]
+
+
 def bot_holds_browser(
     account_id: uuid.UUID, computer_id: uuid.UUID, bot_id: uuid.UUID
 ) -> bool:

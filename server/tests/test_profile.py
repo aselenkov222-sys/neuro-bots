@@ -11,12 +11,30 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
+from server.browser_action import clear_opens, enqueue_open, peek_open
+from server.confirmation import issue_confirmation_link
 from server.db import create_db_engine
-from server.models import accounts, quota_counters, subscription_periods
+from server.library import store_library_file
+from server.models import (
+    accounts,
+    bots,
+    catalog_app_bots,
+    catalog_apps,
+    chats,
+    confirmation_links,
+    desktops,
+    library_files,
+    messages,
+    quota_charges,
+    quota_counters,
+    routines,
+    sessions,
+    subscription_periods,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_ROOT.parent
@@ -158,7 +176,7 @@ def _open_with_counter(email: str, used: int) -> str:
 
 def test_profile_name_uses_the_card_field_without_a_prototype_header() -> None:
     script = WEB_APP.read_text(encoding="utf-8")
-    start = script.index("function profileScreen()")
+    start = script.index("function accountRemoval()")
     body = script[start : script.index("function catalogForm()")]
     assert 'class="identity raised"' in body
     assert 'class="ink-label" for="profile-name"' in body
@@ -171,6 +189,10 @@ def test_profile_name_uses_the_card_field_without_a_prototype_header() -> None:
     assert "остал" not in body
     assert "500" not in body
     assert "Оплатить" not in body
+    assert "Удаление не отменяется." in body
+    assert 'data-action="ask-delete-account"' in body
+    assert 'data-action="confirm-delete-account"' in body
+    assert 'data-action="cancel-delete-account"' in body
 
 
 def test_profile_renames_the_account_including_an_empty_name(database: None) -> None:
@@ -264,6 +286,211 @@ def test_profile_name_rejects_eighty_one_characters_and_a_foreign_origin(
     assert me.json()["account"]["name"] == "Своё"
     assert _stored_name(email) == "Своё"
     assert _stored_name(other) == ""
+
+
+CONFIRMATION_REQUIRED = {
+    "code": "confirmation_required",
+    "message": "Удаление нужно подтвердить.",
+}
+
+
+def _table_rows(table) -> list[dict]:
+    engine = create_db_engine()
+    try:
+        with engine.connect() as connection:
+            rows = connection.execute(select(table)).mappings().all()
+    finally:
+        engine.dispose()
+    return [dict(row) for row in rows]
+
+
+def _account_id(email: str) -> uuid.UUID:
+    matched = [row for row in _rows() if row["email"] == email]
+    assert len(matched) == 1
+    return matched[0]["id"]
+
+
+def test_removal_waits_for_confirmation_and_then_deletes_the_account(
+    database: None,
+) -> None:
+    email = f"profile-delete-{uuid.uuid4()}@example.com"
+    other_email = f"profile-kept-{uuid.uuid4()}@example.com"
+    cookie = _open_with_counter(email, 0)
+    other_cookie = _open_with_counter(other_email, 0)
+    account_id = _account_id(email)
+    other_id = _account_id(other_email)
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            second = create_session(connection, account_id)
+            issue_confirmation_link(connection, account_id)
+    finally:
+        engine.dispose()
+    computer = uuid.uuid4()
+    try:
+        with _client(cookie) as client:
+            refused = client.request(
+                "DELETE",
+                "/api/me",
+                json={"confirm": False},
+                headers={"Origin": ORIGIN},
+            )
+            created = client.post(
+                "/api/bots",
+                json={"name": "Искра", "scenario": "Открой почту."},
+                headers={"Origin": ORIGIN},
+            )
+            assert created.status_code == 200, created.text
+            bot_id = created.json()["id"]
+            routine = client.post(
+                f"/api/bots/{bot_id}/routines",
+                json={"weekdays": [1], "time": "09:00"},
+                headers={"Origin": ORIGIN},
+            )
+            posted = client.post(
+                f"/api/bots/{bot_id}/messages",
+                json={"text": "привет"},
+                headers={"Origin": ORIGIN},
+            )
+            catalog = client.post(
+                "/api/catalog",
+                json={
+                    "name": "Почта",
+                    "address": "https://example.com/inbox",
+                    "description": "письма",
+                },
+                headers={"Origin": ORIGIN},
+            )
+            assert catalog.status_code == 200, catalog.text
+            linked = client.put(
+                f"/api/catalog/{catalog.json()['id']}/connection",
+                json={"everyone": False, "bot_ids": [bot_id]},
+                headers={"Origin": ORIGIN},
+            )
+            desktop = client.post(
+                "/api/desktops",
+                json={"id": str(computer)},
+                headers={"Origin": ORIGIN},
+            )
+        with _client(other_cookie) as kept_client:
+            kept = kept_client.post(
+                "/api/bots",
+                json={"name": "Чужой"},
+                headers={"Origin": ORIGIN},
+            )
+        assert refused.status_code == 400
+        assert refused.json() == CONFIRMATION_REQUIRED
+        assert routine.status_code == 200, routine.text
+        assert posted.status_code == 200, posted.text
+        assert linked.status_code == 200, linked.text
+        assert desktop.status_code == 200, desktop.text
+        assert kept.status_code == 200
+        assistant = next(
+            item for item in posted.json()["messages"] if item["role"] == "assistant"
+        )
+        chat_id = next(
+            row["id"]
+            for row in _table_rows(chats)
+            if row["bot_id"] == uuid.UUID(bot_id)
+        )
+        engine = create_db_engine()
+        try:
+            with engine.begin() as connection:
+                store_library_file(
+                    connection,
+                    bot_id=uuid.UUID(bot_id),
+                    chat_id=chat_id,
+                    message_id=uuid.UUID(assistant["id"]),
+                    name="лист.xlsx",
+                    content=b"sheet",
+                    created_at=datetime(2026, 11, 16, tzinfo=timezone.utc),
+                )
+        finally:
+            engine.dispose()
+        enqueue_open(
+            account_id=account_id,
+            computer_id=computer,
+            url="https://example.com/inbox",
+            bot_id=uuid.UUID(bot_id),
+            chat_id=chat_id,
+        )
+        assert peek_open(account_id, computer) == "https://example.com/inbox"
+        assert _table_rows(library_files)
+        assert [row for row in _table_rows(routines) if row["bot_id"] == uuid.UUID(bot_id)]
+        period_id = next(
+            row["id"]
+            for row in _table_rows(subscription_periods)
+            if row["account_id"] == account_id
+        )
+        assert [row for row in _table_rows(quota_charges) if row["period_id"] == period_id]
+        with _client(cookie) as client:
+            foreign = client.request(
+                "DELETE",
+                "/api/me",
+                json={"confirm": True},
+                headers={"Origin": "http://evil.example"},
+            )
+            removed = client.request(
+                "DELETE",
+                "/api/me",
+                json={"confirm": True},
+                headers={"Origin": ORIGIN},
+            )
+            again = client.get("/api/me")
+        assert foreign.status_code == 403
+        assert foreign.json() == INVALID_ORIGIN
+        assert removed.status_code == 200
+        assert removed.json() == {}
+        assert ACCEPTED not in removed.text
+        assert "max-age=0" in removed.headers["set-cookie"].lower()
+        assert again.status_code == 401
+        assert peek_open(account_id, computer) is None
+        with _client(str(second)) as stale:
+            assert stale.get("/api/me").status_code == 401
+        with TestClient(app) as client:
+            logged = client.post(
+                "/api/login",
+                json={"email": email, "password": ACCEPTED},
+                headers={"Origin": ORIGIN},
+            )
+        assert logged.status_code == 400
+        assert logged.json()["code"] == "invalid_credentials"
+        with _client(other_cookie) as kept_session:
+            kept_me = kept_session.get("/api/me")
+        assert kept_me.status_code == 200
+        assert kept_me.json()["account"]["email"] == other_email
+        assert [row for row in _rows() if row["email"] == email] == []
+        assert [row for row in _rows() if row["id"] == other_id]
+        owned_bots = [row["id"] for row in _table_rows(bots) if row["account_id"] == account_id]
+        assert owned_bots == []
+        kept_bots = [row for row in _table_rows(bots) if row["account_id"] == other_id]
+        assert len(kept_bots) == 1
+        gone_bot = uuid.UUID(bot_id)
+        assert [row for row in _table_rows(chats) if row["bot_id"] == gone_bot] == []
+        assert [row for row in _table_rows(messages) if row["chat_id"] == chat_id] == []
+        assert [row for row in _table_rows(routines) if row["bot_id"] == gone_bot] == []
+        assert [row for row in _table_rows(library_files) if row["bot_id"] == gone_bot] == []
+        assert [row for row in _table_rows(catalog_apps) if row["account_id"] == account_id] == []
+        assert [row for row in _table_rows(catalog_app_bots) if row["bot_id"] == gone_bot] == []
+        assert [row for row in _table_rows(desktops) if row["account_id"] == account_id] == []
+        assert [row for row in _table_rows(sessions) if row["account_id"] == account_id] == []
+        assert [row for row in _table_rows(confirmation_links) if row["account_id"] == account_id] == []
+        assert [row for row in _table_rows(subscription_periods) if row["account_id"] == account_id] == []
+        assert [row for row in _table_rows(quota_counters) if row["period_id"] == period_id] == []
+        assert [row for row in _table_rows(quota_charges) if row["period_id"] == period_id] == []
+        engine = create_db_engine()
+        try:
+            with engine.connect() as connection:
+                names = connection.execute(
+                    text(
+                        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                    )
+                ).scalars().all()
+        finally:
+            engine.dispose()
+        assert all("archive" not in name for name in names)
+    finally:
+        clear_opens()
 
 
 class Journal:
@@ -404,7 +631,26 @@ def test_profile_screen_saves_the_typed_name(database: None) -> None:
             page.goto(f"{origin}/#profile")
             page.wait_for_selector("#profile-name")
             assert page.locator("#profile-name").input_value() == ""
+            page.click("[data-action='ask-delete-account']")
+            page.wait_for_selector("text=Удаление не отменяется")
+            assert page.locator("h1").inner_text() == "Профиль"
+            page.click("[data-action='cancel-delete-account']")
+            assert page.locator("text=Удаление не отменяется").count() == 0
+            page.click("[data-action='ask-delete-account']")
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/me")
+                and response.request.method == "DELETE"
+            ) as removed_account:
+                page.click("[data-action='confirm-delete-account']")
+            assert removed_account.value.status == 200
+            page.wait_for_selector("#register-email")
+            assert page.locator("h1").inner_text() == "Регистрация"
+            page.click("a:has-text('Вход')")
+            page.fill("#login-email", email)
+            page.fill("#login-password", ACCEPTED)
+            page.click("button:has-text('Войти')")
+            page.wait_for_selector("text=Почта или пароль не сходятся")
             browser.close()
     finally:
         _stop(process, journal)
-    assert _stored_name(email) == ""
+    assert [row for row in _rows() if row["email"] == email] == []

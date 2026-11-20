@@ -55,7 +55,8 @@ const state = {
   chats: [],
   activeChatId: null,
   library: [],
-  catalog: []
+  catalog: [],
+  confirmAccountRemoval: false
 };
 
 function esc(value) {
@@ -431,6 +432,21 @@ function profileCounter() {
   return String(state.me.quota_counter);
 }
 
+function accountRemoval() {
+  if (state.confirmAccountRemoval === true) {
+    return `
+      <p class="hint">Удаление не отменяется.</p>
+      <div class="actions">
+        <button type="button" class="btn-orange" data-action="confirm-delete-account">Удалить</button>
+        <button type="button" class="btn-quiet" data-action="cancel-delete-account">Оставить</button>
+      </div>`;
+  }
+  return `
+    <div class="actions">
+      <button type="button" class="btn-quiet" data-action="ask-delete-account">Удалить аккаунт</button>
+    </div>`;
+}
+
 function profileScreen() {
   return `
     ${topbar("Профиль", "", '<a class="btn-quiet" href="#catalog">Каталог</a>' + logoutControl())}
@@ -448,7 +464,8 @@ function profileScreen() {
           <input id="quota-counter" type="text" readonly value="${esc(profileCounter())}">
         </label>
       </div>
-    </section>`;
+    </section>
+    ${accountRemoval()}`;
 }
 
 function catalogForm() {
@@ -1251,6 +1268,20 @@ app.addEventListener("click", (event) => {
     signOut();
     return;
   }
+  if (action === "ask-delete-account") {
+    state.confirmAccountRemoval = true;
+    render();
+    return;
+  }
+  if (action === "cancel-delete-account") {
+    state.confirmAccountRemoval = false;
+    render();
+    return;
+  }
+  if (action === "confirm-delete-account") {
+    removeAccount();
+    return;
+  }
   if (action === "open-create") {
     state.creating = { name: "", description: "", scenario: "", color: "#c85a12", icon: "spark" };
     render();
@@ -1429,10 +1460,8 @@ async function sendConfirmation() {
   render();
 }
 
-async function signOut() {
+function resetCabinet() {
   stopPulse();
-  const result = await api("/api/logout", { method: "POST" });
-  note(result);
   state.me = null;
   state.holdTariff = false;
   state.activeId = null;
@@ -1447,7 +1476,29 @@ async function signOut() {
   state.messages = [];
   state.chats = [];
   state.activeChatId = null;
+  state.library = [];
   state.catalog = [];
+  state.confirmAccountRemoval = false;
+}
+
+async function removeAccount() {
+  stopPulse();
+  const result = await api("/api/me", { method: "DELETE", body: { confirm: true } });
+  note(result);
+  if (!result.ok) {
+    render();
+    return;
+  }
+  resetCabinet();
+  if (location.hash !== "#register") location.hash = "#register";
+  else render();
+}
+
+async function signOut() {
+  stopPulse();
+  const result = await api("/api/logout", { method: "POST" });
+  note(result);
+  resetCabinet();
   if (location.hash !== "#login") location.hash = "#login";
   else render();
 }

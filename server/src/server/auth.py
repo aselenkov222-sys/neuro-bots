@@ -19,6 +19,7 @@ from server.accounts import (
     calendar_month_end,
     create_account,
     create_session,
+    delete_account,
     delete_session,
     find_account_by_email,
     find_account_by_id,
@@ -435,6 +436,54 @@ def request_confirmation(request: Request) -> JSONResponse:
     account_id, email, name, token = issued
     log_confirmation_link(str(request.base_url), token, email)
     return JSONResponse(account_document(account_id, email, name, None))
+
+
+async def read_account_removal(request: Request) -> JSONResponse | None:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(400, "invalid_request", "Нужен JSON-объект.")
+    if not isinstance(body, dict) or set(body) != {"confirm"}:
+        return error_response(400, "invalid_request", "Нужен JSON-объект.")
+    if body.get("confirm") is not True:
+        return error_response(
+            400,
+            "confirmation_required",
+            "Удаление нужно подтвердить.",
+        )
+    return None
+
+
+@router.delete("/api/me")
+async def delete_me(request: Request) -> JSONResponse:
+    rejected = origin_rejected(request)
+    if rejected is not None:
+        return rejected
+    refusal = await read_account_removal(request)
+    if refusal is not None:
+        return refusal
+    now = utc_now()
+    with begin() as connection:
+        current = current_account(connection, request, now)
+        if current is None:
+            removed = None
+        else:
+            removed = current[1]["id"]
+            delete_account(connection, removed)
+    if removed is None:
+        return unauthenticated()
+    from server.browser_action import forget_account
+
+    forget_account(removed)
+    response = JSONResponse({})
+    response.delete_cookie(
+        key="session",
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=False,
+    )
+    return response
 
 
 @router.post("/api/logout")

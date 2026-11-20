@@ -941,7 +941,7 @@ def test_browser_opens_catalog_from_profile(database: None) -> None:
             assert page.locator("#profile-name").count() == 1
             assert page.locator("#profile-name").input_value() == ""
             assert page.locator("text=Хранилище").count() == 0
-            assert page.locator("text=Удалить").count() == 0
+            assert page.locator("[data-action='ask-delete-account']").count() == 1
             assert page.locator("text=Рабочий десктоп").count() == 0
 
             page.locator("a", has_text="Каталог").click()
