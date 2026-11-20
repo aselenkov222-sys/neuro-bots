@@ -39,6 +39,10 @@ def confirmation_url(base_url: str, token: str) -> str:
     return f"{base_url.rstrip('/')}/api/confirm-email?token={token}"
 
 
+def confirmation_letter(base_url: str, token: str, email: str) -> str:
+    return f"{confirmation_url(base_url, token)} {email}"
+
+
 def issue_confirmation_link(connection: Connection, account_id: uuid.UUID) -> str:
     token = secrets.token_urlsafe()
     connection.execute(
@@ -54,7 +58,7 @@ def issue_confirmation_link(connection: Connection, account_id: uuid.UUID) -> st
 
 
 def log_confirmation_link(base_url: str, token: str, email: str) -> None:
-    logger.info("%s %s", confirmation_url(base_url, token), email)
+    logger.info("%s", confirmation_letter(base_url, token, email))
 
 
 def replace_confirmation_link(
