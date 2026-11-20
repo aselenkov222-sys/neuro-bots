@@ -1,11 +1,16 @@
+import socket
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from playwright.sync_api import sync_playwright
 from sqlalchemy import select
 
 from server.accounts import calendar_month_end, create_account, create_session
@@ -771,3 +776,192 @@ def test_later_save_replaces_the_earlier_one_and_there_is_no_compare_screen(
             "created_at": routine.json()["created_at"],
         }
     ]
+
+
+def test_profile_holds_the_role_transfer() -> None:
+    script = (REPO_ROOT / "web" / "app.js").read_text(encoding="utf-8")
+    role = script.split("function desktopRole()", 1)[1].split(
+        "function profileScreen()", 1
+    )[0]
+    profile = script.split("function profileScreen()", 1)[1].split(
+        "function catalogForm()", 1
+    )[0]
+    assert "Этот компьютер запускает рутины." in role
+    assert "Рутины запускает другой компьютер." in role
+    assert 'data-action="transfer-role"' in role
+    assert "Перенести роль сюда" in role
+    assert "proto-nav" not in role
+    assert "Кликабельный макет" not in role
+    assert "${desktopRole()}" in profile
+    assert 'if (action === "transfer-role")' in script
+
+
+class Journal:
+    def __init__(self, process: subprocess.Popen[str]) -> None:
+        self.process = process
+        self._chunks: list[str] = []
+        self._lock = threading.Lock()
+        assert process.stdout is not None
+        self._thread = threading.Thread(
+            target=self._read, args=(process.stdout,), daemon=True
+        )
+        self._thread.start()
+
+    def _read(self, stream) -> None:
+        for line in stream:
+            with self._lock:
+                self._chunks.append(line)
+
+    def text(self) -> str:
+        with self._lock:
+            return "".join(self._chunks)
+
+    def join(self) -> None:
+        self._thread.join(timeout=5)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _stop(process: subprocess.Popen[str], journal: Journal) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    journal.join()
+
+
+def _wait_until(journal: Journal, predicate, timeout: float = 20) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate(journal.text()):
+            return
+        if journal.process.poll() is not None:
+            break
+        time.sleep(0.05)
+    assert predicate(journal.text()), journal.text()[-2000:]
+
+
+def _confirmation_urls(text: str, email: str) -> list[str]:
+    suffix = f" {email}"
+    found = []
+    for line in text.splitlines():
+        if "/api/confirm-email?token=" in line and line.endswith(suffix):
+            found.append(line[: -len(suffix)])
+    return found
+
+
+def test_profile_transfers_the_working_role(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"profile-role-{uuid.uuid4()}@example.com"
+    first = str(uuid.uuid4())
+    second = str(uuid.uuid4())
+    shots = Path("/opt/cursor/artifacts")
+    shots.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+
+            def ready(text: str) -> bool:
+                if "Application startup complete." not in text:
+                    return False
+                try:
+                    return client.get(f"{origin}/health").status_code == 200
+                except httpx.HTTPError:
+                    return False
+
+            _wait_until(journal, ready)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            page.goto(f"{origin}/")
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+            page.locator("a", has_text="Профиль").click()
+            page.wait_for_selector("#profile-name")
+            assert page.locator("#desktop-role").count() == 0
+            assert "proto-nav" not in page.content()
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/desktops")
+                and response.request.method == "POST"
+            ) as claimed:
+                page.evaluate(
+                    """(id) => {
+                      window.__neuroDesktop = {id: id, timezone: "Europe/Moscow"};
+                      window.dispatchEvent(new Event("neuro-desktop"));
+                    }""",
+                    first,
+                )
+            assert claimed.value.status == 200
+            assert claimed.value.json()["working"] is True
+            page.wait_for_selector("#desktop-role")
+            assert page.locator("#desktop-role").inner_text() == (
+                "Этот компьютер запускает рутины."
+            )
+            assert page.locator("[data-action='transfer-role']").count() == 0
+            page.screenshot(path=str(shots / "profile-working-desktop.png"))
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/desktops")
+                and response.request.method == "POST"
+            ) as idle:
+                page.evaluate(
+                    """(id) => {
+                      window.__neuroDesktop = {id: id, timezone: "Europe/Moscow"};
+                      window.dispatchEvent(new Event("neuro-desktop"));
+                    }""",
+                    second,
+                )
+            assert idle.value.status == 200
+            assert idle.value.json()["working"] is False
+            page.wait_for_selector("[data-action='transfer-role']")
+            assert "Рутины запускает другой компьютер." in page.locator(
+                "#desktop-role"
+            ).inner_text()
+            page.screenshot(path=str(shots / "profile-transfer-role.png"))
+            with page.expect_response(
+                lambda response: response.url.endswith("/working")
+                and response.request.method == "POST"
+            ) as moved:
+                page.click("[data-action='transfer-role']")
+            assert moved.value.status == 200
+            assert moved.value.json() == {"id": second, "working": True}
+            page.wait_for_selector("text=Этот компьютер запускает рутины")
+            assert page.locator("[data-action='transfer-role']").count() == 0
+            assert "Сравнить версии" not in page.content()
+            assert "proto-nav" not in page.content()
+            page.screenshot(path=str(shots / "profile-role-moved.png"))
+            browser.close()
+    finally:
+        _stop(process, journal)
