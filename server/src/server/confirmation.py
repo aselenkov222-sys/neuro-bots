@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
 from server.accounts import calendar_month_end, utc_now
+from server.config import configured_mail_sink
 from server.models import accounts, confirmation_links, quota_counters, subscription_periods
 
 logger = logging.getLogger("server.confirmation")
@@ -58,7 +59,13 @@ def issue_confirmation_link(connection: Connection, account_id: uuid.UUID) -> st
 
 
 def log_confirmation_link(base_url: str, token: str, email: str) -> None:
-    logger.info("%s", confirmation_letter(base_url, token, email))
+    letter = confirmation_letter(base_url, token, email)
+    logger.info("%s", letter)
+    path = configured_mail_sink()
+    if path is None:
+        return
+    with open(path, "a", encoding="utf-8", newline="\n") as sink:
+        sink.write(f"{letter}\n")
 
 
 def replace_confirmation_link(
