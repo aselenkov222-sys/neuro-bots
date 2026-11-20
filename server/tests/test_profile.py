@@ -13,10 +13,10 @@ from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright
 from sqlalchemy import select
 
-from server.accounts import create_account, create_session
+from server.accounts import calendar_month_end, create_account, create_session
 from server.app import app
 from server.db import create_db_engine
-from server.models import accounts
+from server.models import accounts, quota_counters, subscription_periods
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_ROOT.parent
@@ -122,6 +122,40 @@ def _stored_name(email: str) -> str:
     return matched[0]["name"]
 
 
+def _open_with_counter(email: str, used: int) -> str:
+    started = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    engine = create_db_engine()
+    try:
+        with engine.begin() as connection:
+            account_id = create_account(connection, email, ACCEPTED)
+            session_id = create_session(connection, account_id)
+            connection.execute(
+                accounts.update()
+                .where(accounts.c.id == account_id)
+                .values(email_confirmed_at=started)
+            )
+            period_id = uuid.uuid4()
+            connection.execute(
+                subscription_periods.insert().values(
+                    id=period_id,
+                    account_id=account_id,
+                    started_at=started,
+                    ends_at=calendar_month_end(started),
+                    active=True,
+                )
+            )
+            connection.execute(
+                quota_counters.insert().values(
+                    id=uuid.uuid4(),
+                    period_id=period_id,
+                    used=used,
+                )
+            )
+    finally:
+        engine.dispose()
+    return str(session_id)
+
+
 def test_profile_name_uses_the_card_field_without_a_prototype_header() -> None:
     script = WEB_APP.read_text(encoding="utf-8")
     start = script.index("function profileScreen()")
@@ -132,6 +166,11 @@ def test_profile_name_uses_the_card_field_without_a_prototype_header() -> None:
     assert 'maxlength="80"' in body
     assert "proto-nav" not in body
     assert "Кликабельный макет" not in body
+    assert '<article class="tariff sheet" aria-label="Тариф"></article>' in body
+    assert 'for="quota-counter">Счётчик квоты' in body
+    assert "остал" not in body
+    assert "500" not in body
+    assert "Оплатить" not in body
 
 
 def test_profile_renames_the_account_including_an_empty_name(database: None) -> None:
@@ -156,6 +195,26 @@ def test_profile_renames_the_account_including_an_empty_name(database: None) -> 
     assert me.json()["account"]["name"] == full
     assert _stored_name(email) == full
     assert ACCEPTED not in filled.text
+
+
+def test_profile_shows_the_period_counter(database: None) -> None:
+    email = f"profile-counter-{uuid.uuid4()}@example.com"
+    fresh = f"profile-fresh-{uuid.uuid4()}@example.com"
+    cookie = _open_with_counter(email, 7)
+    with _client(cookie) as client:
+        me = client.get("/api/me")
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/register",
+            json={"email": fresh, "password": ACCEPTED},
+            headers={"Origin": ORIGIN},
+        )
+    assert me.status_code == 200
+    assert me.json()["quota_counter"] == 7
+    assert me.json()["quota"] == 493
+    assert registered.status_code == 200
+    assert registered.json()["quota_counter"] is None
+    assert "остал" not in me.text
 
 
 def test_profile_name_rejects_eighty_one_characters_and_a_foreign_origin(
@@ -317,6 +376,13 @@ def test_profile_screen_saves_the_typed_name(database: None) -> None:
             page.wait_for_selector("#profile-name")
             assert page.locator("h1").inner_text() == "Профиль"
             assert "proto-nav" not in page.content()
+            tariff = page.locator("article.tariff")
+            assert tariff.count() == 1
+            assert tariff.inner_text().strip() == ""
+            assert page.locator("#quota-counter").input_value() == "0"
+            assert page.get_by_text("остал", exact=False).count() == 0
+            assert page.get_by_text("500", exact=True).count() == 0
+            assert page.get_by_text("Оплатить", exact=True).count() == 0
             with page.expect_response(
                 lambda response: response.url.endswith("/api/me")
                 and response.request.method == "PATCH"

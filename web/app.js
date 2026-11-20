@@ -426,6 +426,11 @@ function profileName() {
   return account.name;
 }
 
+function profileCounter() {
+  if (!state.me || !Number.isInteger(state.me.quota_counter)) return "";
+  return String(state.me.quota_counter);
+}
+
 function profileScreen() {
   return `
     ${topbar("Профиль", "", '<a class="btn-quiet" href="#catalog">Каталог</a>' + logoutControl())}
@@ -434,6 +439,14 @@ function profileScreen() {
       <div class="identity-main">
         <label class="ink-label" for="profile-name">Имя</label>
         <input class="name-input" id="profile-name" type="text" maxlength="80" value="${esc(profileName())}" autocomplete="nickname">
+      </div>
+    </section>
+    <article class="tariff sheet" aria-label="Тариф"></article>
+    <section class="panel sheet">
+      <div class="fields">
+        <label class="field" for="quota-counter">Счётчик квоты
+          <input id="quota-counter" type="text" readonly value="${esc(profileCounter())}">
+        </label>
       </div>
     </section>`;
 }
@@ -899,6 +912,7 @@ async function showCurrent() {
     return;
   }
   if (desired === "bots") await loadBots();
+  if (desired === "profile") await loadMe();
   if (desired === "catalog") {
     await loadBots();
     await loadCatalog();
@@ -909,6 +923,12 @@ async function showCurrent() {
     await loadLibrary();
   }
   render();
+}
+
+async function loadMe() {
+  const result = await api("/api/me");
+  if (result.ok && result.data) state.me = result.data;
+  else note(result);
 }
 
 async function loadCatalog() {

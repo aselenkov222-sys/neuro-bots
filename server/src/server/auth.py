@@ -121,6 +121,7 @@ def account_document(
     if email_confirmed_at is None:
         period = None
         quota = None
+        quota_counter = None
         confirmed = False
     elif stored_period is None:
         period = {
@@ -129,6 +130,7 @@ def account_document(
             "active": True,
         }
         quota = None
+        quota_counter = None
         confirmed = True
     else:
         period = {
@@ -137,6 +139,7 @@ def account_document(
             "active": stored_period.active,
         }
         quota = development_tariff.model_requests - stored_period.used
+        quota_counter = stored_period.used
         confirmed = True
     return {
         "account": {
@@ -147,6 +150,7 @@ def account_document(
         "email_confirmed": confirmed,
         "period": period,
         "quota": quota,
+        "quota_counter": quota_counter,
     }
 
 

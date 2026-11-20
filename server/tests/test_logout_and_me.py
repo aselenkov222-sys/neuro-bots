@@ -132,6 +132,7 @@ def _account_body(account_id: uuid.UUID, email: str) -> dict:
         "email_confirmed": False,
         "period": None,
         "quota": None,
+        "quota_counter": None,
     }
 
 
