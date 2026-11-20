@@ -65,6 +65,20 @@ def record_renewal_failed(
     _deactivate_latest_at_end(connection, account_id, at)
 
 
+def apply_payment_event(
+    connection: Connection,
+    account_id: uuid.UUID,
+    kind: str,
+    at: datetime,
+) -> None:
+    if kind == "success":
+        record_success(connection, account_id, at)
+    elif kind == "cancellation":
+        record_cancellation(connection, account_id, at)
+    elif kind == "renewal_failed":
+        record_renewal_failed(connection, account_id, at)
+
+
 def record_success(connection: Connection, account_id: uuid.UUID, at: datetime) -> None:
     connection.execute(
         subscription_periods.update()
@@ -121,7 +135,7 @@ async def pay(request: Request) -> JSONResponse:
                 document = "unset"
             else:
                 touch_session(connection, session["id"], now)
-                record_success(connection, account["id"], now)
+                apply_payment_event(connection, account["id"], "success", now)
                 document = account_document(
                     account["id"],
                     account["email"],

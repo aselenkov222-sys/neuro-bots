@@ -44,7 +44,7 @@ from server.models import (
     routine_runs,
     subscription_periods,
 )
-from server.payment import record_cancellation, record_renewal_failed
+from server.payment import apply_payment_event
 from server.routines import settle_due
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +65,14 @@ EMAIL_UNCONFIRMED = {
     "message": "Почта ещё не подтверждена.",
 }
 PRICE_UNSET = {"code": "invalid_request", "message": "Оплата не задана."}
+PROVIDER_NAMES = (
+    "stripe",
+    "yookassa",
+    "paypal",
+    "cloudpayments",
+    "tinkoff",
+    "robokassa",
+)
 INACTIVE_TEXT = "Подписка неактивна."
 INVALID_BODY = {"code": "invalid_request", "message": "Нужен JSON-объект."}
 BODY_MARKER = "marker-value"
@@ -804,7 +812,7 @@ def test_cancellation_before_the_end_keeps_the_period_and_opens_the_minute(
     ends_at = stored[0]["ends_at"]
     assert DUE < ends_at
     with begin() as connection:
-        record_cancellation(connection, account_id, DUE)
+        apply_payment_event(connection, account_id, "cancellation", DUE)
     kept = _periods(account_id)
     assert len(kept) == 1
     assert kept[0]["active"] is True
@@ -828,7 +836,7 @@ def test_settling_at_the_period_end_does_not_open_while_the_flag_stays_true(
     bot_id = uuid.UUID(bot["id"])
     _set_ends_at(account_id, DUE)
     with begin() as connection:
-        record_cancellation(connection, account_id, DUE - timedelta(seconds=1))
+        apply_payment_event(connection, account_id, "cancellation", DUE - timedelta(seconds=1))
     kept = _periods(account_id)
     assert len(kept) == 1
     assert kept[0]["active"] is True
@@ -842,7 +850,7 @@ def test_settling_at_the_period_end_does_not_open_while_the_flag_stays_true(
     _assert_inactive_chat(bot_id)
     assert _periods(account_id)[0]["active"] is True
     with begin() as connection:
-        record_cancellation(connection, account_id, DUE)
+        apply_payment_event(connection, account_id, "cancellation", DUE)
     closed = _periods(account_id)
     assert len(closed) == 1
     assert closed[0]["active"] is False
@@ -860,7 +868,7 @@ def test_failed_renewal_before_the_end_still_opens_the_minute(
     ends_at = _periods(account_id)[0]["ends_at"]
     assert DUE < ends_at
     with begin() as connection:
-        record_renewal_failed(connection, account_id, DUE)
+        apply_payment_event(connection, account_id, "renewal_failed", DUE)
     kept = _periods(account_id)
     assert len(kept) == 1
     assert kept[0]["active"] is True
@@ -890,7 +898,7 @@ def test_failed_renewal_at_the_end_does_not_start_the_routine(
     bot_id = uuid.UUID(bot["id"])
     _set_ends_at(account_id, DUE)
     with begin() as connection:
-        record_renewal_failed(connection, account_id, DUE)
+        apply_payment_event(connection, account_id, "renewal_failed", DUE)
     closed = _periods(account_id)
     assert len(closed) == 1
     assert closed[0]["active"] is False
@@ -910,9 +918,52 @@ def test_missing_period_is_left_alone_by_cancellation_and_failed_renewal(
     email = f"pay-empty-{uuid.uuid4()}@example.com"
     account_id, _cookie = _open_account(email, CONFIRMED_AT)
     with begin() as connection:
-        record_cancellation(connection, account_id, DUE)
-        record_renewal_failed(connection, account_id, DUE)
+        apply_payment_event(connection, account_id, "cancellation", DUE)
+        apply_payment_event(connection, account_id, "renewal_failed", DUE)
     assert _periods(account_id) == []
+
+
+def test_unknown_payment_kind_does_not_insert_or_deactivate_a_period(
+    database: None,
+) -> None:
+    started = datetime(2026, 11, 16, tzinfo=timezone.utc)
+    ends_at = calendar_month_end(started)
+    account_id, _cookie = _open_account(
+        f"pay-kind-{uuid.uuid4()}@example.com", started
+    )
+    _insert_open_period(account_id, started, ends_at)
+    before = _periods(account_id)
+    counters = _counters(account_id)
+    assert len(before) == 1
+    assert before[0]["active"] is True
+    with begin() as connection:
+        for kind in ("refund", "", "Success"):
+            apply_payment_event(connection, account_id, kind, ends_at)
+    assert _periods(account_id) == before
+    assert _counters(account_id) == counters
+    empty_id, _cookie = _open_account(
+        f"pay-kind-empty-{uuid.uuid4()}@example.com", started
+    )
+    with begin() as connection:
+        apply_payment_event(connection, empty_id, "refund", ends_at)
+    assert _periods(empty_id) == []
+    assert _counters(empty_id) == []
+
+
+def test_sources_do_not_name_a_payment_provider() -> None:
+    roots = (PROJECT_ROOT / "src", PROJECT_ROOT.parent / "web")
+    for root in roots:
+        assert root.is_dir()
+        for path in root.rglob("*"):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            folded = text.casefold()
+            for name in PROVIDER_NAMES:
+                assert name.casefold() not in folded, path
 
 
 def test_me_reports_inactive_at_the_period_end_without_writing_the_flag(
