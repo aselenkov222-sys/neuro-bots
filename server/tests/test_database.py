@@ -151,6 +151,8 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
         "desktop_notices",
         "dangerous_steps",
         "library_files",
+        "catalog_apps",
+        "catalog_app_bots",
     }
     assert server.models.accounts.metadata is metadata
     assert server.models.sessions.metadata is metadata
@@ -168,6 +170,8 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert server.models.desktop_notices.metadata is metadata
     assert server.models.dangerous_steps.metadata is metadata
     assert server.models.library_files.metadata is metadata
+    assert server.models.catalog_apps.metadata is metadata
+    assert server.models.catalog_app_bots.metadata is metadata
     chain = _revision_chain()
     assert chain[0] == ("3c87a0f84d5e", None)
     assert ("ff582d8bc7fb", "3c87a0f84d5e") in chain
@@ -188,8 +192,12 @@ def test_alembic_uses_the_same_database_and_metadata() -> None:
     assert ("b3c7e9a41d52", "f3a8c1d27e05") in chain
     assert ("e7a1c4b82d60", "b3c7e9a41d52") in chain
     assert ("c2d8f4a91e73", "e7a1c4b82d60") in chain
-    assert chain[-1] == ("c2d8f4a91e73", "e7a1c4b82d60")
-    assert chain[-1][1] == "e7a1c4b82d60"
+    assert ("d9b4e2a71c58", "c2d8f4a91e73") in chain
+    assert ("e2b7c4a91f06", "d9b4e2a71c58") in chain
+    assert chain[-1] == ("e2b7c4a91f06", "d9b4e2a71c58")
+    assert chain[-1][1] == "d9b4e2a71c58"
+    assert chain[-1][0] != "d9b4e2a71c58"
+    assert chain[-1][0] != "c2d8f4a91e73"
     assert chain[-1][0] != "e7a1c4b82d60"
     assert chain[-1][0] != "b3c7e9a41d52"
     assert chain[-1][0] != "f3a8c1d27e05"
@@ -252,8 +260,12 @@ def test_select_one_and_alembic_upgrade_head() -> None:
         assert ("b3c7e9a41d52", "f3a8c1d27e05") in chain
         assert ("e7a1c4b82d60", "b3c7e9a41d52") in chain
         assert ("c2d8f4a91e73", "e7a1c4b82d60") in chain
-        assert chain[-1] == ("c2d8f4a91e73", "e7a1c4b82d60")
-        assert chain[-1][1] == "e7a1c4b82d60"
+        assert ("d9b4e2a71c58", "c2d8f4a91e73") in chain
+        assert ("e2b7c4a91f06", "d9b4e2a71c58") in chain
+        assert chain[-1] == ("e2b7c4a91f06", "d9b4e2a71c58")
+        assert chain[-1][1] == "d9b4e2a71c58"
+        assert chain[-1][0] != "d9b4e2a71c58"
+        assert chain[-1][0] != "c2d8f4a91e73"
         assert chain[-1][0] != "e7a1c4b82d60"
         assert chain[-1][0] != "b3c7e9a41d52"
         assert chain[-1][0] != "f3a8c1d27e05"
@@ -299,6 +311,8 @@ def test_select_one_and_alembic_upgrade_head() -> None:
             "desktop_notices",
             "dangerous_steps",
             "library_files",
+            "catalog_apps",
+            "catalog_app_bots",
             "alembic_version",
         }
     finally:

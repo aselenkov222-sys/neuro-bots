@@ -7,7 +7,7 @@ from server.app import app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WEB_DIR = REPO_ROOT / "web"
-SCREENS = ("tariff", "bots", "bot", "chat")
+SCREENS = ("tariff", "bots", "bot", "chat", "profile", "catalog")
 
 
 def test_root_serves_cabinet_screens_without_prototype_header() -> None:

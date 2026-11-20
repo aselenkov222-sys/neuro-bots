@@ -1198,9 +1198,19 @@ def test_missing_claim_writes_one_skip_for_that_local_date(
     assert _chat_messages(late_bot_id) == late_messages
 
 
+OFF_DAY = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+
+
+def _pin_off_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("server.bots.utc_now", lambda: OFF_DAY)
+    monkeypatch.setattr("server.auth.utc_now", lambda: OFF_DAY)
+    monkeypatch.setattr("server.desktops.utc_now", lambda: OFF_DAY)
+
+
 def test_pause_and_logout_hold_open_neither_a_run_nor_a_skip(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _pin_off_day(monkeypatch)
     _refuse_aggregator(monkeypatch)
     _cookie, paused_account, _computer, paused_bot, paused = _prepare_due_routine(
         "paused-window@example.com", paused=True
@@ -1238,6 +1248,7 @@ def test_pause_and_logout_hold_open_neither_a_run_nor_a_skip(
 def test_unpause_after_the_minute_does_not_write_a_skip(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _pin_off_day(monkeypatch)
     _refuse_aggregator(monkeypatch)
     cookie, account_id, _computer, bot, created = _prepare_due_routine(
         "unpause-after@example.com"
@@ -1267,6 +1278,7 @@ def test_unpause_after_the_minute_does_not_write_a_skip(
 def test_sign_in_after_the_minute_does_not_write_a_skip(
     database: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _pin_off_day(monkeypatch)
     _refuse_aggregator(monkeypatch)
     email = "signin-after@example.com"
     cookie, account_id, computer, bot, created = _prepare_due_routine(email)

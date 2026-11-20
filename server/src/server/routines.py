@@ -3,6 +3,7 @@ import re
 import uuid
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
@@ -12,7 +13,7 @@ from sqlalchemy.engine import Connection, RowMapping
 
 import server.aggregator as aggregator
 from server.accounts import format_utc, touch_session, utc_now
-from server.browser_action import enqueue_open, named_address
+from server.browser_action import _same_host, enqueue_open, named_address
 from server.dangerous import (
     first_gate,
     not_done_text,
@@ -55,6 +56,8 @@ from server.library import store_library_file
 from server.models import (
     accounts,
     bots,
+    catalog_app_bots,
+    catalog_apps,
     chats,
     desktops,
     messages,
@@ -79,6 +82,8 @@ SKIP_CODE = "routine_skipped"
 QUEUE_CODE = "routine_queue"
 SCENARIO_INSUFFICIENT = "scenario_insufficient"
 SCENARIO_INSUFFICIENT_TEXT = "Запуск завершён: сценария недостаточно."
+CATALOG_NOT_CONNECTED = "catalog_not_connected"
+CATALOG_NOT_CONNECTED_TEXT = "Запуск завершён: приложение не подключено."
 SITE_NOT_OPENED = "site_not_opened"
 SITE_NOT_OPENED_TEXT = "Запуск завершён: сайт не открылся."
 LOGIN_FAILED = "login_failed"
@@ -766,6 +771,152 @@ def _earliest_claimable_run(
     )
 
 
+def _opening_lines(scenario: object) -> list[str]:
+    if not isinstance(scenario, str):
+        return []
+    lines = scenario_lines(scenario)
+    gate = first_gate(scenario)
+    if gate is None:
+        return lines
+    return lines[: gate[0]]
+
+
+def _addresses_of(lines: list[str]) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        address = named_address(line)
+        if address is None or address in seen:
+            continue
+        seen.add(address)
+        found.append(address)
+    return found
+
+
+def _catalog_rows(
+    connection: Connection, account_id: uuid.UUID
+) -> list[RowMapping]:
+    return list(
+        connection.execute(
+            select(
+                catalog_apps.c.id,
+                catalog_apps.c.address,
+                catalog_apps.c.everyone,
+            ).where(catalog_apps.c.account_id == account_id)
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _linked_catalog_ids(
+    connection: Connection, bot_id: uuid.UUID
+) -> set[uuid.UUID]:
+    return set(
+        connection.execute(
+            select(catalog_app_bots.c.catalog_app_id).where(
+                catalog_app_bots.c.bot_id == bot_id
+            )
+        ).scalars()
+    )
+
+
+def _names_catalog_host(address: str, item_address: str) -> bool:
+    host = urlsplit(item_address).hostname
+    if host is None:
+        return False
+    return _same_host(address, host)
+
+
+def _items_for_host(
+    items: list[RowMapping], address: str
+) -> list[RowMapping]:
+    return [
+        item
+        for item in items
+        if _names_catalog_host(address, item["address"])
+    ]
+
+
+def _connected_to_host(
+    items: list[RowMapping], linked: set[uuid.UUID], address: str
+) -> bool:
+    for item in _items_for_host(items, address):
+        if item["everyone"] is True or item["id"] in linked:
+            return True
+    return False
+
+
+def _address_closed(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    address: str,
+    items: list[RowMapping] | None = None,
+    linked: set[uuid.UUID] | None = None,
+) -> bool:
+    rows = _catalog_rows(connection, account_id) if items is None else items
+    if not _items_for_host(rows, address):
+        return False
+    chosen = (
+        _linked_catalog_ids(connection, bot_id) if linked is None else linked
+    )
+    return not _connected_to_host(rows, chosen, address)
+
+
+def _catalog_closed(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    scenario: object,
+) -> bool:
+    addresses = _addresses_of(_opening_lines(scenario))
+    if not addresses:
+        return False
+    items = _catalog_rows(connection, account_id)
+    if not items:
+        return False
+    linked = _linked_catalog_ids(connection, bot_id)
+    for address in addresses:
+        if not _items_for_host(items, address):
+            continue
+        if not _connected_to_host(items, linked, address):
+            return True
+    return False
+
+
+def _enqueue_named_addresses(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    scenario: object,
+) -> set[str]:
+    queued: set[str] = set()
+    addresses = _addresses_of(_opening_lines(scenario))
+    if not addresses:
+        return queued
+    desktop = find_working_desktop(connection, account_id)
+    if desktop is None:
+        return queued
+    items = _catalog_rows(connection, account_id)
+    linked = _linked_catalog_ids(connection, bot_id)
+    chat_id = main_chat(connection, bot_id)["id"]
+    for address in addresses:
+        if _items_for_host(items, address) and not _connected_to_host(
+            items, linked, address
+        ):
+            continue
+        enqueue_open(
+            account_id=account_id,
+            computer_id=desktop["computer_id"],
+            url=address,
+            bot_id=bot_id,
+            chat_id=chat_id,
+        )
+        queued.add(address)
+    return queued
+
+
 def claim_earliest_pending(
     connection: Connection, account_id: uuid.UUID, now: datetime
 ) -> RowMapping | None:
@@ -788,6 +939,19 @@ def claim_earliest_pending(
             SCENARIO_INSUFFICIENT_TEXT,
         )
         return None
+    if _catalog_closed(
+        connection, account_id, pending["bot_id"], pending["scenario"]
+    ):
+        _mark_failed(
+            connection,
+            pending["id"],
+            "pending",
+            pending["bot_id"],
+            moment,
+            CATALOG_NOT_CONNECTED,
+            CATALOG_NOT_CONNECTED_TEXT,
+        )
+        return None
     updated = connection.execute(
         routine_runs.update()
         .where(
@@ -799,8 +963,16 @@ def claim_earliest_pending(
     if updated.rowcount != 1:
         return None
     _note_queue(connection, account_id, pending["bot_id"], moment)
+    opened = _enqueue_named_addresses(
+        connection, account_id, pending["bot_id"], pending["scenario"]
+    )
     _complete_claimed_run(
-        connection, account_id, pending["bot_id"], pending["id"], moment
+        connection,
+        account_id,
+        pending["bot_id"],
+        pending["id"],
+        moment,
+        skip_urls=opened,
     )
     return pending
 
@@ -886,15 +1058,37 @@ def _enqueue_lines(
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
     lines: list[str],
-) -> None:
+    skip_urls: set[str] | None = None,
+    *,
+    run_id: uuid.UUID | None = None,
+    now: datetime | None = None,
+    fail_from: str | None = None,
+) -> bool:
     desktop = find_working_desktop(connection, account_id)
     if desktop is None:
-        return
+        return False
+    items = _catalog_rows(connection, account_id)
+    linked = _linked_catalog_ids(connection, bot_id)
     chat_id = main_chat(connection, bot_id)["id"]
+    seen = set(skip_urls or set())
     for line in lines:
         address = named_address(line)
-        if address is None:
+        if address is None or address in seen:
             continue
+        if run_id is not None and _address_closed(
+            connection, account_id, bot_id, address, items, linked
+        ):
+            if now is not None and fail_from is not None:
+                _mark_failed(
+                    connection,
+                    run_id,
+                    fail_from,
+                    bot_id,
+                    now,
+                    CATALOG_NOT_CONNECTED,
+                    CATALOG_NOT_CONNECTED_TEXT,
+                )
+            return True
         enqueue_open(
             account_id=account_id,
             computer_id=desktop["computer_id"],
@@ -902,6 +1096,8 @@ def _enqueue_lines(
             bot_id=bot_id,
             chat_id=chat_id,
         )
+        seen.add(address)
+    return False
 
 
 def _maybe_wait(
@@ -914,17 +1110,25 @@ def _maybe_wait(
     run_id: uuid.UUID | None,
     check_id: uuid.UUID | None,
     after: int = -1,
+    skip_urls: set[str] | None = None,
+    fail_from: str | None = None,
 ) -> bool:
     found = first_gate(scenario, after=after)
     if found is None:
         return False
     position, action = found
-    _enqueue_lines(
+    stopped = _enqueue_lines(
         connection,
         account_id,
         bot_id,
         scenario_lines(scenario)[after + 1 : position],
+        skip_urls=skip_urls,
+        run_id=run_id,
+        now=now,
+        fail_from=fail_from,
     )
+    if stopped:
+        return True
     open_gate(
         connection,
         bot_id,
@@ -976,14 +1180,19 @@ def _continue_after(
         run_id=run_id,
         check_id=check_id,
         after=after,
+        fail_from="awaiting" if run_id is not None else None,
     ):
         return
-    _enqueue_lines(
+    if _enqueue_lines(
         connection,
         account_id,
         bot_id,
         scenario_lines(scenario)[after + 1 :],
-    )
+        run_id=run_id,
+        now=now,
+        fail_from="awaiting" if run_id is not None else None,
+    ):
+        return
     if run_id is not None:
         connection.execute(
             routine_runs.update()
@@ -1017,6 +1226,7 @@ def _complete_claimed_run(
     bot_id: uuid.UUID,
     run_id: uuid.UUID,
     now: datetime,
+    skip_urls: set[str] | None = None,
 ) -> None:
     bot = (
         connection.execute(select(bots.c.scenario).where(bots.c.id == bot_id))
@@ -1032,6 +1242,8 @@ def _complete_claimed_run(
         now,
         run_id=run_id,
         check_id=None,
+        skip_urls=skip_urls,
+        fail_from="claimed",
     ):
         return
     _speak_scenario(
@@ -1562,6 +1774,21 @@ def _perform_released(
         return
     desktop = find_working_desktop(connection, account_id)
     address = named_address(step["action"])
+    if (
+        step["run_id"] is not None
+        and address is not None
+        and _address_closed(connection, account_id, step["bot_id"], address)
+    ):
+        _mark_failed(
+            connection,
+            step["run_id"],
+            "awaiting",
+            step["bot_id"],
+            now,
+            CATALOG_NOT_CONNECTED,
+            CATALOG_NOT_CONNECTED_TEXT,
+        )
+        return
     if desktop is not None and address is not None:
         chat_id = main_chat(connection, step["bot_id"])["id"]
         enqueue_open(
