@@ -54,7 +54,8 @@ const state = {
   messages: [],
   chats: [],
   activeChatId: null,
-  library: []
+  library: [],
+  catalog: []
 };
 
 function esc(value) {
@@ -254,7 +255,16 @@ function replyPending(messages, text) {
 
 function screen() {
   const hash = location.hash;
-  if (hash === "#tariff" || hash === "#bots" || hash === "#bot" || hash === "#chat" || hash === "#register" || hash === "#login") {
+  if (
+    hash === "#tariff" ||
+    hash === "#bots" ||
+    hash === "#bot" ||
+    hash === "#chat" ||
+    hash === "#register" ||
+    hash === "#login" ||
+    hash === "#profile" ||
+    hash === "#catalog"
+  ) {
     return hash.slice(1);
   }
   return "";
@@ -265,6 +275,7 @@ function desiredScreen() {
   if (requested === "login" || requested === "register") return requested;
   if (!state.me) return "register";
   if (state.holdTariff || !state.me.email_confirmed) return "tariff";
+  if (requested === "profile" || requested === "catalog") return requested;
   if ((requested === "bot" || requested === "chat") && state.activeId) return requested;
   return "bots";
 }
@@ -403,10 +414,73 @@ function botsScreen() {
     </form>` : "";
 
   return `
-    ${topbar("Боты", "", '<button type="button" class="btn-orange" data-action="open-create">Создать бота</button>' + logoutControl())}
+    ${topbar("Боты", "", '<a class="btn-quiet" href="#profile">Профиль</a><button type="button" class="btn-orange" data-action="open-create">Создать бота</button>' + logoutControl())}
     ${noticeHtml()}
     <div class="bot-grid">${state.bots.map(botCard).join("")}</div>
     ${form}`;
+}
+
+function profileScreen() {
+  return `
+    ${topbar("Профиль", "", '<a class="btn-quiet" href="#catalog">Каталог</a>' + logoutControl())}
+    ${noticeHtml()}`;
+}
+
+function catalogForm() {
+  return `
+    <form class="panel sheet" data-form="catalog">
+      <div class="fields">
+        <label class="field" for="catalog-name">Название
+          <input id="catalog-name" name="name" type="text" autocomplete="off">
+        </label>
+        <label class="field" for="catalog-address">Адрес
+          <input id="catalog-address" name="address" type="text" autocomplete="off">
+        </label>
+        <label class="field" for="catalog-description">Короткое описание
+          <textarea id="catalog-description" name="description" rows="2"></textarea>
+        </label>
+      </div>
+      <div class="actions" style="margin-top:12px">
+        <button class="btn-orange" type="submit">Добавить</button>
+      </div>
+    </form>`;
+}
+
+function catalogItem(item) {
+  const everyone = item.everyone === true;
+  const selected = Array.isArray(item.bot_ids) ? item.bot_ids : [];
+  const bots = state.bots.map((bot) => `
+    <label class="field">
+      <input type="checkbox" name="bot" value="${esc(bot.id)}" ${selected.includes(bot.id) ? "checked" : ""}>
+      ${esc(bot.name)}
+    </label>`).join("");
+  return `
+    <article class="panel sheet">
+      <strong>${esc(item.name)}</strong>
+      <p class="hint">${esc(item.address)}</p>
+      <p class="hint">${esc(item.description)}</p>
+      <form data-form="connection" data-id="${esc(item.id)}">
+        <div class="fields">
+          <label class="field">
+            <input type="checkbox" name="everyone" ${everyone ? "checked" : ""}>
+            Всем ботам
+          </label>
+          <div data-catalog-bots ${everyone ? "hidden" : ""}>${bots}</div>
+        </div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn-green" type="submit">Сохранить</button>
+        </div>
+      </form>
+    </article>`;
+}
+
+function catalogScreen() {
+  const items = state.catalog.map(catalogItem).join("");
+  return `
+    ${topbar("Каталог", "", '<a class="btn-quiet" href="#profile">Профиль</a>' + logoutControl())}
+    ${noticeHtml()}
+    ${catalogForm()}
+    ${items}`;
 }
 
 function routineLocked() {
@@ -617,7 +691,9 @@ function render() {
     bot: botScreen,
     chat: chatScreen,
     register: registerScreen,
-    login: loginScreen
+    login: loginScreen,
+    profile: profileScreen,
+    catalog: catalogScreen
   }[name];
   app.classList.toggle("home", name === "chat");
   app.innerHTML = view();
@@ -806,10 +882,53 @@ async function showCurrent() {
     return;
   }
   if (desired === "bots") await loadBots();
+  if (desired === "catalog") {
+    await loadBots();
+    await loadCatalog();
+  }
   if (desired === "bot") await loadCard();
   if (desired === "chat") {
     await loadMessages();
     await loadLibrary();
+  }
+  render();
+}
+
+async function loadCatalog() {
+  const result = await api("/api/catalog");
+  note(result);
+  if (result.ok && result.data && Array.isArray(result.data.items)) {
+    state.catalog = result.data.items;
+  }
+}
+
+async function submitCatalog(form) {
+  const result = await api("/api/catalog", {
+    method: "POST",
+    body: {
+      name: form.querySelector("#catalog-name").value,
+      address: form.querySelector("#catalog-address").value,
+      description: form.querySelector("#catalog-description").value
+    }
+  });
+  note(result);
+  if (result.ok) await loadCatalog();
+  render();
+}
+
+async function submitConnection(form) {
+  const everyone = form.querySelector("[name='everyone']");
+  const all = everyone ? everyone.checked === true : false;
+  const botIds = all
+    ? []
+    : [...form.querySelectorAll("[name='bot']:checked")].map((box) => box.value);
+  const result = await api(`/api/catalog/${form.dataset.id}/connection`, {
+    method: "PUT",
+    body: { everyone: all, bot_ids: botIds }
+  });
+  note(result);
+  if (result.ok && result.data && typeof result.data.id === "string") {
+    state.catalog = state.catalog.map((item) => item.id === result.data.id ? result.data : item);
   }
   render();
 }
@@ -1061,6 +1180,15 @@ app.addEventListener("submit", (event) => {
   if (form === "login") submitLogin();
   if (form === "create") submitCreate();
   if (form === "send") submitMessage();
+  if (form === "catalog") submitCatalog(event.target);
+  if (form === "connection") submitConnection(event.target);
+});
+
+app.addEventListener("change", (event) => {
+  const input = event.target;
+  if (!input || input.name !== "everyone" || !input.form) return;
+  const bots = input.form.querySelector("[data-catalog-bots]");
+  if (bots) bots.hidden = input.checked === true;
 });
 
 app.addEventListener("click", (event) => {
@@ -1264,6 +1392,7 @@ async function signOut() {
   state.messages = [];
   state.chats = [];
   state.activeChatId = null;
+  state.catalog = [];
   if (location.hash !== "#login") location.hash = "#login";
   else render();
 }

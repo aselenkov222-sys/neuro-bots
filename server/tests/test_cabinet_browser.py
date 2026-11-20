@@ -878,3 +878,118 @@ def test_browser_confirms_a_scenario_from_the_chat(database: None) -> None:
             browser.close()
     finally:
         _stop(process, journal)
+
+
+def test_browser_opens_catalog_from_profile(database: None) -> None:
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    email = f"catalog-{uuid.uuid4()}@example.com"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "server.app:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    journal = Journal(process)
+    try:
+        with httpx.Client(timeout=5) as client:
+            _wait_until(
+                journal,
+                lambda text: "Application startup complete." in text
+                and _health_ok(client, origin),
+            )
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                channel="chrome",
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_page()
+            page.goto(f"{origin}/")
+            page.wait_for_selector("h1")
+            assert page.locator("h1").inner_text() == "Регистрация"
+            page.fill("#register-email", email)
+            page.fill("#register-password", ACCEPTED)
+            page.click("button:has-text('Зарегистрироваться')")
+            page.wait_for_selector("text=Прислать новую")
+            _wait_until(journal, lambda text: len(_confirmation_urls(text, email)) >= 1)
+            page.goto(_confirmation_urls(journal.text(), email)[-1])
+            page.wait_for_selector("text=Создать бота")
+            assert page.locator("h1").inner_text() == "Боты"
+            assert page.locator("a", has_text="Профиль").count() == 1
+            assert page.locator("button", has_text="Выход").count() == 1
+
+            page.click("text=Создать бота")
+            page.fill("#create-name", "Искра")
+            page.click("#save-bot")
+            page.wait_for_selector(".bot-card")
+            page.locator("a", has_text="Профиль").click()
+            page.wait_for_selector("h1:has-text('Профиль')")
+            assert page.locator("h1").inner_text() == "Профиль"
+            assert page.locator("a", has_text="Каталог").count() == 1
+            assert page.locator("button", has_text="Выход").count() == 1
+            assert page.locator("input").count() == 0
+            assert page.locator("text=Хранилище").count() == 0
+            assert page.locator("text=Удалить").count() == 0
+            assert page.locator("text=Рабочий десктоп").count() == 0
+
+            page.locator("a", has_text="Каталог").click()
+            page.wait_for_selector("#catalog-name")
+            assert page.locator("h1").inner_text() == "Каталог"
+            assert page.locator("a", has_text="Профиль").count() == 1
+            assert page.locator("article.panel").count() == 0
+            assert page.locator("text=https://").count() == 0
+            page.fill("#catalog-name", "Почта")
+            page.fill("#catalog-address", "https://example.com/inbox")
+            page.fill("#catalog-description", "короткие письма")
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/api/catalog")
+                and response.ok
+            ) as created:
+                page.click("button:has-text('Добавить')")
+            posted = created.value.json()
+            assert posted["name"] == "Почта"
+            assert posted["address"] == "https://example.com/inbox"
+            assert posted["description"] == "короткие письма"
+            assert posted["everyone"] is False
+            assert posted["bot_ids"] == []
+            page.wait_for_selector("article.panel")
+            item = page.locator("article.panel")
+            assert item.count() == 1
+            assert item.locator("text=Почта").count() == 1
+            assert item.locator("text=https://example.com/inbox").count() == 1
+            assert item.locator("text=короткие письма").count() == 1
+            assert page.get_by_role("checkbox", name="Всем ботам").is_checked() is False
+            chosen = page.get_by_role("checkbox", name="Искра")
+            bot_id = chosen.input_value()
+            chosen.check()
+            with page.expect_response(
+                lambda response: response.request.method == "PUT"
+                and response.url.endswith("/connection")
+                and response.ok
+            ) as saved:
+                page.get_by_role("button", name="Сохранить").click()
+            connected = saved.value.json()
+            assert connected["everyone"] is False
+            assert connected["bot_ids"] == [bot_id]
+            page.wait_for_selector("article.panel input[name='bot']:checked")
+            assert page.get_by_role("checkbox", name="Всем ботам").is_checked() is False
+            assert page.get_by_role("checkbox", name="Искра").is_checked() is True
+            assert page.locator("article.panel").locator("text=Почта").count() == 1
+            assert page.locator("text=Кликабельный макет").count() == 0
+            assert page.locator(".proto").count() == 0
+            assert page.locator(".proto-nav").count() == 0
+            browser.close()
+    finally:
+        _stop(process, journal)
