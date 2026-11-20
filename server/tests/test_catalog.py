@@ -1087,3 +1087,161 @@ def test_deleting_a_bot_keeps_everyone_and_drops_only_its_link(
     assert stored[uuid.UUID(picked_body["id"])]["everyone"] is False
     assert _item_links(uuid.UUID(shared["id"])) == []
     assert _item_links(uuid.UUID(picked_body["id"])) == [uuid.UUID(kept["id"])]
+
+
+def _answer_no(cookie: str, bot_id: str) -> None:
+    message_id = next(
+        row["id"]
+        for row in _chat_messages(uuid.UUID(bot_id))
+        if row["code"] == "dangerous_action"
+    )
+    with _client(cookie) as client:
+        answered = client.post(
+            f"/api/bots/{bot_id}/messages/{message_id}/answer",
+            json={"answer": "no"},
+            headers={"Origin": ORIGIN},
+        )
+    assert answered.status_code == 200
+
+
+def test_claim_queues_only_the_address_before_a_dangerous_line(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-gate-order@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    before = "https://other.example/before"
+    danger = "https://publish.example/post"
+    after = "https://later.example/after"
+    publish = f"Опубликовать {danger}"
+    scenario = f"Прочитать {before}\n{publish}\nДальше {after}"
+    with _client(cookie) as client:
+        later = _post(
+            client,
+            {
+                "name": "Дальше",
+                "address": "https://later.example/home",
+                "description": "после шага",
+            },
+        )
+        assert later.status_code == 200
+        bot = _bot_with_scenario(client, "Порядок", scenario)
+        created = _routine(client, bot["id"])
+        connected = _connect(
+            client,
+            later.json()["id"],
+            {"everyone": False, "bot_ids": [bot["id"]]},
+        )
+        assert connected.status_code == 200
+        computer = _working_desktop(client)
+        claimed = _claim(client, computer)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "awaiting"
+    assert peek_open(account_id, computer) == before
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    assert calls == []
+    _answer_no(cookie, bot["id"])
+    assert peek_open(account_id, computer) == after
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    bot_id = uuid.UUID(bot["id"])
+    texts = [row["text"] for row in _chat_messages(bot_id)]
+    assert f"Не сделано: {publish}" in texts
+    assert STUB_TEXT in texts
+    assert _runs_for(created["id"])[0]["status"] == "claimed"
+    assert len(calls) == 1
+    assert _used(account_id) == 1
+
+
+def test_a_closed_catalog_address_before_the_gate_opens_nothing(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-gate-closed@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    scenario = (
+        "Прочитать https://closed.example/page\n"
+        "Опубликовать https://publish.example/post\n"
+        "Дальше https://later.example/after"
+    )
+    with _client(cookie) as client:
+        posted = _post(
+            client,
+            {
+                "name": "Закрыто",
+                "address": "https://closed.example/app",
+                "description": "нет связи",
+            },
+        )
+        assert posted.status_code == 200
+        bot = _bot_with_scenario(client, "Раньше", scenario)
+        created = _routine(client, bot["id"])
+        computer = _working_desktop(client)
+        stopped = _claim(client, computer)
+    assert stopped.status_code == 204
+    run = _runs_for(created["id"])
+    assert len(run) == 1
+    assert run[0]["status"] == "failed"
+    assert run[0]["claimed_at"] is None
+    errors = _chat_messages(uuid.UUID(bot["id"]))
+    assert len(errors) == 1
+    assert errors[0]["code"] == "catalog_not_connected"
+    assert errors[0]["text"] == CATALOG_CLOSED
+    assert peek_open(account_id, computer) is None
+    assert calls == []
+    assert _used(account_id) == 0
+    assert _charges(account_id) == []
+
+
+def test_a_closed_catalog_address_after_the_gate_stops_the_rest(
+    database: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _record_aggregator(monkeypatch)
+    cookie, account_id = _open_period("catalog-gate-later@example.com")
+    monkeypatch.setattr("server.routines.utc_now", lambda: CLAIM_AT)
+    before = "https://other.example/before"
+    danger = "https://publish.example/post"
+    closed = "https://closed.example/secret"
+    tail = "https://tail.example/tail"
+    scenario = (
+        f"Прочитать {before}\n"
+        f"Опубликовать {danger}\n"
+        f"Дальше {closed}\n"
+        f"Потом {tail}"
+    )
+    with _client(cookie) as client:
+        posted = _post(
+            client,
+            {
+                "name": "Закрыто",
+                "address": "https://closed.example/app",
+                "description": "после шага",
+            },
+        )
+        assert posted.status_code == 200
+        bot = _bot_with_scenario(client, "После", scenario)
+        created = _routine(client, bot["id"])
+        computer = _working_desktop(client)
+        claimed = _claim(client, computer)
+    assert claimed.status_code == 200
+    assert _runs_for(created["id"])[0]["status"] == "awaiting"
+    assert peek_open(account_id, computer) == before
+    pop_open(account_id, computer)
+    assert peek_open(account_id, computer) is None
+    assert calls == []
+    _answer_no(cookie, bot["id"])
+    assert peek_open(account_id, computer) is None
+    failed = _runs_for(created["id"])[0]
+    assert failed["status"] == "failed"
+    errors = [
+        row
+        for row in _chat_messages(uuid.UUID(bot["id"]))
+        if row["role"] == "error"
+    ]
+    assert len(errors) == 1
+    assert errors[0]["code"] == "catalog_not_connected"
+    assert errors[0]["text"] == CATALOG_CLOSED
+    assert calls == []
+    assert _used(account_id) == 0
+    assert _charges(account_id) == []

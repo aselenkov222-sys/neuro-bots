@@ -771,12 +771,20 @@ def _earliest_claimable_run(
     )
 
 
-def _scenario_addresses(scenario: object) -> list[str]:
+def _opening_lines(scenario: object) -> list[str]:
     if not isinstance(scenario, str):
         return []
+    lines = scenario_lines(scenario)
+    gate = first_gate(scenario)
+    if gate is None:
+        return lines
+    return lines[: gate[0]]
+
+
+def _addresses_of(lines: list[str]) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
-    for line in scenario_lines(scenario):
+    for line in lines:
         address = named_address(line)
         if address is None or address in seen:
             continue
@@ -839,13 +847,30 @@ def _connected_to_host(
     return False
 
 
+def _address_closed(
+    connection: Connection,
+    account_id: uuid.UUID,
+    bot_id: uuid.UUID,
+    address: str,
+    items: list[RowMapping] | None = None,
+    linked: set[uuid.UUID] | None = None,
+) -> bool:
+    rows = _catalog_rows(connection, account_id) if items is None else items
+    if not _items_for_host(rows, address):
+        return False
+    chosen = (
+        _linked_catalog_ids(connection, bot_id) if linked is None else linked
+    )
+    return not _connected_to_host(rows, chosen, address)
+
+
 def _catalog_closed(
     connection: Connection,
     account_id: uuid.UUID,
     bot_id: uuid.UUID,
     scenario: object,
 ) -> bool:
-    addresses = _scenario_addresses(scenario)
+    addresses = _addresses_of(_opening_lines(scenario))
     if not addresses:
         return False
     items = _catalog_rows(connection, account_id)
@@ -867,7 +892,7 @@ def _enqueue_named_addresses(
     scenario: object,
 ) -> set[str]:
     queued: set[str] = set()
-    addresses = _scenario_addresses(scenario)
+    addresses = _addresses_of(_opening_lines(scenario))
     if not addresses:
         return queued
     desktop = find_working_desktop(connection, account_id)
@@ -1034,16 +1059,36 @@ def _enqueue_lines(
     bot_id: uuid.UUID,
     lines: list[str],
     skip_urls: set[str] | None = None,
-) -> None:
+    *,
+    run_id: uuid.UUID | None = None,
+    now: datetime | None = None,
+    fail_from: str | None = None,
+) -> bool:
     desktop = find_working_desktop(connection, account_id)
     if desktop is None:
-        return
+        return False
+    items = _catalog_rows(connection, account_id)
+    linked = _linked_catalog_ids(connection, bot_id)
     chat_id = main_chat(connection, bot_id)["id"]
-    skipped = skip_urls or set()
+    seen = set(skip_urls or set())
     for line in lines:
         address = named_address(line)
-        if address is None or address in skipped:
+        if address is None or address in seen:
             continue
+        if run_id is not None and _address_closed(
+            connection, account_id, bot_id, address, items, linked
+        ):
+            if now is not None and fail_from is not None:
+                _mark_failed(
+                    connection,
+                    run_id,
+                    fail_from,
+                    bot_id,
+                    now,
+                    CATALOG_NOT_CONNECTED,
+                    CATALOG_NOT_CONNECTED_TEXT,
+                )
+            return True
         enqueue_open(
             account_id=account_id,
             computer_id=desktop["computer_id"],
@@ -1051,6 +1096,8 @@ def _enqueue_lines(
             bot_id=bot_id,
             chat_id=chat_id,
         )
+        seen.add(address)
+    return False
 
 
 def _maybe_wait(
@@ -1064,18 +1111,24 @@ def _maybe_wait(
     check_id: uuid.UUID | None,
     after: int = -1,
     skip_urls: set[str] | None = None,
+    fail_from: str | None = None,
 ) -> bool:
     found = first_gate(scenario, after=after)
     if found is None:
         return False
     position, action = found
-    _enqueue_lines(
+    stopped = _enqueue_lines(
         connection,
         account_id,
         bot_id,
         scenario_lines(scenario)[after + 1 : position],
         skip_urls=skip_urls,
+        run_id=run_id,
+        now=now,
+        fail_from=fail_from,
     )
+    if stopped:
+        return True
     open_gate(
         connection,
         bot_id,
@@ -1127,14 +1180,19 @@ def _continue_after(
         run_id=run_id,
         check_id=check_id,
         after=after,
+        fail_from="awaiting" if run_id is not None else None,
     ):
         return
-    _enqueue_lines(
+    if _enqueue_lines(
         connection,
         account_id,
         bot_id,
         scenario_lines(scenario)[after + 1 :],
-    )
+        run_id=run_id,
+        now=now,
+        fail_from="awaiting" if run_id is not None else None,
+    ):
+        return
     if run_id is not None:
         connection.execute(
             routine_runs.update()
@@ -1185,6 +1243,7 @@ def _complete_claimed_run(
         run_id=run_id,
         check_id=None,
         skip_urls=skip_urls,
+        fail_from="claimed",
     ):
         return
     _speak_scenario(
@@ -1715,6 +1774,21 @@ def _perform_released(
         return
     desktop = find_working_desktop(connection, account_id)
     address = named_address(step["action"])
+    if (
+        step["run_id"] is not None
+        and address is not None
+        and _address_closed(connection, account_id, step["bot_id"], address)
+    ):
+        _mark_failed(
+            connection,
+            step["run_id"],
+            "awaiting",
+            step["bot_id"],
+            now,
+            CATALOG_NOT_CONNECTED,
+            CATALOG_NOT_CONNECTED_TEXT,
+        )
+        return
     if desktop is not None and address is not None:
         chat_id = main_chat(connection, step["bot_id"])["id"]
         enqueue_open(
